@@ -981,6 +981,28 @@ mod scans {
         "write_all",
     ];
 
+    /// Calls that actually MUTATE the file an `OpenOptions` targets. The
+    /// builder itself is not a write: access-mode flags (`.read(true)`,
+    /// `.write(true)`) only grant rights. The CAS streaming put reopens its
+    /// already-fsynced temp read+WRITE so `FlushFileBuffers` can run on
+    /// Windows (commit b18eec4) — that line performs no mutation and is a
+    /// durability flush, not an atomic-write sequence, so the 2026-09 false
+    /// positive is fixed here: an `OpenOptions` line that names a temp path
+    /// is an offender only when one of these mutation calls is on the same
+    /// line. Every other write marker mutates by itself.
+    const ATOMIC_MUTATION_MARKERS: &[&str] = &[
+        "write_all",
+        "write_fmt",
+        "fs::write",
+        "std::fs::write",
+        "tokio::fs::write",
+        "File::create",
+        "create(true)",
+        "create_new(true)",
+        "truncate(true)",
+        "set_len(",
+    ];
+
     const ATOMIC_ALLOWLIST: &[(&str, &str)] = &[
         // crates/cas: content-addressed store writer (frozen layer below
         // crates/fs; its own documented temp+fsync+rename durability
@@ -1013,14 +1035,26 @@ mod scans {
     /// The temp-write half of scan 3, independent of any fsync: a
     /// write-family call whose LINE also targets a temp path. The temp
     /// check reads the raw line (not the code mask), because the canonical
-    /// shape is a string-literal path such as `".thing.tmp"`.
+    /// shape is a string-literal path such as `".thing.tmp"`. An
+    /// `OpenOptions` builder alone is not a write (see
+    /// [`ATOMIC_MUTATION_MARKERS`]): it fires only with an actual mutation
+    /// call on the same line, so a pure durability reopen of an existing
+    /// temp is accepted while a create/truncate/write of one still fires.
     fn atomic_temp_write_hits(f: &File<'_>) -> Vec<(usize, String)> {
         let mut hits = Vec::new();
         for (line, text) in find_markers(f, ATOMIC_WRITE_MARKERS) {
             let raw = f.src.lines().nth(line - 1).unwrap_or_default();
-            if raw.contains("tmp") || raw.contains("NamedTempFile") {
-                hits.push((line, text));
+            if !(raw.contains("tmp") || raw.contains("NamedTempFile")) {
+                continue;
             }
+            if text.contains("OpenOptions")
+                && !ATOMIC_MUTATION_MARKERS
+                    .iter()
+                    .any(|mutation| raw.contains(mutation))
+            {
+                continue;
+            }
+            hits.push((line, text));
         }
         // `NamedTempFile::persist` in its associated/literal form AND the
         // instance form (`line ... NamedTempFile ... .persist(`) are both
@@ -1589,6 +1623,39 @@ fn prod_only() {}
         assert!(
             !atomic_write_offenders(&f).is_empty(),
             "NamedTempFile persist must be listed independently"
+        );
+        // False-positive regression (the CAS streaming put, commit b18eec4):
+        // reopening an fsynced temp read+WRITE performs NO mutation — the
+        // write access exists solely for the Windows FlushFileBuffers. The
+        // access-mode flags are not a write, so the line must be accepted
+        // WITHOUT any allowlist entry.
+        for src in [
+            "fn s(tmp: &std::path::Path) -> std::io::Result<()> { \
+             let f = fs::OpenOptions::new().read(true).write(true).open(&tmp)?; \
+             f.sync_all() }\n",
+            "fn s(tmp: &std::path::Path) -> std::io::Result<()> { \
+             fs::OpenOptions::new().write(true).open(&tmp)?.sync_all() }\n",
+        ] {
+            let f = synthetic_file("crates/cas/src/lib.rs", src);
+            assert!(
+                atomic_write_offenders(&f).is_empty(),
+                "an OpenOptions reopen with no mutation call is a durability \
+                 flush, never an atomic-write sequence: {:?}",
+                atomic_write_offenders(&f)
+            );
+        }
+        // The mutation still fires: an OpenOptions sequence that CREATES the
+        // temp is an offender (and the mutation requirement never weakens
+        // the plain write/rename/persist patterns above).
+        let f = synthetic_file(
+            "crates/agent/src/lib.rs",
+            "fn c(tmp: &std::path::Path) -> std::io::Result<()> { \
+             let f = fs::OpenOptions::new().write(true).create(true).open(&tmp)?; \
+             Ok(()) }\n",
+        );
+        assert!(
+            !atomic_write_offenders(&f).is_empty(),
+            "create(true) on a temp path must be listed"
         );
         // A plain non-temp write is not an atomic-write sequence.
         let f = synthetic_file(

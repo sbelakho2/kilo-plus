@@ -247,6 +247,87 @@ pub enum CommandSpec {
 /// Bound on a shell snippet before any process exists.
 pub const COMMAND_SCRIPT_MAX_BYTES: usize = 512 * 1024;
 
+/// Reserved prefix of a materialized cmd script (see
+/// [`materialize_cmd_script`]). The process supervisor deletes only files
+/// carrying this prefix under the system temp dir, so a caller-supplied
+/// `cmd /c <script>` is never touched.
+pub const CMD_SCRIPT_PREFIX: &str = "faktor-cmd-";
+
+/// Abandoned materialized cmd scripts (lowering created the file but the
+/// supervisor never got to delete it — a crash in between) are swept after
+/// this age, so the system temp dir stays bounded. The age is far past any
+/// plausible supervised deadline, so the sweep can never race a LIVE cmd
+/// still reading its batch file.
+const CMD_SCRIPT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Sweep every Nth materialization: the sweep is opportunistic, never a
+/// per-command cost.
+const CMD_SCRIPT_SWEEP_EVERY: u64 = 64;
+
+static CMD_SCRIPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Materialize a shell script that must reach cmd.exe VERBATIM: cmd's `/C`
+/// quote handling strips and re-parses embedded quotes when the snippet is
+/// passed on the command line, so the snippet is written to a unique
+/// `faktor-cmd-*.cmd` file in the system temp dir and cmd is handed the
+/// path (`cmd.exe /D /C <path>`; std quotes the path when it contains
+/// spaces, and with `/s` absent cmd preserves that single quoted executable
+/// name — `cmd /?` rule 1). The file is a direct-use temp: no rename and no
+/// publication step, so it is NOT an atomic-write sequence. The process
+/// supervisor removes it as soon as the child exits; a file abandoned by a
+/// crash is swept past [`CMD_SCRIPT_TTL`].
+fn materialize_cmd_script(script: &str) -> Result<OsString, Error> {
+    let dir = std::env::temp_dir();
+    let seq = CMD_SCRIPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if seq.is_multiple_of(CMD_SCRIPT_SWEEP_EVERY) {
+        sweep_abandoned_cmd_scripts(&dir);
+    }
+    let name = format!(
+        "{CMD_SCRIPT_PREFIX}{}-{}-{seq}.cmd",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let script_path = dir.join(name);
+    std::fs::write(&script_path, script)
+        .map_err(|e| Error::internal(format!("materialize cmd script: {e}")))?;
+    Ok(script_path.into_os_string())
+}
+
+fn sweep_abandoned_cmd_scripts(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(CMD_SCRIPT_PREFIX) || !name.ends_with(".cmd") {
+            continue;
+        }
+        let abandoned = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > CMD_SCRIPT_TTL);
+        if abandoned {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The argv of a materialized cmd script run: `cmd.exe /d /c <path>`. `/d`
+/// skips AutoRun and `/c` runs the script; without `/s` cmd keeps a single
+/// quoted path argument intact (`cmd /?` rule 1), which is exactly how std
+/// hands over a temp path containing spaces.
+fn cmd_script_argv(script: &str) -> Result<(OsString, Vec<OsString>), Error> {
+    let script_path = materialize_cmd_script(script)?;
+    Ok((
+        OsString::from("cmd.exe"),
+        vec![OsString::from("/d"), OsString::from("/c"), script_path],
+    ))
+}
+
 /// A lowered command: the exact program + argv handed to the spawn layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedCommand {
@@ -279,7 +360,10 @@ impl CommandSpec {
     /// Lower to program + argv. `configured_platform_shell` overrides the
     /// [`ShellKind::PlatformDefault`] executable only; every other kind is
     /// fixed. Hostile input (NUL, empty, oversized) is refused typed before
-    /// any process exists.
+    /// any process exists. A cmd shell snippet is materialized to a unique
+    /// temp `.cmd` file and lowered to `cmd.exe /d /c <path>` (see
+    /// [`materialize_cmd_script`]); PowerShell/PosixSh snippets stay one
+    /// argv element.
     pub fn lower_with(
         &self,
         configured_platform_shell: Option<&OsStr>,
@@ -314,8 +398,30 @@ impl CommandSpec {
                 if script.contains('\0') {
                     return Err(Error::malformed("shell script contains NUL"));
                 }
+                // A cmd snippet must reach cmd.exe VERBATIM: cmd's `/C`
+                // quote handling mangles embedded quotes riding on the
+                // command line, so the snippet is materialized to a temp
+                // `.cmd` file and only the path is passed. Every other shell
+                // keeps the one-argv-element snippet.
+                let materialized = matches!(shell, ShellKind::Cmd)
+                    || (matches!(shell, ShellKind::PlatformDefault)
+                        && !cfg!(unix)
+                        && configured_platform_shell.is_none());
                 let (program, mut args): (OsString, Vec<OsString>) = match shell {
-                    ShellKind::PlatformDefault => platform_default_shell(configured_platform_shell),
+                    ShellKind::PlatformDefault => {
+                        #[cfg(unix)]
+                        {
+                            platform_default_shell(configured_platform_shell)
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            if configured_platform_shell.is_none() {
+                                cmd_script_argv(script)?
+                            } else {
+                                platform_default_shell(configured_platform_shell)
+                            }
+                        }
+                    }
                     ShellKind::PosixSh => {
                         #[cfg(unix)]
                         {
@@ -326,10 +432,7 @@ impl CommandSpec {
                             ("sh".into(), vec!["-c".into()])
                         }
                     }
-                    ShellKind::Cmd => (
-                        "cmd.exe".into(),
-                        vec!["/d".into(), "/s".into(), "/c".into()],
-                    ),
+                    ShellKind::Cmd => cmd_script_argv(script)?,
                     ShellKind::PowerShell => (
                         "powershell.exe".into(),
                         vec![
@@ -349,7 +452,9 @@ impl CommandSpec {
                         }
                     }
                 }
-                args.push(script.into());
+                if !materialized {
+                    args.push(script.into());
+                }
                 Ok(ResolvedCommand { program, args })
             }
         }
@@ -519,7 +624,20 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        #[cfg(unix)]
         assert_eq!(args.last().unwrap(), "echo hi");
+        #[cfg(not(unix))]
+        {
+            let script = std::path::PathBuf::from(&resolved.args[2]);
+            assert!(
+                script
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(CMD_SCRIPT_PREFIX)),
+                "platform-default cmd scripts are materialized: {args:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&script).unwrap(), "echo hi");
+            let _ = std::fs::remove_file(script);
+        }
 
         let configured = OsString::from("/bin/dash");
         let resolved = CommandSpec::shell("echo hi", ShellKind::PlatformDefault)
@@ -555,10 +673,55 @@ mod tests {
     }
 
     #[test]
+    fn cmd_shell_snippets_are_materialized_never_embedded_on_the_command_line() {
+        // `echo "a b"` through a raw `cmd.exe /C <script>` command line is
+        // mangled by cmd's quote stripping (2026-09 Windows failure: exit 1,
+        // empty stdout). The lowering must hand cmd a materialized script
+        // file instead, with the raw snippet absent from the command line.
+        let script = "echo \"a b\"";
+        let resolved = CommandSpec::shell(script, ShellKind::Cmd).lower().unwrap();
+        assert_eq!(resolved.program, OsString::from("cmd.exe"));
+        assert_eq!(resolved.args[0], OsString::from("/d"));
+        assert_eq!(resolved.args[1], OsString::from("/c"));
+        assert_eq!(resolved.args.len(), 3);
+        let path = std::path::PathBuf::from(&resolved.args[2]);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(
+            name.starts_with(CMD_SCRIPT_PREFIX) && name.ends_with(".cmd"),
+            "cmd scripts carry the reserved materialized name: {name}"
+        );
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
+        assert!(
+            !resolved
+                .args
+                .iter()
+                .any(|a| a.to_string_lossy().contains(script)),
+            "the raw script must never ride on the cmd command line: {:?}",
+            resolved.args
+        );
+        // Every lowering materializes its own unique script file.
+        let second = CommandSpec::shell(script, ShellKind::Cmd).lower().unwrap();
+        assert_ne!(resolved.args[2], second.args[2]);
+        // PowerShell stays a single -Command argv element (unchanged).
+        let ps = CommandSpec::shell(script, ShellKind::PowerShell)
+            .lower()
+            .unwrap();
+        assert_eq!(ps.args.last().unwrap(), &OsString::from(script));
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(&second.args[2]));
+    }
+
+    #[test]
     fn explicit_shell_kinds_select_fixed_interpreters() {
         let cmd = CommandSpec::shell("dir", ShellKind::Cmd).lower().unwrap();
         assert_eq!(cmd.program, OsString::from("cmd.exe"));
         assert_eq!(cmd.args[0], OsString::from("/d"));
+        assert_eq!(cmd.args[1], OsString::from("/c"));
+        let _ = std::fs::remove_file(std::path::PathBuf::from(&cmd.args[2]));
         let ps = CommandSpec::shell("Get-Date", ShellKind::PowerShell)
             .lower()
             .unwrap();
@@ -612,8 +775,9 @@ mod tests {
         assert!(CommandSpec::shell("true", ShellKind::PlatformDefault)
             .lower_with(Some(OsStr::new("sh\0")))
             .is_err());
-        assert!(CommandSpec::shell("x".repeat(10_000), ShellKind::Cmd)
+        let big = CommandSpec::shell("x".repeat(10_000), ShellKind::Cmd)
             .lower()
-            .is_ok());
+            .unwrap();
+        let _ = std::fs::remove_file(std::path::PathBuf::from(&big.args[2]));
     }
 }

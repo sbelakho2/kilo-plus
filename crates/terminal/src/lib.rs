@@ -345,6 +345,57 @@ fn effective_artifact_max(configured: usize) -> usize {
     configured.min(GLOBAL_HARD_MAX as usize)
 }
 
+/// The materialized cmd script behind a spawn, when the configuration is
+/// exactly the core lowering's `cmd.exe /d /c <reserved temp path>` form
+/// (see `faktor_core::command::CMD_SCRIPT_PREFIX`). The snippet is written
+/// to a direct-use temp file so cmd's `/C` quote handling cannot mangle it;
+/// the supervisor — which owns the run — deletes that file once the child
+/// has exited. Only the reserved prefix under the system temp dir matches,
+/// so a caller-supplied `cmd /c <script>` is never removed.
+fn materialized_cmd_script(cfg: &SpawnConfig) -> Option<PathBuf> {
+    let program = std::path::Path::new(&cfg.cmd)
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if program != "cmd" && program != "cmd.exe" {
+        return None;
+    }
+    let at = cfg
+        .args
+        .iter()
+        .position(|arg| arg.eq_ignore_ascii_case("/c"))?;
+    let path = PathBuf::from(cfg.args.get(at + 1)?.as_str());
+    let name = path.file_name()?.to_string_lossy();
+    if !name.starts_with(faktor_core::command::CMD_SCRIPT_PREFIX) || !name.ends_with(".cmd") {
+        return None;
+    }
+    if path.parent() != Some(std::env::temp_dir().as_path()) {
+        return None;
+    }
+    Some(path)
+}
+
+/// Deletes a materialized cmd script exactly once the controlling run has
+/// finished. The guard drops on every return path (success, timeout,
+/// cancellation, refused/failed spawn), always after the child was reaped;
+/// the detached spawn paths hand the path to their reaper thread instead,
+/// so the script stays readable for as long as cmd runs.
+struct CmdScriptGuard(Option<PathBuf>);
+
+impl CmdScriptGuard {
+    fn disarm(mut self) -> Option<PathBuf> {
+        self.0.take()
+    }
+}
+
+impl Drop for CmdScriptGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Bound (ms) on the post-exit drain in [`ProcessSupervisor::run`]: the
 /// existence of an unrelated descendant holding an inherited descriptor must
 /// never control completion of the parent command.
@@ -663,6 +714,9 @@ impl ProcessSupervisor {
         deadline: Duration,
         token: CancellationToken,
     ) -> Result<CommandOutput, Error> {
+        // The run OWNS the materialized cmd script (when lowering produced
+        // one): deleted on every return path after the child is gone.
+        let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
@@ -936,6 +990,9 @@ impl ProcessSupervisor {
         stdout_cap: usize,
         stderr_cap: usize,
     ) -> Result<SyncRunOutput, Error> {
+        // The run OWNS the materialized cmd script (when lowering produced
+        // one): deleted on every return path after the child is gone.
+        let _cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
@@ -1043,6 +1100,10 @@ impl ProcessSupervisor {
     /// Spawn with piped stdin/stdout/stderr (for MCP/LSP style servers).
     /// The caller owns the pipes; a reaper thread still reaps the child.
     pub fn spawn_detached_with_pipes(&self, mut cfg: SpawnConfig) -> Result<SpawnedProcess, Error> {
+        // The reaper thread owns the materialized cmd script (when lowering
+        // produced one): cmd reads the batch file while it runs, so it is
+        // deleted only after the child exits.
+        let cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
@@ -1078,10 +1139,15 @@ impl ProcessSupervisor {
                 .collect(),
             &cfg.owner,
         );
-        // Reaper thread (no zombies); the caller keeps the pipes.
+        // Reaper thread (no zombies); the caller keeps the pipes. It also
+        // deletes the materialized cmd script once the child has exited.
         let registry = self.registry.clone();
+        let script = cmd_script.disarm();
         std::thread::spawn(move || {
             let status = child.wait().ok();
+            if let Some(path) = script {
+                let _ = std::fs::remove_file(path);
+            }
             let code = status.and_then(|s| s.code());
             let mut reg = registry.lock().unwrap();
             if let Some(state) = reg.get_mut(&id) {
@@ -1099,6 +1165,9 @@ impl ProcessSupervisor {
     /// Spawn detached with a reaper thread (no zombies); the caller owns the
     /// child and must kill/transfer deliberately.
     pub fn spawn(&self, cfg: SpawnConfig) -> Result<ChildHandle, Error> {
+        // The reaper thread owns the materialized cmd script (when lowering
+        // produced one): deleted only after the child exits.
+        let cmd_script = CmdScriptGuard(materialized_cmd_script(&cfg));
         if cfg.network_isolation == NetworkIsolation::DenyAll {
             isolation_gate(&cfg)?;
         }
@@ -1124,10 +1193,15 @@ impl ProcessSupervisor {
             );
             (child, pid, id)
         };
-        // Reaper thread: waitpid is the only way to avoid zombies.
+        // Reaper thread: waitpid is the only way to avoid zombies. It also
+        // deletes the materialized cmd script once the child has exited.
         let registry = self.registry.clone();
+        let script = cmd_script.disarm();
         std::thread::spawn(move || {
             let status = child.wait_with_output().map(|o| o.status).ok();
+            if let Some(path) = script {
+                let _ = std::fs::remove_file(path);
+            }
             let code = status.and_then(|s| s.code());
             let mut reg = registry.lock().unwrap();
             if let Some(state) = reg.get_mut(&id) {
@@ -1611,6 +1685,87 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(sup.registered(), 0, "reap collects the run_sync child");
+    }
+
+    #[test]
+    fn cmd_shell_lowering_materializes_the_script_off_the_command_line() {
+        // Pure lowering (no spawn): `echo "a b"` through a raw
+        // `cmd.exe /C <script>` command line is mangled by cmd's quote
+        // stripping. The lowered argv must carry a materialized `.cmd` path
+        // and never the raw embedded-quote script.
+        let script = "echo \"a b\"";
+        let resolved = CommandSpec::shell(script, ShellKind::Cmd).lower().unwrap();
+        assert_eq!(resolved.program.to_string_lossy(), "cmd.exe");
+        let args: Vec<String> = resolved
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args[0], "/d");
+        assert_eq!(args[1], "/c");
+        assert_eq!(args.len(), 3);
+        let path = PathBuf::from(&resolved.args[2]);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("faktor-cmd-") && name.ends_with(".cmd"),
+            "the cmd form must name its materialized script: {args:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
+        assert!(
+            !args.iter().any(|a| a.contains(script)),
+            "no raw embedded-quote script on the command line: {args:?}"
+        );
+        // Unix platform default stays `/bin/sh -c` with the snippet as one
+        // argv element: only cmd materializes.
+        let sh = CommandSpec::shell(script, ShellKind::PlatformDefault)
+            .lower()
+            .unwrap();
+        assert_eq!(sh.program.to_string_lossy(), "/bin/sh");
+        assert!(
+            !sh.args
+                .iter()
+                .any(|a| a.to_string_lossy().starts_with("faktor-cmd-")),
+            "only cmd materializes: {:?}",
+            sh.args
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cmd_script_guard_deletes_only_the_reserved_materialized_file() {
+        // The supervisor cleanup contract: a reserved-prefix script under
+        // the system temp dir is deleted by the run guard; a user-named
+        // script (even in the temp dir) is never matched, so it survives.
+        let reserved =
+            std::env::temp_dir().join(format!("faktor-cmd-guard-{}.cmd", uuid::Uuid::new_v4()));
+        std::fs::write(&reserved, b"echo reserved").unwrap();
+        let cfg = SpawnConfig {
+            cmd: "cmd.exe".into(),
+            args: vec![
+                "/d".into(),
+                "/c".into(),
+                reserved.to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(materialized_cmd_script(&cfg), Some(reserved.clone()));
+        drop(CmdScriptGuard(materialized_cmd_script(&cfg)));
+        assert!(!reserved.exists(), "the run guard deletes the script");
+
+        let user = std::env::temp_dir().join(format!("kp-user-{}.cmd", uuid::Uuid::new_v4()));
+        std::fs::write(&user, b"echo user").unwrap();
+        let cfg = SpawnConfig {
+            cmd: "cmd.exe".into(),
+            args: vec!["/c".into(), user.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            materialized_cmd_script(&cfg),
+            None,
+            "a caller-supplied script is never claimed by the guard"
+        );
+        assert!(user.exists(), "user scripts are never deleted");
+        let _ = std::fs::remove_file(user);
     }
 
     #[test]
@@ -3428,8 +3583,68 @@ mod windows_tests {
             resolved.program
         );
         assert_eq!(resolved.args[0], std::ffi::OsString::from("/d"));
-        assert_eq!(resolved.args[1], std::ffi::OsString::from("/s"));
-        assert_eq!(resolved.args[2], std::ffi::OsString::from("/c"));
+        assert_eq!(resolved.args[1], std::ffi::OsString::from("/c"));
+        // The script is MATERIALIZED: cmd is handed a path, never the raw
+        // embedded-quote snippet (whose /C quote stripping mangled
+        // `echo "a b"` into exit 1 / empty stdout).
+        let script = std::path::PathBuf::from(&resolved.args[2]);
+        assert!(
+            script
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("faktor-cmd-"))
+                .unwrap_or(false),
+            "the cmd form must hand over a materialized script path: {:?}",
+            resolved.args
+        );
+        assert!(
+            !resolved
+                .args
+                .iter()
+                .any(|a| a.to_string_lossy().contains("echo hi")),
+            "the raw script must never ride on the cmd command line: {:?}",
+            resolved.args
+        );
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
+    fn materialized_cmd_script_is_deleted_after_the_run() {
+        // The runner owns the materialized script: after the supervised run
+        // the temp `.cmd` file must be gone (cmd reads it while executing,
+        // so deletion happens only once the child has exited).
+        let (_dir, sup) = shell_supervisor();
+        let resolved = CommandSpec::shell("echo cleanup-check", ShellKind::PlatformDefault)
+            .lower()
+            .unwrap();
+        let script = std::path::PathBuf::from(&resolved.args[2]);
+        assert!(script.exists(), "lowering materializes the script");
+        let cfg = SpawnConfig {
+            cmd: resolved.program.to_string_lossy().into_owned(),
+            args: resolved
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            cwd: std::env::temp_dir(),
+            env: EnvSpec::default_baseline(),
+            owner: ProcessOwner::Daemon,
+            capture: true,
+            artifact_max: 1024 * 1024,
+            network_isolation: NetworkIsolation::Inherit,
+        };
+        let out = sup
+            .run_sync(cfg, Duration::from_secs(20), 64 * 1024, 64 * 1024)
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
+        assert!(
+            out.stdout_head.contains("cleanup-check"),
+            "{:?}",
+            out.stdout_head
+        );
+        assert!(
+            !script.exists(),
+            "the supervisor must delete the run's materialized cmd script"
+        );
     }
 
     #[test]
