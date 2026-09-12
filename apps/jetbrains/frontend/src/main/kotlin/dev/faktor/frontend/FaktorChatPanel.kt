@@ -145,6 +145,8 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private val navigator = EvidenceNavigatorPanel()
 
+    private val boardPanel = BoardPanel()
+
     private val tabs = JTabbedPane()
 
     private var renderedSeq: Long = 0
@@ -204,6 +206,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         tabs.addTab("Task Tree", buildTaskTreeTab())
         tabs.addTab("Agents", buildAgentsTab())
         tabs.addTab("Tournament", tournamentPanel)
+        tabs.addTab("Board", boardPanel)
         tabs.addTab("Evidence", navigator)
         tabs.preferredSize = Dimension(430, 600)
 
@@ -351,6 +354,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 service.stop()
                 submittedCompletion = null
                 onEdt {
+                    boardPanel.reset()
                     setControlsEnabled(false)
                     appendSystem("daemon stopped")
                 }
@@ -362,7 +366,10 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 val model = modelField.text.trim().ifEmpty { "default" }
                 val created = service.createSession(provider, model, title = "JetBrains session")
                 submittedCompletion = null
-                onEdt { appendSystem("session ${created.id} created (${created.title})") }
+                onEdt {
+                    boardPanel.reset()
+                    appendSystem("session ${created.id} created (${created.title})")
+                }
                 service.watchSession(created.id, 0)
                 refreshAllBlocking()
             }
@@ -532,6 +539,38 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 }
             }
         })
+        boardPanel.setListener(object : BoardPanel.Listener {
+            override fun onRead() {
+                runAsync("board read") { refreshBoardBlocking(acknowledge = true) }
+            }
+
+            override fun onPost(subject: String, body: String) {
+                if (subject.isEmpty()) {
+                    appendSystem("board post needs a subject")
+                    return
+                }
+                if (body.isBlank()) {
+                    appendSystem("board post needs a non-empty body")
+                    return
+                }
+                runAsync("board post") {
+                    try {
+                        val post = service.boardPost(subject, body)
+                        onEdt { appendSystem("board post #${post.revision} recorded") }
+                    } catch (e: NativeApiException) {
+                        // The durable authority owns every refusal (family
+                        // scope, terminal child, oversized text): surface it
+                        // typed instead of a silent no-op.
+                        onEdt {
+                            appendSystem(
+                                "board post refused: ${e.status} ${e.code}: ${e.detail}"
+                            )
+                        }
+                    }
+                    refreshBoardBlocking(acknowledge = true)
+                }
+            }
+        })
         navigator.setListener(object : EvidenceNavigatorPanel.Listener {
             override fun onRetrieve(evidenceId: Long, selectorJson: String) {
                 runAsync("evidence $evidenceId") {
@@ -557,7 +596,11 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 val provider = providerField.text.trim().ifEmpty { "default" }
                 val model = modelField.text.trim().ifEmpty { "default" }
                 val created = service.createSession(provider, model, title = "JetBrains session")
-                onEdt { appendSystem("session ${created.id} created") }
+                submittedCompletion = null
+                onEdt {
+                    boardPanel.reset()
+                    appendSystem("session ${created.id} created")
+                }
                 service.watchSession(created.id, 0)
                 refreshAllBlocking()
             }
@@ -595,6 +638,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         refreshUsageBlocking()
         refreshVerificationBlocking()
         refreshTournamentsBlocking()
+        refreshBoardBlocking()
         refreshTaskTreeBlocking()
     }
 
@@ -741,6 +785,30 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private fun surfaceTournamentError(action: String, e: NativeApiException) {
         onEdt { appendSystem("tournament $action refused: ${e.status} ${e.code}: ${e.detail}") }
+    }
+
+    /**
+     * The durable run-family board of the current session. A daemon without
+     * the additive route (typed 404/405) records an explicit unavailable
+     * state with its reason; the panel never shows a fabricated board.
+     * `acknowledge` moves the read watermark (explicit read/post only).
+     */
+    private fun refreshBoardBlocking(acknowledge: Boolean = false) {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        try {
+            val page = service.board(limit = 100L)
+            onEdt { boardPanel.setBoard(page, acknowledge) }
+        } catch (e: NativeApiException) {
+            val routeMissing = e.status == 404 || e.status == 405 || e.status == 501
+            val label = if (routeMissing) "no board route" else "board read refused"
+            onEdt {
+                boardPanel.setUnavailable("$label (status ${e.status} ${e.code}: ${e.detail})")
+            }
+        } catch (e: Exception) {
+            onEdt {
+                boardPanel.setUnavailable("board read failed: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
     }
 
     private fun refreshTaskTreeBlocking() {
@@ -956,6 +1024,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 if (service.isRunning() && service.currentSessionId() != null) {
                     refreshStatusBlocking()
                     refreshMessagesBlocking()
+                    refreshBoardBlocking()
                     refreshTaskTreeBlocking()
                 }
             } catch (e: Exception) {

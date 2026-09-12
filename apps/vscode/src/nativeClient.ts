@@ -1579,6 +1579,106 @@ export function validateTournamentDecision(json: Json): NativeTournamentDecision
   };
 }
 
+// -------------------------------------------------------- coordination board
+
+/**
+ * One durable run-family board post (`GET/POST /native/session/{id}/board`).
+ * `author_child` is the acting child's session id; null means the run root
+ * posted. `revision` is the per-board monotonic cursor (id == revision).
+ */
+export interface NativeBoardPost {
+  readonly id: number;
+  readonly board_id: number;
+  readonly author_child: number | null;
+  readonly author_session: number;
+  readonly subject: string;
+  readonly body: string;
+  readonly refs: readonly string[];
+  readonly revision: number;
+  readonly created_ms: number;
+}
+
+/** One bounded newest-first page of the path session's board. */
+export interface NativeBoardPage {
+  readonly board_id: number;
+  readonly revision: number;
+  readonly posts: readonly NativeBoardPost[];
+  /** Exclusive cursor for the next OLDER page (passed back as `since`). */
+  readonly next_before_revision: number | null;
+  readonly has_more: boolean;
+}
+
+function fPositiveInt(object: JsonObject, key: string, path: string): number {
+  const value = fInt(object, key, path);
+  if (value <= 0) {
+    fail(`${path}.${key}`, `expected a positive integer, got ${value}`);
+  }
+  return value;
+}
+
+function fNonNegativeInt(object: JsonObject, key: string, path: string): number {
+  const value = fInt(object, key, path);
+  if (value < 0) {
+    fail(`${path}.${key}`, `expected a non-negative integer, got ${value}`);
+  }
+  return value;
+}
+
+function validateBoardPostAt(object: JsonObject, path: string): NativeBoardPost {
+  checkResponseKeys(object, path, [
+    'id',
+    'board_id',
+    'author_child',
+    'author_session',
+    'subject',
+    'body',
+    'refs',
+    'revision',
+    'created_ms',
+  ]);
+  return {
+    id: fPositiveInt(object, 'id', path),
+    board_id: fPositiveInt(object, 'board_id', path),
+    author_child: fNullableInt(object, 'author_child', path),
+    author_session: fPositiveInt(object, 'author_session', path),
+    subject: fString(object, 'subject', path),
+    body: fString(object, 'body', path),
+    // A hostile daemon cannot force an unbounded ref list into the frame.
+    refs: fStringArray(object, 'refs', path).slice(0, 64),
+    revision: fPositiveInt(object, 'revision', path),
+    created_ms: fInt(object, 'created_ms', path),
+  };
+}
+
+/** Strict parse of one board post response (`POST .../board`, 201). */
+export function validateBoardPost(json: Json): NativeBoardPost {
+  const path = 'POST /native/session/{id}/board';
+  return validateBoardPostAt(asObject(json, path), path);
+}
+
+/** Strict parse of one board page (`GET .../board`). */
+export function validateBoardPage(json: Json): NativeBoardPage {
+  const path = 'GET /native/session/{id}/board';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, [
+    'board_id',
+    'revision',
+    'posts',
+    'next_before_revision',
+    'has_more',
+  ]);
+  return {
+    board_id: fPositiveInt(object, 'board_id', path),
+    // An empty board has revision 0 (no post/reset yet); posts are >= 1.
+    revision: fNonNegativeInt(object, 'revision', path),
+    posts: fObjectArray(object, 'posts', path).map((entry, index) =>
+      validateBoardPostAt(entry, `${path}.posts[${index}]`),
+    ),
+    next_before_revision: fNullableInt(object, 'next_before_revision', path),
+    has_more: fBool(object, 'has_more', path),
+  };
+}
+
 export function validateMessagePage(json: Json): NativeMessagePage {
   const path = 'GET /native/messages';
   const object = asObject(json, path);
@@ -2289,6 +2389,48 @@ export class NativeClient {
       `/native/session/${encodeURIComponent(sessionId)}/tournaments/${encodeURIComponent(tournamentId)}/abort`,
       { body, validate: validateTournament },
     );
+  }
+
+  /**
+   * One bounded newest-first page of the path session's run-family board
+   * (`GET /native/session/{id}/board`). `since` is the exclusive OLDER-page
+   * cursor returned as `next_before_revision`; `limit` is bounded by the
+   * server (1..=MAX_BOARD_PAGE, oversized limits are a typed 400).
+   */
+  board(
+    sessionId: string,
+    page: { since?: number; limit?: number } = {},
+  ): Promise<NativeBoardPage> {
+    return this.request('GET', `/native/session/${encodeURIComponent(sessionId)}/board`, {
+      query: { since: page.since, limit: page.limit },
+      validate: validateBoardPage,
+    });
+  }
+
+  /**
+   * Append one bounded post AS the session (`POST .../board`, 201). The
+   * server owns family scoping, terminal-child refusal and every text bound:
+   * a hostile/oversized post is a typed 4xx, never silently truncated. Both
+   * subject and body are non-empty by the durable authority's own rule.
+   */
+  boardPost(
+    sessionId: string,
+    post: { subject: string; body: string; refs?: readonly string[] },
+  ): Promise<NativeBoardPost> {
+    if (post.subject.trim().length === 0 || post.body.trim().length === 0) {
+      throw new NativeProtocolError(
+        'POST /native/session/{id}/board',
+        'board subject and body must both be non-empty',
+      );
+    }
+    return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/board`, {
+      body: {
+        subject: post.subject,
+        body: post.body,
+        ...(post.refs !== undefined && post.refs.length > 0 ? { refs: [...post.refs] } : {}),
+      },
+      validate: validateBoardPost,
+    });
   }
 
   messages(

@@ -76,25 +76,58 @@ fi
 
 # ---------------------------------------------------------- semantic truth
 #
+# Every semantic assertion below is derived from a source artifact. A
+# contradiction fails with the EXACT original line (line number + text) so
+# the fix is unambiguous; when a wrapped phrase defeats line matching, the
+# whitespace-normalized matching fragment is printed instead.
+#
 # Whitespace-normalized view of one doc (line wrapping must not hide a
 # contradiction).
 normalized() {
     tr '\n' ' ' < "$1" | tr -s ' ' | sed 's/7\.1\.2/712/g'
 }
 
-# 1. Completion-step execution: the runner is in the tree, so no truth doc
-#    may still call execution a follow-up or claim no runner exists.
+# Prints the first original lines matching an ERE (line numbers included).
+raw_lines() {
+    local doc="$1" re="$2"
+    grep -n -i -E "$re" "$doc" 2>/dev/null | head -n 3 || true
+}
+
+# Prints the first normalized fragment matching an ERE (for wrapped claims).
+normalized_fragment() {
+    local doc="$1" re="$2"
+    normalized "$doc" | grep -oE -i "[^.]{0,120}(${re})[^.]{0,120}" | head -n 1 || true
+}
+
+# Fails when a truth doc matches a contradiction regex; prints the evidence.
+assert_no_contradiction() {
+    local doc="$1" re="$2" message="$3" evidence
+    [ -f "$doc" ] || return 0
+    if normalized "$doc" | grep -Eqi "$re"; then
+        echo "CONTRADICTION: $doc: $message" >&2
+        evidence="$(raw_lines "$doc" "$re")"
+        if [ -n "$evidence" ]; then
+            echo "  exact line(s):" >&2
+            printf '%s\n' "$evidence" >&2
+        else
+            echo "  wrapped claim: $(normalized_fragment "$doc" "$re")" >&2
+        fi
+        fail=1
+    fi
+}
+
+# 1. Completion-step execution: crates/orchestrator/src/completion_steps.rs
+#    exists and executes, so no truth doc may call execution a follow-up or
+#    claim no automatic runner exists. ("follow-up" assertions only apply in
+#    that case; the file IS the CompletionStepRunner.)
 if [ -f crates/orchestrator/src/completion_steps.rs ]; then
     for doc in "${TRUTH_DOCS[@]}"; do
-        [ -f "$doc" ] || continue
-        if normalized "$doc" | grep -Eqi 'execution[^.]{0,60}follow[- ]?up'; then
-            echo "CONTRADICTION: $doc still calls completion-step execution a follow-up, but crates/orchestrator/src/completion_steps.rs exists" >&2
-            fail=1
-        fi
-        if normalized "$doc" | grep -Eqi '(no|without)[^.]{0,40}automatic[^.]{0,80}(commit|push|pr)[^.]{0,60}runner'; then
-            echo "CONTRADICTION: $doc claims there is no automatic commit/push/PR runner, but crates/orchestrator/src/completion_steps.rs exists" >&2
-            fail=1
-        fi
+        assert_no_contradiction "$doc" \
+            'execution[^.]{0,60}follow[- ]?up' \
+            "still calls completion-step execution a follow-up, but crates/orchestrator/src/completion_steps.rs exists and executes"
+        assert_no_contradiction "$doc" \
+            '(no|without)[^.]{0,40}automatic[^.]{0,80}(commit|push|pr)[^.]{0,60}runner' \
+            "claims there is no automatic commit/push/PR runner, but crates/orchestrator/src/completion_steps.rs exists and executes"
     done
     if ! grep -q 'completion_steps\.rs' README.md docs/certification.md 2>/dev/null; then
         echo "MISSING: the completion-step executor (crates/orchestrator/src/completion_steps.rs) is not referenced by README.md or docs/certification.md" >&2
@@ -102,20 +135,22 @@ if [ -f crates/orchestrator/src/completion_steps.rs ]; then
     fi
 fi
 
-# 2. Windows Job Objects: AssignProcessToJobObject is real, so the docs may
-#    not describe Job Objects as a future/target mechanism.
+# 2. Windows Job Objects: the sources call CreateJobObjectW AND
+#    AssignProcessToJobObject, so no truth doc may describe Job Objects as a
+#    future/target mechanism.
 if grep -Rq 'AssignProcessToJobObject' crates/winjob/src 2>/dev/null; then
     for doc in "${TRUTH_DOCS[@]}"; do
-        [ -f "$doc" ] || continue
-        if normalized "$doc" | grep -Eqi 'job objects?[^.]{0,80}(future|target|planned|not yet|eventually|follow[- ]?up|todo)'; then
-            echo "CONTRADICTION: $doc calls Windows Job Objects a future/target mechanism, but crates/winjob uses AssignProcessToJobObject" >&2
-            fail=1
-        fi
-        if normalized "$doc" | grep -Eqi '(future|target|planned|not yet)[^.]{0,60}job objects?'; then
-            echo "CONTRADICTION: $doc calls Windows Job Objects a future/target mechanism, but crates/winjob uses AssignProcessToJobObject" >&2
-            fail=1
-        fi
+        assert_no_contradiction "$doc" \
+            'job objects?[^.]{0,80}(future|target|planned|not yet|eventually|follow[- ]?up|todo)' \
+            "calls Windows Job Objects a future/target mechanism, but crates/winjob uses AssignProcessToJobObject (and CreateJobObjectW)"
+        assert_no_contradiction "$doc" \
+            '(future|target|planned|not yet)[^.]{0,60}job objects?' \
+            "calls Windows Job Objects a future/target mechanism, but crates/winjob uses AssignProcessToJobObject (and CreateJobObjectW)"
     done
+    if ! grep -q 'CreateJobObjectW' README.md; then
+        echo "MISSING: README.md does not name CreateJobObjectW, the constructor crates/winjob actually uses" >&2
+        fail=1
+    fi
     if ! grep -qi 'job object' README.md; then
         echo "MISSING: README.md does not document the Windows Job Object containment (crates/winjob)" >&2
         fail=1
@@ -123,30 +158,58 @@ if grep -Rq 'AssignProcessToJobObject' crates/winjob/src 2>/dev/null; then
 fi
 
 # 3. Vendored VS Code webview: ui/upstream.json means the upstream tree IS
-#    vendored. Generic "not vendored" claims contradict it; only explicitly
+#    vendored, and the VSIX staging step (prepackage:vsix) ships it under
+#    media/. Generic "not vendored" claims contradict BOTH; only explicitly
 #    JetBrains-7.1.2-scoped statements are allowed.
-if [ -f ui/upstream.json ]; then
+VSIX_STAGING=apps/vscode/scripts/prepare-vendored-webview.mjs
+if [ -f ui/upstream.json ] && [ -f "$VSIX_STAGING" ]; then
     for doc in "${TRUTH_DOCS[@]}"; do
         [ -f "$doc" ] || continue
-        if normalized "$doc" | grep -q 'not vendored in this repo'; then
-            echo "CONTRADICTION: $doc says the UI is 'not vendored in this repo', but ui/upstream.json exists (the v7.5.6 webview is vendored)" >&2
+        doc_fail=0
+        raw_count=0
+        while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            raw_count=$((raw_count + 1))
+            lineno="${entry%%:*}"
+            line="${entry#*:}"
+            case "$line" in
+                *JetBrains*|*jetbrains*|*7.1.2*|*712*) continue ;;
+            esac
+            echo "CONTRADICTION: $doc:$lineno says the UI is not vendored without a JetBrains-7.1.2 scope, but ui/upstream.json exists and prepackage:vsix stages the pinned closure + overlay into media/" >&2
+            echo "  exact line: $line" >&2
+            doc_fail=1
+        done < <(grep -n -i 'not vendored' "$doc" || true)
+        # A wrapped claim ("not\nvendored") evades line matching entirely;
+        # catch it via the normalized view and print the matching fragment.
+        if [ "$raw_count" -eq 0 ] && normalized "$doc" | grep -Eqi 'not[[:space:]]+vendored'; then
+            echo "CONTRADICTION: $doc contains a wrapped 'not vendored' claim that no single line captured; normalized evidence follows" >&2
+            echo "  wrapped claim: $(normalized_fragment "$doc" 'not[[:space:]]+vendored')" >&2
+            doc_fail=1
+        fi
+        if [ "$doc_fail" -ne 0 ]; then
             fail=1
         fi
-        while IFS= read -r fragment; do
-            [ -z "$fragment" ] && continue
-            case "$fragment" in
-                *JetBrains*|*jetbrains*|*712*) ;;
-                *)
-                    echo "CONTRADICTION: $doc says the UI is not vendored without scoping the claim to JetBrains 7.1.2 while ui/upstream.json exists:${fragment}" >&2
-                    fail=1
-                    ;;
-            esac
-        done < <(normalized "$doc" | grep -oE '[^.]*not vendored[^.]*' || true)
     done
     if ! grep -q 'ui/upstream\.json' README.md; then
         echo "MISSING: README.md does not reference the vendored-UI manifest (ui/upstream.json)" >&2
         fail=1
     fi
+fi
+
+# 4. apps/ real panels: when the rich Faktor panels exist (task tree,
+#    tournament, board, blockers, evidence), no truth doc may describe
+#    apps/ as scaffolding/stubs/placeholders.
+if [ -f apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt ] &&
+    [ -f apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt ] &&
+    [ -f apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt ]; then
+    for doc in "${TRUTH_DOCS[@]}"; do
+        assert_no_contradiction "$doc" \
+            'apps?/[^.]{0,100}(scaffold|scaffolding|stub|placeholder)' \
+            "calls apps/ scaffolding/stubs, but the real Faktor panels exist (BoardPanel/TaskTreePanel/TournamentPanel)"
+        assert_no_contradiction "$doc" \
+            '(scaffold|scaffolding|stub|placeholder)[^.]{0,100}apps?/' \
+            "calls apps/ scaffolding/stubs, but the real Faktor panels exist (BoardPanel/TaskTreePanel/TournamentPanel)"
+    done
 fi
 
 if [ "$fail" -ne 0 ]; then
@@ -155,4 +218,4 @@ if [ "$fail" -ne 0 ]; then
 fi
 
 echo "docs/architecture.md is in sync: no stale identifiers, current API names present."
-echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, vendored UI)."
+echo "${TRUTH_DOCS[*]} pass the semantic truth assertions (completion execution, Windows Job Objects, vendored UI + VSIX staging, real apps/ panels)."

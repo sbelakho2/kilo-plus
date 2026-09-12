@@ -247,6 +247,42 @@ const agentsJson = [
 ];
 const controlAckJson = { queuedSeq: 3, applied: null };
 const presentationAckJson = { child_id: 'c1', presentation: 'background', changed: true };
+const boardPostJson = {
+  id: 3,
+  board_id: 7,
+  author_child: 8,
+  author_session: 8,
+  subject: 'handoff',
+  body: 'main step ready',
+  refs: ['evidence:41'],
+  revision: 3,
+  created_ms: 1700,
+};
+const boardRootPostJson = {
+  id: 2,
+  board_id: 7,
+  author_child: null,
+  author_session: 7,
+  subject: 'root note',
+  body: 'no children yet',
+  refs: [],
+  revision: 2,
+  created_ms: 1600,
+};
+const boardPageJson = {
+  board_id: 7,
+  revision: 3,
+  posts: [boardPostJson, boardRootPostJson],
+  next_before_revision: 2,
+  has_more: true,
+};
+const emptyBoardPageJson = {
+  board_id: 7,
+  revision: 0,
+  posts: [],
+  next_before_revision: null,
+  has_more: false,
+};
 const tournamentJson = {
   id: 't-1',
   run_family: 'run-7',
@@ -528,6 +564,11 @@ async function validatorAccepts() {
     delete aggregateUsage.durable.reservations.routeDecisions;
     assertDeepEqual(nc.validateUsage(aggregateUsage).durable.reservations.routeDecisions, []);
     assertEqual(nc.validateTaskVerification(clone(taskVerificationJson)).records[0].checks[0].exit, 0);
+    assertEqual(nc.validateBoardPage(clone(boardPageJson)).posts[0].revision, 3);
+    assertEqual(nc.validateBoardPage(clone(boardPageJson)).posts[1].author_child, null);
+    assertEqual(nc.validateBoardPage(clone(boardPageJson)).next_before_revision, 2);
+    assertEqual(nc.validateBoardPage(clone(emptyBoardPageJson)).revision, 0, 'an empty board has revision 0');
+    assertEqual(nc.validateBoardPost(clone(boardPostJson)).subject, 'handoff');
     assertEqual(nc.validateEvidence(clone(evidenceJson)).id, 41);
     assertEqual(nc.validateEvidenceRetrieval(clone(evidenceRetrievalJson)).byteLen, 3);
     assertEqual(nc.validateSemanticStatus(clone(semanticStatusJson)).providerCount, 0);
@@ -602,6 +643,31 @@ async function validatorRejects() {
     assertProtocol(() => nc.validateSemanticStatus({ ...clone(semanticStatusJson), fallback: null }), 'expected an object');
     assertProtocol(() => nc.validateCheckpoints([{ ...clone(checkpointJson), beforeExists: 'nope' }]), 'expected a boolean');
     assertProtocol(() => nc.validateTaskViews([{ ...clone(taskViewJson), budget: { ...clone(budgetJson), spentCostMicro: '12' } }]), 'expected a finite number');
+    // Board: absent fields, hostile types and phantom entries fail loudly.
+    const missingBoardField = clone(boardPageJson);
+    delete missingBoardField.has_more;
+    assertProtocol(() => nc.validateBoardPage(missingBoardField), 'missing required field has_more');
+    assertProtocol(
+      () => nc.validateBoardPage({ ...clone(boardPageJson), posts: [{ ...clone(boardPostJson), revision: 0 }] }),
+      'expected a positive integer',
+    );
+    assertProtocol(
+      () => nc.validateBoardPage({ ...clone(boardPageJson), posts: [{ ...clone(boardPostJson), author_child: 'root' }] }),
+      'expected an integer or null',
+    );
+    assertProtocol(
+      () => nc.validateBoardPage({ ...clone(boardPageJson), revision: -1 }),
+      'expected a non-negative integer',
+    );
+    assertProtocol(
+      () => nc.validateBoardPage({ ...clone(boardPageJson), posts: [{ ...clone(boardPostJson), refs: [7] }] }),
+      'expected a string',
+    );
+    assertProtocol(
+      () => nc.validateBoardPost({ ...clone(boardPostJson), id: 3.5 }),
+      'expected an integer',
+    );
+    assertProtocol(() => nc.validateBoardPost({}), 'missing required field id');
   });
 }
 
@@ -639,6 +705,8 @@ async function clientAccepts() {
       'POST /native/session/7/tournaments/t-1/decide': () => jsonResponse(tournamentDecisionJson),
       'POST /native/session/7/tournaments/t-1/abort': () =>
         jsonResponse({ ...clone(tournamentJson), state: 'aborted' }),
+      'GET /native/session/7/board': () => jsonResponse(boardPageJson),
+      'POST /native/session/7/board': () => jsonResponse(boardPostJson),
       'GET /native/messages': () => jsonResponse(messagePageJson),
       'GET /native/events': () => jsonResponse(eventPageJson),
       'GET /native/usage': () => jsonResponse(usageTotalsJson),
@@ -688,6 +756,13 @@ async function clientAccepts() {
     );
     assertEqual((await client.decideTournament('7', 't-1')).winner, 'child-0');
     assertEqual((await client.abortTournament('7', 't-1', 'smoke reason')).state, 'aborted');
+    assertEqual((await client.board('7', { since: 9, limit: 2 })).posts[0].subject, 'handoff');
+    assertEqual((await client.board('7')).next_before_revision, 2);
+    assertEqual(
+      (await client.boardPost('7', { subject: 'status', body: 'all green', refs: ['evidence:41'] }))
+        .revision,
+      3,
+    );
     assertEqual((await client.messages('7', { before: 9, limit: 2 })).messages[0].id, 2);
     assertEqual((await client.events('7', { after: 7, limit: 3 })).events[0].seq, 1);
     assertEqual((await client.usage()).sessions, 1);
@@ -738,6 +813,15 @@ async function clientAccepts() {
       selector: 'all',
     });
     assertDeepEqual(findCall(calls, 'POST', '/native/evidence/41/retrieve').query, { session: '7' });
+    assertDeepEqual(findCall(calls, 'GET', '/native/session/7/board').query, {
+      since: '9',
+      limit: '2',
+    });
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/board').body, {
+      subject: 'status',
+      body: 'all green',
+      refs: ['evidence:41'],
+    });
     assertDeepEqual(findCall(calls, 'POST', '/native/session/7/abort').body, {
       session_id: '7',
       op_id: '3',
@@ -1495,6 +1579,208 @@ async function completionContractTests() {
   });
 }
 
+
+// -------------- 7c. board state projection + webview forwarding hardening
+
+async function boardAndForwardingTests() {
+  await test('board pages project posts, unread and the read watermark', () => {
+    const first = st.boardStateFromPage(clone(boardPageJson), null);
+    assertEqual(first.board.available, true);
+    assertEqual(first.board.source, 'native');
+    assertEqual(first.board.revision, 3);
+    assertEqual(first.board.unread, 2, 'a null watermark counts every page post as unread');
+    assertEqual(first.board.posts[0].id, '3');
+    assertEqual(first.board.posts[0].author, 'child:8');
+    assertEqual(first.board.posts[1].author, 'root');
+    assertDeepEqual(first.board.posts[0].refs, ['evidence:41']);
+    assertEqual(first.board.posts[0].createdMs, 1700);
+    assertEqual(first.watermark, 3);
+
+    // The watermark acknowledges exactly the revisions at-or-below it.
+    assertEqual(st.boardStateFromPage(clone(boardPageJson), 2).board.unread, 1);
+    assertEqual(st.boardStateFromPage(clone(boardPageJson), 3).board.unread, 0);
+    assertEqual(st.boardStateFromPage(clone(emptyBoardPageJson), 3).board.unread, 0);
+    assertEqual(st.boardStateFromPage(clone(emptyBoardPageJson), 3).board.revision, 0);
+
+    // Unavailable is explicit and never fabricates posts.
+    const unavailable = st.unavailableBoardState('route absent (HTTP 404 not_found)');
+    assertEqual(unavailable.available, false);
+    assertEqual(unavailable.posts.length, 0);
+    assertEqual(unavailable.unread, null);
+    assert(unavailable.reason.includes('404'), unavailable.reason);
+
+    // Host re-validation: board gestures are bounded before the wire.
+    assertDeepEqual(st.parseBoardReadRequest(undefined, undefined), { since: null, limit: null });
+    assertDeepEqual(st.parseBoardReadRequest(5, 10), { since: 5, limit: 10 });
+    for (const [since, limit] of [
+      [0, null],
+      [-1, null],
+      [1.5, null],
+      ['5', null],
+      [null, 0],
+      [null, 101],
+      [null, 1.5],
+    ]) {
+      const parsed = st.parseBoardReadRequest(since, limit);
+      assert('reason' in parsed, `hostile board read must be refused: ${since}/${limit}`);
+    }
+    assertDeepEqual(st.parseBoardPostRequest({ subject: ' s ', body: ' b ', refs: [' r '] }), {
+      subject: 's',
+      body: ' b ',
+      refs: ['r'],
+    });
+    for (const hostile of [
+      {},
+      { subject: '   ', body: 'b' },
+      { subject: 's' },
+      { subject: 's', body: '' },
+      { subject: 's', body: 'b', refs: 'nope' },
+      { subject: 's', body: 'b', refs: [''] },
+      { subject: 's'.repeat(513), body: 'b' },
+      { subject: 's', body: 'b'.repeat(16 * 1024 + 1) },
+    ]) {
+      const parsed = st.parseBoardPostRequest(hostile);
+      assert('reason' in parsed, `hostile board post must be refused: ${JSON.stringify(hostile)}`);
+    }
+  });
+
+  await test('the client refuses empty board posts locally (no request is made)', async () => {
+    const { client, calls } = makeClient({});
+    assertProtocol(() => client.boardPost('7', { subject: ' ', body: 'b' }));
+    assertProtocol(() => client.boardPost('7', { subject: 's', body: ' ' }));
+    assertEqual(calls.length, 0, 'invalid board posts must never reach the wire');
+  });
+
+  await test('composer files are bounded per-entry and forwarded to the native task-run', async () => {
+    const { files, refused } = ts.boundedWebviewFiles([
+      'src/a.ts',
+      '  docs/b.md  ',
+      '',
+      '  ',
+      7,
+      null,
+      '../escape.txt',
+      'dir/../up.txt',
+      'ctrl\u0000name',
+      '/abs/escape.rs',
+      'C:\\abs\\escape.rs',
+      'data:image/png;base64,AAAA',
+      'file:///etc/passwd',
+      'x'.repeat(4097),
+      ...Array.from({ length: 70 }, (_, i) => `f${i}.ts`),
+    ]);
+    assertEqual(files.length, 64, 'the accepted list is capped at MAX_WEBVIEW_FILES');
+    assertEqual(files[0], 'src/a.ts');
+    assertEqual(files[1], 'docs/b.md', 'accepted paths are trimmed');
+    assert(
+      refused.some((entry) => entry.reason.includes('traverses outside the workspace')),
+      JSON.stringify(refused),
+    );
+    assert(
+      refused.some((entry) => entry.reason.includes('control characters')),
+      JSON.stringify(refused),
+    );
+    assert(
+      refused.some((entry) => entry.reason.includes('4096')),
+      JSON.stringify(refused),
+    );
+    assert(
+      refused.some((entry) => entry.reason.includes('more than 64')),
+      JSON.stringify(refused),
+    );
+    assert(
+      refused.some((entry) => entry.reason.includes('workspace-relative paths only')),
+      JSON.stringify(refused),
+    );
+    assert(
+      refused.some((entry) => entry.reason.includes('must be workspace-relative')),
+      JSON.stringify(refused),
+    );
+    assertDeepEqual(ts.boundedWebviewFiles(undefined), { files: [], refused: [] });
+    assertEqual(ts.boundedWebviewFiles('nope').refused[0].index, 0);
+
+    // The accepted subset reaches ONE native task-run request alongside the
+    // submitted contract (an explicit work item), never a silent drop.
+    const captured = [];
+    const outcome = await ts.startTaskRun({
+      client: {
+        startTaskRun: async (_sessionId, request) => {
+          captured.push(request);
+          return taskRunStartedJson;
+        },
+      },
+      sessionId: '7',
+      goal: 'ship it',
+      settings: {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0,
+        files,
+        completionContract: { include_commit: true, include_push: false, include_pr: true },
+      },
+      onStarted: () => {},
+      onFailure: () => {
+        throw new Error('must not fail');
+      },
+    });
+    assertEqual(outcome.ok, true);
+    assertEqual(captured.length, 1);
+    assertEqual(captured[0].files.length, 64);
+    assertDeepEqual(captured[0].completion_contract, {
+      include_commit: true,
+      include_push: false,
+      include_pr: true,
+    });
+    assertEqual(captured[0].work_items[0].id, 'main');
+    assertEqual(captured[0].work_items[0].kind, 'Implementation');
+  });
+
+  await test('a malformed completion contract is refused with a typed reason', () => {
+    assertDeepEqual(ts.parseCompletionContract(undefined), { contract: null });
+    assertDeepEqual(ts.parseCompletionContract(null), { contract: null });
+    assertDeepEqual(
+      ts.parseCompletionContract({
+        include_commit: false,
+        include_push: false,
+        include_pr: false,
+      }),
+      { contract: null },
+      'all-false is the default path, not a contract',
+    );
+    assertDeepEqual(
+      ts.parseCompletionContract({
+        include_commit: true,
+        include_push: false,
+        include_pr: true,
+      }),
+      { contract: { include_commit: true, include_push: false, include_pr: true } },
+    );
+    for (const hostile of [
+      'commit',
+      ['include_commit'],
+      true,
+      42,
+      {},
+      { include_commit: true },
+      { include_commit: 'yes', include_push: false, include_pr: false },
+      { include_commit: true, include_push: false, include_pr: false, include_release: true },
+    ]) {
+      const parsed = ts.parseCompletionContract(hostile);
+      assert(
+        'reason' in parsed && parsed.reason.length > 0,
+        `hostile contract must carry a typed reason: ${JSON.stringify(hostile)}`,
+      );
+    }
+    // Inherited members cannot smuggle a contract through the parser.
+    const inherited = Object.create({
+      include_commit: true,
+      include_push: false,
+      include_pr: false,
+    });
+    const parsed = ts.parseCompletionContract(inherited);
+    assert('reason' in parsed, 'inherited-only members must be refused');
+  });
+}
 
 async function draftPreservationTests() {
   await test('composer clears the draft only after a successful start', () => {
@@ -2900,6 +3186,7 @@ async function main() {
   await daemonTests();
   await shadowDefaultTests();
   await completionContractTests();
+  await boardAndForwardingTests();
   await draftPreservationTests();
   await runStateTests();
   await workspaceBindingTests();

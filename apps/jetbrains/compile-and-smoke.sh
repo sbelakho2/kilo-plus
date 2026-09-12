@@ -26,6 +26,7 @@ $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/BlockersPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/BoardPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/EvidenceNavigatorPanel.kt
 $JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AttachmentsPanel.kt"
 

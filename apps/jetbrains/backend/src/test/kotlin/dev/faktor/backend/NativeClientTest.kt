@@ -24,6 +24,8 @@ import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBoardPage
+import dev.faktor.shared.parseNativeBoardPost
 import dev.faktor.shared.parseNativeEvidence
 import dev.faktor.shared.parseNativeEvidenceRetrieval
 import dev.faktor.shared.parseNativeHealth
@@ -132,6 +134,21 @@ private const val TASK_RUN_STARTED_JSON =
 
 private const val TASK_RUN_CANCELLED_JSON =
     "{\"run_id\":\"run-1\",\"cancelled\":true}"
+
+private const val BOARD_PAGE_JSON = "{" +
+    "\"board_id\":7,\"revision\":3,\"posts\":[" +
+    "{\"id\":3,\"board_id\":7,\"author_child\":8,\"author_session\":8," +
+    "\"subject\":\"handoff\",\"body\":\"ready\",\"refs\":[\"evidence:41\"]," +
+    "\"revision\":3,\"created_ms\":1700}," +
+    "{\"id\":2,\"board_id\":7,\"author_child\":null,\"author_session\":7," +
+    "\"subject\":\"root\",\"body\":\"note\",\"refs\":[]," +
+    "\"revision\":2,\"created_ms\":1600}" +
+    "],\"next_before_revision\":2,\"has_more\":true}"
+
+private const val BOARD_POST_JSON = "{" +
+    "\"id\":3,\"board_id\":7,\"author_child\":8,\"author_session\":8," +
+    "\"subject\":\"handoff\",\"body\":\"ready\",\"refs\":[]," +
+    "\"revision\":3,\"created_ms\":1700}"
 
 private const val AGENTS_JSON = "[" +
     "{\"agent_id\":\"child-1\",\"kind\":\"child\",\"run_id\":\"run-1\"," +
@@ -264,6 +281,11 @@ private fun assertRequestBodies() {
     assertEquals("{\"max_cost_micro\":5}", NativeRequests.changeBudget(maxCostMicro = 5))
     assertEquals("{\"selector\":\"all\"}", NativeRequests.evidenceSelectorAll())
     assertEquals("{\"text\":\"a\\\"b\\n\"}", NativeRequests.steer("a\"b\n"))
+    assertEquals(
+        "{\"subject\":\"s\",\"body\":\"b\",\"refs\":[\"r1\",\"r2\"]}",
+        NativeRequests.boardPost("s", "b", listOf("r1", "r2"))
+    )
+    assertEquals("{\"subject\":\"s\",\"body\":\"b\"}", NativeRequests.boardPost("s", "b"))
 }
 
 // ---------------------------------------------------------- response parsers
@@ -301,6 +323,17 @@ private fun assertResponseParsers() {
     assertEquals(3L, runs[0].taskId)
     assertEquals("Running", parseNativeTaskRunStarted(TASK_RUN_STARTED_JSON).state)
     assertEquals(true, parseNativeTaskRunCancelled(TASK_RUN_CANCELLED_JSON).cancelled)
+
+    val board = parseNativeBoardPage(BOARD_PAGE_JSON)
+    assertEquals(7L, board.boardId)
+    assertEquals(3L, board.revision)
+    assertEquals(2, board.posts.size)
+    assertEquals(8L, board.posts[0].authorChild)
+    assertEquals(null, board.posts[1].authorChild)
+    assertEquals(listOf("evidence:41"), board.posts[0].refs)
+    assertEquals(2L, board.nextBeforeRevision)
+    assertEquals(true, board.hasMore)
+    assertEquals(3L, parseNativeBoardPost(BOARD_POST_JSON).revision)
 
     val agents = parseNativeAgents(AGENTS_JSON)
     assertEquals("child-1", agents[0].agentId)
@@ -360,6 +393,26 @@ private fun assertHostileParsers() {
         fail("invalid base64 must be rejected")
     } catch (e: NativeProtocolException) {
         // expected
+    }
+    // Board drift: a missing page field, a typed author and a phantom post
+    // step all fail loudly (never a silently empty board).
+    for (text in listOf(
+        "{\"board_id\":7,\"revision\":3,\"posts\":[],\"next_before_revision\":null}",
+        "{\"board_id\":7,\"revision\":3,\"posts\":[" +
+            "{\"id\":3,\"board_id\":7,\"author_child\":\"root\",\"author_session\":7," +
+            "\"subject\":\"s\",\"body\":\"b\",\"refs\":[],\"revision\":3," +
+            "\"created_ms\":1}],\"next_before_revision\":null,\"has_more\":false}",
+        "{\"board_id\":7,\"revision\":\"3\",\"posts\":[]," +
+            "\"next_before_revision\":null,\"has_more\":false}",
+        "{\"board_id\":7,\"revision\":3,\"posts\":{}," +
+            "\"next_before_revision\":null,\"has_more\":false}"
+    )) {
+        try {
+            parseNativeBoardPage(text)
+            fail("hostile board page must be rejected: $text")
+        } catch (e: NativeProtocolException) {
+            // expected
+        }
     }
 }
 
@@ -576,6 +629,8 @@ private fun assertClientRoutes() {
     daemon.on("GET", "/native/messages") { _, response -> response.json(200, MESSAGES_JSON) }
     daemon.on("GET", "/native/events") { _, response -> response.json(200, EVENTS_JSON) }
     daemon.on("GET", "/native/session/7/tasks") { _, response -> response.json(200, TASKS_JSON) }
+    daemon.on("GET", "/native/session/7/board") { _, response -> response.json(200, BOARD_PAGE_JSON) }
+    daemon.on("POST", "/native/session/7/board") { _, response -> response.json(201, BOARD_POST_JSON) }
     daemon.on("GET", "/native/session/7/task-runs") { _, response ->
         response.json(200, TASK_RUNS_JSON)
     }
@@ -619,6 +674,8 @@ private fun assertClientRoutes() {
         assertEquals("run-1", client.taskRunState("7", "run-1").runId)
         client.startTaskRun("7", "g")
         client.cancelTaskRun("7", "run-1")
+        assertEquals("handoff", client.board("7", since = 9L, limit = 2L).posts[0].subject)
+        assertEquals(3L, client.boardPost("7", "handoff", "ready", listOf("evidence:41")).revision)
         assertEquals("child-1", client.agents("7")[0].agentId)
         client.pauseAgent("child-1")
         client.resumeAgent("child-1")
@@ -643,6 +700,15 @@ private fun assertClientRoutes() {
         )
         val prompt = daemon.requests.first { it.path == "/session/prompt" }
         assertEquals("{\"session_id\":\"7\",\"prompt\":\"hi\"}", prompt.body)
+        val boardRead = daemon.requests.first {
+            it.method == "GET" && it.path == "/native/session/7/board"
+        }
+        assertEquals("9", boardRead.query["since"])
+        assertEquals("2", boardRead.query["limit"])
+        val boardPost = daemon.requests.first {
+            it.method == "POST" && it.path == "/native/session/7/board"
+        }
+        assertEquals("{\"subject\":\"handoff\",\"body\":\"ready\",\"refs\":[\"evidence:41\"]}", boardPost.body)
         for (action in listOf("pause", "resume", "cancel", "retry", "steer", "model", "budget")) {
             assertEquals(
                 1,

@@ -558,6 +558,33 @@ data class NativeTaskRunStarted(val taskId: Long, val runId: String, val state: 
 
 data class NativeTaskRunCancelled(val runId: String, val cancelled: Boolean)
 
+/**
+ * One durable run-family board post (`GET/POST /native/session/{id}/board`).
+ * `authorChild` null means the run root posted; `revision` is the per-board
+ * monotonic cursor (id == revision).
+ */
+data class NativeBoardPost(
+    val id: Long,
+    val boardId: Long,
+    val authorChild: Long?,
+    val authorSession: Long,
+    val subject: String,
+    val body: String,
+    val refs: List<String>,
+    val revision: Long,
+    val createdMs: Long
+)
+
+/** One bounded newest-first page of the path session's board. */
+data class NativeBoardPage(
+    val boardId: Long,
+    val revision: Long,
+    val posts: List<NativeBoardPost>,
+    /** Exclusive cursor for the next OLDER page (passed back as `since`). */
+    val nextBeforeRevision: Long?,
+    val hasMore: Boolean
+)
+
 data class NativeAgent(
     val agentId: String,
     val kind: String,
@@ -1034,6 +1061,34 @@ fun parseNativeTaskViews(json: String): List<NativeTaskView> {
     }
 }
 
+private fun parseBoardPost(v: JsonView): NativeBoardPost = NativeBoardPost(
+    id = v.field("id").long(),
+    boardId = v.field("board_id").long(),
+    authorChild = v.optionalField("author_child")?.long(),
+    authorSession = v.field("author_session").long(),
+    subject = v.field("subject").string(),
+    body = v.field("body").string(),
+    refs = v.field("refs").stringArray(),
+    revision = v.field("revision").long(),
+    createdMs = v.field("created_ms").long()
+)
+
+/** Strict parse of one board page (`GET /native/session/{id}/board`). */
+fun parseNativeBoardPage(json: String): NativeBoardPage {
+    val v = JsonCodec.parse(json).view("GET /native/session/{id}/board")
+    return NativeBoardPage(
+        boardId = v.field("board_id").long(),
+        revision = v.field("revision").long(),
+        posts = v.field("posts").array().map { parseBoardPost(it) },
+        nextBeforeRevision = v.optionalField("next_before_revision")?.long(),
+        hasMore = v.field("has_more").bool()
+    )
+}
+
+/** Strict parse of one board post response (`POST .../board`, 201). */
+fun parseNativeBoardPost(json: String): NativeBoardPost =
+    parseBoardPost(JsonCodec.parse(json).view("POST /native/session/{id}/board"))
+
 fun parseNativeTaskRuns(json: String): List<NativeTaskRun> {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/task-runs")
     return v.array().map {
@@ -1496,6 +1551,13 @@ object NativeRequests {
 
     fun changePresentation(presentation: String): String =
         JsonObjectBuilder().put("state", presentation).toJson()
+
+    /** One bounded board post body; the daemon re-validates every bound. */
+    fun boardPost(subject: String, body: String, refs: List<String>? = null): String {
+        val builder = JsonObjectBuilder().put("subject", subject).put("body", body)
+        if (!refs.isNullOrEmpty()) builder.putStrings("refs", refs)
+        return builder.toJson()
+    }
 
     fun changeModel(model: String): String = JsonObjectBuilder().put("model", model).toJson()
 

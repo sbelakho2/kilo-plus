@@ -20,6 +20,126 @@ import type {
 /** The `faktor.mutationMode` setting vocabulary. `''` = inherit-daemon. */
 export type MutationModeSetting = '' | 'shadow' | 'direct_compat';
 
+/** Bounds of one composer attachment list (mirror the daemon's own caps). */
+export const MAX_WEBVIEW_FILES = 64;
+export const MAX_WEBVIEW_FILE_CHARS = 4096;
+
+/** One refused composer attachment (kept, never a whole-message drop). */
+export interface WebviewFileRefusal {
+  readonly index: number;
+  readonly reason: string;
+}
+
+/**
+ * Bounded composer attachment mapping. Every malformed entry is refused
+ * individually with a reason (never echoed unbounded), the containing
+ * message is never dropped wholesale because of it, and the goal always
+ * survives. Paths are structural only: the daemon re-validates against the
+ * workspace before use.
+ */
+export function boundedWebviewFiles(raw: unknown): {
+  readonly files: string[];
+  readonly refused: readonly WebviewFileRefusal[];
+} {
+  const files: string[] = [];
+  const refused: WebviewFileRefusal[] = [];
+  if (raw === undefined || raw === null) {
+    return { files, refused };
+  }
+  if (!Array.isArray(raw)) {
+    return { files, refused: [{ index: 0, reason: 'files must be an array of attachment paths' }] };
+  }
+  const refuse = (index: number, reason: string): void => {
+    if (refused.length < MAX_WEBVIEW_FILES) {
+      refused.push({ index, reason });
+    }
+  };
+  for (let index = 0; index < raw.length; index += 1) {
+    const entry = raw[index];
+    if (typeof entry !== 'string') {
+      refuse(index, 'attachment path must be a string');
+      continue;
+    }
+    const trimmed = entry.trim();
+    if (trimmed.length === 0) {
+      refuse(index, 'attachment path is empty');
+      continue;
+    }
+    if (trimmed.length > MAX_WEBVIEW_FILE_CHARS) {
+      refuse(index, `attachment path exceeds ${MAX_WEBVIEW_FILE_CHARS} characters`);
+      continue;
+    }
+    let control = false;
+    for (let i = 0; i < trimmed.length; i += 1) {
+      const code = trimmed.charCodeAt(i);
+      if (code < 0x20 || code === 0x7f) {
+        control = true;
+        break;
+      }
+    }
+    if (control) {
+      refuse(index, 'attachment path carries control characters');
+      continue;
+    }
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
+      // `data:`/`file:`/`vscode-remote:` bytes stay out of the native run:
+      // the DTO carries workspace-relative paths only. Surfaced, not silent.
+      refuse(index, 'attachment url schemes do not reach the native run (workspace-relative paths only)');
+      continue;
+    }
+    if (trimmed.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith('\\\\')) {
+      refuse(index, 'attachment path must be workspace-relative');
+      continue;
+    }
+    const segments = trimmed.split(/[\\/]/);
+    if (segments.some((segment) => segment === '..')) {
+      refuse(index, 'attachment path traverses outside the workspace');
+      continue;
+    }
+    if (files.length >= MAX_WEBVIEW_FILES) {
+      refuse(index, `more than ${MAX_WEBVIEW_FILES} file attachments`);
+      continue;
+    }
+    files.push(trimmed);
+  }
+  return { files, refused };
+}
+
+/**
+ * Strict completion-contract parse for the host path. `{contract:null}` for
+ * an absent value or the all-false default (today's path); `{contract}` for
+ * a valid non-default contract; `{reason}` for anything malformed — the
+ * caller must refuse the START loudly rather than silently run the task
+ * contract-free, which would claim a workflow the run never recorded.
+ */
+export function parseCompletionContract(
+  raw: unknown,
+): { readonly contract: NativeCompletionContract | null } | { readonly reason: string } {
+  if (raw === undefined || raw === null) {
+    return { contract: null };
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { reason: 'completionContract must be an object' };
+  }
+  const record = raw as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key !== 'include_commit' && key !== 'include_push' && key !== 'include_pr') {
+      return { reason: `completionContract.${key} is not a known member` };
+    }
+  }
+  for (const key of ['include_commit', 'include_push', 'include_pr'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(record, key) || typeof record[key] !== 'boolean') {
+      return { reason: `completionContract.${key} must be a boolean` };
+    }
+  }
+  const contract: NativeCompletionContract = {
+    include_commit: record.include_commit as boolean,
+    include_push: record.include_push as boolean,
+    include_pr: record.include_pr as boolean,
+  };
+  return hasCompletionSteps(contract) ? { contract } : { contract: null };
+}
+
 export interface StartTaskSettings {
   readonly mutationMode: string;
   readonly maxTokens: number;
@@ -64,27 +184,15 @@ export interface StartRunClient {
  * missing member, a typed string, an extra member, a non-object) is
  * refused as `null` — never coerced, never partially applied. An all-false
  * contract is the default behavior and returns `null` (no wire field).
+ *
+ * Callers that must distinguish "no contract" from "malformed" (and refuse
+ * the start loudly) use `parseCompletionContract`; this wrapper preserves
+ * the original `null`-on-everything-invalid contract for callers that
+ * treat both as the default path.
  */
 export function completionContractSetting(raw: unknown): NativeCompletionContract | null {
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    return null;
-  }
-  const record = raw as Record<string, unknown>;
-  const keys = Object.keys(record);
-  if (keys.some((key) => key !== 'include_commit' && key !== 'include_push' && key !== 'include_pr')) {
-    return null;
-  }
-  for (const key of ['include_commit', 'include_push', 'include_pr']) {
-    if (!Object.prototype.hasOwnProperty.call(record, key) || typeof record[key] !== 'boolean') {
-      return null;
-    }
-  }
-  const contract: NativeCompletionContract = {
-    include_commit: record.include_commit as boolean,
-    include_push: record.include_push as boolean,
-    include_pr: record.include_pr as boolean,
-  };
-  return hasCompletionSteps(contract) ? contract : null;
+  const parsed = parseCompletionContract(raw);
+  return 'reason' in parsed ? null : parsed.contract;
 }
 
 /** TRUE when the contract requests at least one conditional step. */

@@ -115,6 +115,18 @@ jobs:
         # crate with un-gated unix tests fails this lane by construction until
         # it is fixed or listed here.
         #
+        # Host cross-target evidence (2026-09-12, darwin/arm64, rustc 1.98.0
+        # = the workspace MSRV): `CARGO_FEATURE_PURE=1 cargo check --target
+        # x86_64-pc-windows-msvc -p <crate>` was run for faktor-agent,
+        # faktor-verify, faktor-index, faktor-cas and faktor-snapshot. Each
+        # records a CROSS-TOOLCHAIN SKIP (never a Rust error): zstd-sys
+        # (agent/verify/cas), libsqlite3-sys (index/snapshot) and the
+        # tree-sitter grammars (agent/index/snapshot) need an MSVC C compiler
+        # the host does not carry. The native windows runner provides it, so
+        # this lane stays the compile/test authority for those Rust sources;
+        # no crate is dropped from it because of a host-only cross-compile
+        # limit.
+        #
         # faktor-cli        test helpers use /bin/sh and std::os::unix::fs::symlink
         # faktor-hooks      tests call libc::kill (unix-only symbol; no Windows binding)
         # faktor-tests-coding-benchmark  verify harness hardcodes /bin/sh + pgrep

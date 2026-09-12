@@ -18,6 +18,8 @@ import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBoardPage
+import dev.faktor.shared.parseNativeBoardPost
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
 import dev.faktor.shared.parseNativePermissionList
@@ -115,6 +117,21 @@ private const val DUAL_MODELS_JSON = "[" +
     "\"tools\":false,\"parallelTools\":false,\"reasoning\":false,\"thinking\":true," +
     "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
     "\"streaming\":true,\"source\":\"conservativeDefault\"}]"
+
+private const val BOARD_PAGE_JSON = "{" +
+    "\"board_id\":7,\"revision\":3,\"posts\":[" +
+    "{\"id\":3,\"board_id\":7,\"author_child\":8,\"author_session\":8," +
+    "\"subject\":\"handoff\",\"body\":\"main step ready\",\"refs\":[\"evidence:41\"]," +
+    "\"revision\":3,\"created_ms\":1700}," +
+    "{\"id\":2,\"board_id\":7,\"author_child\":null,\"author_session\":7," +
+    "\"subject\":\"root note\",\"body\":\"no children yet\",\"refs\":[]," +
+    "\"revision\":2,\"created_ms\":1600}" +
+    "],\"next_before_revision\":2,\"has_more\":true}"
+
+private const val BOARD_POST_JSON = "{" +
+    "\"id\":3,\"board_id\":7,\"author_child\":8,\"author_session\":8," +
+    "\"subject\":\"handoff\",\"body\":\"main step ready\",\"refs\":[]," +
+    "\"revision\":3,\"created_ms\":1700}"
 
 private const val GRAPH_JSON = "{" +
     "\"plan_id\":\"run-1\",\"goal\":\"graph goal\",\"state\":\"Running\"," +
@@ -423,6 +440,78 @@ object FrontendSmoke {
             } finally {
                 panel.shutdown()
             }
+        }
+
+        step("canned native parsing: durable board page + post + request body") {
+            val page = parseNativeBoardPage(BOARD_PAGE_JSON)
+            assertEquals(7L, page.boardId)
+            assertEquals(3L, page.revision)
+            assertEquals(2, page.posts.size)
+            assertEquals("handoff", page.posts[0].subject)
+            assertEquals(8L, page.posts[0].authorChild)
+            assertEquals(null, page.posts[1].authorChild)
+            assertEquals(listOf("evidence:41"), page.posts[0].refs)
+            assertEquals(2L, page.nextBeforeRevision)
+            assertEquals(true, page.hasMore)
+            assertEquals(3L, parseNativeBoardPost(BOARD_POST_JSON).revision)
+            assertEquals(
+                "{\"subject\":\"s\",\"body\":\"b\",\"refs\":[\"evidence:41\"]}",
+                NativeRequests.boardPost("s", "b", listOf("evidence:41"))
+            )
+            assertEquals("{\"subject\":\"s\",\"body\":\"b\"}", NativeRequests.boardPost("s", "b"))
+            // A malformed page is a loud protocol failure, never an empty board.
+            try {
+                parseNativeBoardPage(
+                    "{\"board_id\":7,\"revision\":3,\"posts\":[]," +
+                        "\"next_before_revision\":null}"
+                )
+                fail("a board page without has_more must fail loudly")
+            } catch (e: NativeProtocolException) {
+                assertTrue(e.message?.contains("has_more") == true, e.message)
+            }
+        }
+
+        step("board panel records availability truthfully and gates the composer") {
+            val panel = BoardPanel()
+            panel.setUnavailable("no board route (status 404 not_found: no route)")
+            assertEquals(false, panel.available())
+            assertEquals(false, panel.postEnabled())
+            assertEquals(false, panel.readEnabled())
+            assertTrue(panel.headerText().contains("no board route"), panel.headerText())
+
+            var reads = 0
+            var postedSubject: String? = null
+            var postedBody: String? = null
+            panel.setListener(object : BoardPanel.Listener {
+                override fun onRead() { reads++ }
+                override fun onPost(subject: String, body: String) {
+                    postedSubject = subject
+                    postedBody = body
+                }
+            })
+            panel.setComposerFields("status", "all green")
+            panel.submitComposer()
+            assertEquals(null, postedSubject, "an unavailable panel must not post")
+            assertEquals(0, reads, "an unavailable panel must not read")
+
+            panel.setBoard(parseNativeBoardPage(BOARD_PAGE_JSON))
+            assertEquals(true, panel.available())
+            assertEquals(true, panel.postEnabled())
+            assertEquals(true, panel.readEnabled())
+            assertTrue(panel.headerText().contains("unread=2"), panel.headerText())
+            assertTrue(panel.headerText().contains("posts=2"), panel.headerText())
+            assertTrue(panel.postsText().contains("#3 [child:8] handoff"), panel.postsText())
+            assertTrue(panel.postsText().contains("#2 [root] root note"), panel.postsText())
+            panel.submitComposer()
+            assertEquals("status", postedSubject)
+            assertEquals("all green", postedBody)
+            // An explicit read acknowledges the page; an automatic refresh
+            // never moves the watermark.
+            panel.setBoard(parseNativeBoardPage(BOARD_PAGE_JSON), acknowledge = true)
+            assertTrue(panel.headerText().contains("unread=0"), panel.headerText())
+            panel.reset()
+            assertEquals(false, panel.available())
+            assertEquals(false, panel.postEnabled())
         }
 
         step("evidence ref parsing mirrors the cockpit vocabulary") {
@@ -783,6 +872,30 @@ object FrontendSmoke {
                         } catch (e: NativeApiException) {
                             if (e.status != 404) {
                                 fail("unexpected abort error ${e.status} ${e.code}")
+                            }
+                        }
+                    }
+                    step("board GET/POST round-trips on the real daemon") {
+                        val page = client.board(sid, limit = 10L)
+                        if (page.boardId <= 0L) fail("board id must be positive")
+                        println("  board rev=${page.revision} posts=${page.posts.size}")
+                        val post = client.boardPost(
+                            sid, "smoke subject", "smoke body", listOf("evidence:1")
+                        )
+                        if (post.revision <= 0L) fail("post revision must be positive")
+                        val after = client.board(sid, limit = 10L)
+                        val seen = after.posts.any {
+                            it.revision == post.revision && it.subject == "smoke subject"
+                        }
+                        if (!seen) fail("the posted subject must appear on the next page")
+                    }
+                    step("hostile board post is a typed 4xx (never a silent write)") {
+                        try {
+                            client.boardPost(sid, "", "body")
+                            fail("empty subject must not answer 201")
+                        } catch (e: NativeApiException) {
+                            if (e.status !in 400..499) {
+                                fail("unexpected board error ${e.status} ${e.code}")
                             }
                         }
                     }

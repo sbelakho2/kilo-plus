@@ -17,6 +17,7 @@ import { resolve } from 'node:path';
 import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
 import {
   FetchLike,
+  NativeApiError,
   NativeClient,
   NativeCompletionContract,
   NativeEvidenceSelector,
@@ -38,6 +39,7 @@ import {
   SseResponseLike,
 } from './eventStream';
 import {
+  BoardStateSummary,
   FaktorStore,
   Json,
   RunSummary,
@@ -48,18 +50,23 @@ import {
   VerificationSummary,
   activeRunIdAfter,
   applySseEvent,
+  boardStateFromPage,
   cancelRunTarget,
   nextPixelPresence,
+  parseBoardPostRequest,
+  parseBoardReadRequest,
   summarizeAgents,
   transcriptFromMessages,
+  unavailableBoardState,
 } from './state';
 import { CockpitTaskVerification, buildCockpit, cockpitSections, tournamentViewOf } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
 import {
   StartFailure,
   StartTaskSettings,
-  completionContractSetting,
+  boundedWebviewFiles,
   hasCompletionSteps,
+  parseCompletionContract,
   startTaskRun,
 } from './taskStart';
 import {
@@ -74,9 +81,8 @@ import { ChatMessage, ChatViewProvider } from './webview';
 const HISTORY_PAGE_LIMIT = 100;
 const MAX_EVIDENCE_PREVIEW_BYTES = 256 * 1024;
 const SESSION_BINDINGS_KEY = 'faktor.sessionBindings';
-/** Bounds of one composer attachment list (mirror the daemon's own caps). */
-const MAX_WEBVIEW_FILES = 64;
-const MAX_WEBVIEW_FILE_CHARS = 4096;
+/** One bounded newest-first board page per read (the daemon caps at 100). */
+const BOARD_PAGE_LIMIT = 100;
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -97,6 +103,9 @@ interface ActiveSession {
    * (kept in host memory so the cockpit can tell a contracted run from a
    * plain prompt even when the daemon serves no completion read). */
   completionContract: NativeCompletionContract | null;
+  /** Board read watermark: posts newer than this revision are unread. Only
+   * an explicit read/post moves it; automatic refreshes never mark read. */
+  boardSeenRevision: number;
 }
 
 const active: ActiveSession = {
@@ -112,6 +121,7 @@ const active: ActiveSession = {
   tournamentId: null,
   pixelPresence: new Map(),
   completionContract: null,
+  boardSeenRevision: 0,
 };
 
 const store = new FaktorStore();
@@ -196,35 +206,6 @@ function reportError(error: unknown): void {
   store.patch({ lastError: message });
   chatProvider?.postNotice('error', message);
   void vscode.window.showErrorMessage(`Faktor: ${message}`);
-}
-
-/**
- * Strictly bound the composer's file list. Malformed entries are refused
- * individually (count only, never echoed); a message carrying files is never
- * dropped wholesale because of them, and the goal always survives.
- */
-function boundedWebviewFiles(raw: unknown): { files: string[]; refused: number } {
-  if (raw === undefined || raw === null) {
-    return { files: [], refused: 0 };
-  }
-  if (!Array.isArray(raw)) {
-    return { files: [], refused: 1 };
-  }
-  const files: string[] = [];
-  let refused = 0;
-  for (const entry of raw) {
-    if (
-      typeof entry !== 'string' ||
-      entry.trim().length === 0 ||
-      entry.length > MAX_WEBVIEW_FILE_CHARS ||
-      files.length >= MAX_WEBVIEW_FILES
-    ) {
-      refused += 1;
-      continue;
-    }
-    files.push(entry);
-  }
-  return { files, refused };
 }
 
 /**
@@ -380,6 +361,7 @@ function stopServer(): void {
   active.tournamentId = null;
   active.pixelPresence = new Map();
   active.completionContract = null;
+  active.boardSeenRevision = 0;
   store.patch({
     daemon: 'stopped',
     daemonDetail: '',
@@ -411,6 +393,7 @@ async function ensureSession(
   if (active.sessionId) {
     return active.sessionId;
   }
+  const previousSessionId = active.sessionId;
   const workspace = canonicalWorkspace(context);
   let sessions: Awaited<ReturnType<NativeClient['listSessions']>> = [];
   let listed = false;
@@ -469,6 +452,10 @@ async function ensureSession(
     });
   }
   const sessionId = active.sessionId;
+  if (sessionId !== previousSessionId) {
+    // The board watermark belongs to ONE session/run family.
+    active.boardSeenRevision = 0;
+  }
   try {
     const page = await client.messages(sessionId, { limit: HISTORY_PAGE_LIMIT });
     store.patch({ transcript: transcriptOf(page) });
@@ -548,6 +535,9 @@ async function refresh(): Promise<void> {
   }
   active.refreshing = true;
   try {
+    // The board read is OPTIONAL and never rejects: an older daemon records
+    // an explicit unavailable block instead of blanking the snapshot.
+    const boardPromise = boardFor(client, sessionId);
     const [projection, tasks, verification, usage, agents, runs, sessions, messages, catalog] =
       await Promise.all([
         client.projection(sessionId),
@@ -562,6 +552,7 @@ async function refresh(): Promise<void> {
         // not blank the rest of the snapshot.
         client.modelCatalog().catch(() => [] as NativeModelInfo[]),
       ]);
+    const board = await boardPromise;
     const task =
       tasks.length > 0
         ? taskSummary(tasks[0]!, runs[0]?.state ?? null, active.completionContract)
@@ -608,6 +599,7 @@ async function refresh(): Promise<void> {
       cockpit,
       cockpitSections: cockpit === null ? [] : cockpitSections(cockpit),
       tournament: cockpit?.tournament ?? null,
+      board,
       lastError: null,
     });
     // Assistant/status/tool lines are durable message rows; re-render the
@@ -706,6 +698,97 @@ async function tournamentFor(
     return state;
   } catch {
     return null;
+  }
+}
+
+/** TRUE when the serving daemon predates the additive native board route. */
+function boardRouteMissing(error: unknown): boolean {
+  return (
+    error instanceof NativeApiError &&
+    (error.status === 404 || error.status === 405 || error.status === 501)
+  );
+}
+
+/**
+ * The board block of the snapshot. The additive GET is optional: a daemon
+ * that predates it records `available:false` with the typed route reason,
+ * and any other failure records its message the same way. Posts are NEVER
+ * fabricated, and automatic refreshes never move the read watermark.
+ */
+async function boardFor(client: NativeClient, sessionId: string): Promise<BoardStateSummary> {
+  try {
+    const page = await client.board(sessionId, { limit: BOARD_PAGE_LIMIT });
+    return boardStateFromPage(page, active.boardSeenRevision).board;
+  } catch (error) {
+    if (boardRouteMissing(error)) {
+      const api = error as NativeApiError;
+      return unavailableBoardState(
+        `the serving daemon exposes no coordination-board route (HTTP ${api.status} ${api.code})`,
+      );
+    }
+    return unavailableBoardState(`board read failed: ${messageOf(error)}`);
+  }
+}
+
+/**
+ * One explicit board read (panel gesture or older-page pagination). Only a
+ * fresh top-of-board read (no `since` cursor) acknowledges the page and
+ * moves the watermark; an older-page read keeps new posts unread.
+ */
+async function readBoard(since: number | null, limit: number | null): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  if (!client || !sessionId) {
+    return;
+  }
+  try {
+    const page = await client.board(sessionId, {
+      ...(since !== null ? { since } : {}),
+      ...(limit !== null ? { limit } : {}),
+    });
+    if (since === null) {
+      active.boardSeenRevision = page.revision;
+    }
+    store.patch({ board: boardStateFromPage(page, active.boardSeenRevision).board });
+  } catch (error) {
+    if (boardRouteMissing(error)) {
+      const api = error as NativeApiError;
+      store.patch({
+        board: unavailableBoardState(
+          `the serving daemon exposes no coordination-board route (HTTP ${api.status} ${api.code})`,
+        ),
+      });
+      return;
+    }
+    reportError(error);
+  }
+}
+
+/** One bounded board post as the active session; the server is the guard. */
+async function postBoard(message: ChatMessage): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  const parsed = parseBoardPostRequest({
+    subject: message.subject,
+    body: message.body,
+    refs: message.refs,
+  });
+  if ('reason' in parsed) {
+    chatProvider?.postNotice('error', parsed.reason);
+    return;
+  }
+  if (!client || !sessionId) {
+    chatProvider?.postNotice('info', 'start the daemon before posting to the board');
+    return;
+  }
+  try {
+    const post = await client.boardPost(sessionId, parsed);
+    // The operator authored this post: it is read by definition.
+    active.boardSeenRevision = Math.max(active.boardSeenRevision, post.revision);
+    chatProvider?.postNotice('info', `board post #${post.revision} recorded`);
+    scheduleRefresh(0);
+  } catch (error) {
+    reportError(error);
   }
 }
 
@@ -1132,16 +1215,39 @@ async function handleWebviewMessage(
         return;
       }
       // Files ride the SAME attachment vocabulary the frozen bridge maps
-      // (`sendGoal.files`); malformed entries are refused individually and
-      // never discard the goal. The completion contract is Task-mode only:
-      // a non-object / partial / all-false contract is refused to null and
-      // the run takes today's default path.
+      // (`sendGoal.files`); malformed entries are refused individually (with
+      // their exact reason) and never discard the goal. The completion
+      // contract is Task-mode only: a malformed contract refuses the START
+      // loudly — silently starting contract-free would claim a workflow the
+      // run never recorded.
       const { files, refused } = boundedWebviewFiles(message.files);
-      const contract = completionContractSetting(message.completionContract);
-      if (refused > 0) {
-        chatProvider?.postNotice('error', `${refused} attachment(s) refused (malformed or out of bounds)`);
+      if (refused.length > 0) {
+        const reasons = refused
+          .slice(0, 5)
+          .map((entry) => `#${entry.index}: ${entry.reason}`)
+          .join('; ');
+        chatProvider?.postNotice(
+          'error',
+          `${refused.length} attachment(s) refused: ${reasons}`,
+        );
       }
-      await startTask(goal, files, contract, context);
+      // Binary attachment references never ride the native DTO (it carries
+      // workspace-relative paths only). Surface the count instead of a
+      // silent drop; the goal still starts with its file paths.
+      const binaryRefs = Array.isArray(message.attachments) ? message.attachments.length : 0;
+      if (binaryRefs > 0) {
+        chatProvider?.postNotice(
+          'info',
+          `${binaryRefs} binary attachment reference(s) noted; only workspace-relative file paths reach the native run`,
+        );
+      }
+      const contract = parseCompletionContract(message.completionContract);
+      if ('reason' in contract) {
+        chatProvider?.postNotice('error', `task start refused: ${contract.reason}`);
+        chatProvider?.postStartResult(goal, false);
+        return;
+      }
+      await startTask(goal, files, contract.contract, context);
       return;
     }
     case 'newTask':
@@ -1159,16 +1265,21 @@ async function handleWebviewMessage(
     case 'retrieveEvidence':
       await retrieveEvidence(message);
       return;
-    // Coordination board: the native server exposes no board read route at
-    // this revision (the durable board lives in the session ledger and is
-    // reachable only through the agent's own board tools). The host answers
-    // these gestures truthfully — no fabricated posts, no silent no-op.
-    case 'boardRead':
+    // Coordination board: the native surface serves one bounded newest-first
+    // page (GET) and one bounded post (POST). The host re-validates every
+    // gesture, records an explicit unavailable state for a daemon without
+    // the additive route, and never fabricates a post.
+    case 'boardRead': {
+      const request = parseBoardReadRequest(message.since, message.limit);
+      if ('reason' in request) {
+        chatProvider?.postNotice('error', request.reason);
+        return;
+      }
+      await readBoard(request.since, request.limit);
+      return;
+    }
     case 'boardPost':
-      chatProvider?.postNotice(
-        'info',
-        'coordination board is not exposed by the native server yet (no board read route); no board state is fabricated',
-      );
+      await postBoard(message);
       return;
     default:
       return;

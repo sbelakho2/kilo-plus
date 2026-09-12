@@ -11,6 +11,7 @@
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
 import type { CockpitSection, CockpitTournamentView, CockpitView } from './cockpit';
+import type { NativeBoardPage } from './nativeClient.ts';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -200,6 +201,150 @@ export interface BoardStateSummary {
   readonly unread: number | null;
   readonly posts: readonly BoardPostSummary[];
   readonly reason: string | null;
+}
+
+/** Mirrors of the daemon/bridge board bounds (host-side re-validation). */
+export const MAX_BOARD_SUBJECT_BYTES = 512;
+export const MAX_BOARD_BODY_BYTES = 16 * 1024;
+export const MAX_BOARD_REFS = 32;
+export const MAX_BOARD_REF_BYTES = 1024;
+export const MAX_BOARD_PAGE = 100;
+
+/** The explicitly UNAVAILABLE board: no posts are ever fabricated. */
+export function unavailableBoardState(reason: string, source = 'none'): BoardStateSummary {
+  return {
+    available: false,
+    source,
+    revision: null,
+    unread: null,
+    posts: [],
+    reason: reason.length > 240 ? `${reason.slice(0, 240)}…` : reason,
+  };
+}
+
+/**
+ * Project one validated native board page onto the snapshot vocabulary.
+ * `seenRevision` is the host's read watermark: posts with a strictly newer
+ * revision are unread. The watermark only moves on an explicit read/post —
+ * automatic refreshes never mark posts read. The returned `watermark` is
+ * the board revision at page-read time (resets consume a revision too).
+ */
+export function boardStateFromPage(
+  page: NativeBoardPage,
+  seenRevision: number | null,
+): { readonly board: BoardStateSummary; readonly watermark: number } {
+  const seen = seenRevision ?? 0;
+  let unread = 0;
+  for (const post of page.posts) {
+    if (post.revision > seen) {
+      unread += 1;
+    }
+  }
+  return {
+    board: {
+      available: true,
+      source: 'native',
+      revision: page.revision,
+      unread,
+      posts: page.posts.slice(0, MAX_BOARD_PAGE).map((post) => ({
+        id: String(post.id),
+        author: post.author_child === null ? 'root' : `child:${post.author_child}`,
+        subject: boundText(post.subject, MAX_BOARD_SUBJECT_BYTES),
+        body: boundText(post.body, MAX_BOARD_BODY_BYTES),
+        refs: post.refs.slice(0, MAX_BOARD_REFS).map((ref) => boundText(ref, MAX_BOARD_REF_BYTES)),
+        revision: post.revision,
+        createdMs: post.created_ms,
+      })),
+      reason: null,
+    },
+    watermark: page.revision,
+  };
+}
+
+function boundText(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) {
+    return value;
+  }
+  return `${value.slice(0, maxBytes)}…`;
+}
+
+/** One bounded `boardRead` host request, or a typed refusal reason. */
+export function parseBoardReadRequest(
+  rawSince: unknown,
+  rawLimit: unknown,
+): { readonly since: number | null; readonly limit: number | null } | { readonly reason: string } {
+  let since: number | null = null;
+  if (rawSince !== undefined && rawSince !== null) {
+    if (
+      typeof rawSince !== 'number' ||
+      !Number.isInteger(rawSince) ||
+      rawSince <= 0 ||
+      !Number.isSafeInteger(rawSince)
+    ) {
+      return { reason: 'boardRead.since must be a positive integer cursor' };
+    }
+    since = rawSince;
+  }
+  let limit: number | null = null;
+  if (rawLimit !== undefined && rawLimit !== null) {
+    if (
+      typeof rawLimit !== 'number' ||
+      !Number.isInteger(rawLimit) ||
+      rawLimit <= 0 ||
+      rawLimit > MAX_BOARD_PAGE
+    ) {
+      return { reason: `boardRead.limit must be an integer in 1..${MAX_BOARD_PAGE}` };
+    }
+    limit = rawLimit;
+  }
+  return { since, limit };
+}
+
+/**
+ * One bounded `boardPost` host request, or a typed refusal reason. The
+ * durable authority additionally requires a non-empty subject AND body;
+ * refusing here keeps the failure local and explicit instead of a raw 400.
+ */
+export function parseBoardPostRequest(
+  raw: { readonly subject?: unknown; readonly body?: unknown; readonly refs?: unknown },
+): { readonly subject: string; readonly body: string; readonly refs: string[] } | { readonly reason: string } {
+  const subject = typeof raw.subject === 'string' ? raw.subject.trim() : '';
+  if (subject.length === 0) {
+    return { reason: 'boardPost.subject must be a non-empty string' };
+  }
+  if (Buffer.byteLength(subject, 'utf8') > MAX_BOARD_SUBJECT_BYTES) {
+    return { reason: `boardPost.subject exceeds ${MAX_BOARD_SUBJECT_BYTES} bytes` };
+  }
+  if (typeof raw.body !== 'string') {
+    return { reason: 'boardPost.body must be a string' };
+  }
+  const body = raw.body;
+  if (body.trim().length === 0) {
+    return { reason: 'boardPost.body must be non-empty' };
+  }
+  if (Buffer.byteLength(body, 'utf8') > MAX_BOARD_BODY_BYTES) {
+    return { reason: `boardPost.body exceeds ${MAX_BOARD_BODY_BYTES} bytes` };
+  }
+  const refs: string[] = [];
+  if (raw.refs !== undefined && raw.refs !== null) {
+    if (!Array.isArray(raw.refs)) {
+      return { reason: 'boardPost.refs must be an array of strings' };
+    }
+    if (raw.refs.length > MAX_BOARD_REFS) {
+      return { reason: `boardPost.refs exceeds ${MAX_BOARD_REFS} entries` };
+    }
+    for (let index = 0; index < raw.refs.length; index += 1) {
+      const ref = raw.refs[index];
+      if (typeof ref !== 'string' || ref.trim().length === 0) {
+        return { reason: `boardPost.refs[${index}] must be a non-empty string` };
+      }
+      if (Buffer.byteLength(ref, 'utf8') > MAX_BOARD_REF_BYTES) {
+        return { reason: `boardPost.refs[${index}] exceeds ${MAX_BOARD_REF_BYTES} bytes` };
+      }
+      refs.push(ref.trim());
+    }
+  }
+  return { subject, body, refs };
 }
 
 export interface SessionSummary {

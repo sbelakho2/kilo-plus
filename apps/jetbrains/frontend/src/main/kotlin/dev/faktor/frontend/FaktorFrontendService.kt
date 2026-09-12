@@ -19,6 +19,8 @@ import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
+import dev.faktor.shared.NativeBoardPage
+import dev.faktor.shared.NativeBoardPost
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
@@ -228,6 +230,16 @@ class FaktorFrontendService(
 
     fun cancelTaskRun(runId: String): NativeTaskRunCancelled =
         clientOrThrow().cancelTaskRun(requireSession(), runId)
+
+    // ------------------------------------------------------ coordination board
+
+    /** One bounded newest-first page; `since` is the older-page cursor. */
+    fun board(since: Long? = null, limit: Long? = null): NativeBoardPage =
+        clientOrThrow().board(requireSession(), since, limit)
+
+    /** One bounded post AS the current session; engine refusals stay typed. */
+    fun boardPost(subject: String, body: String, refs: List<String>? = null): NativeBoardPost =
+        clientOrThrow().boardPost(requireSession(), subject, body, refs)
 
     // ------------------------------------------------------------ tournaments
 

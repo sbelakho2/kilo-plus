@@ -21,6 +21,8 @@ import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeBoardPage
+import dev.faktor.shared.NativeBoardPost
 import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeEventPage
 import dev.faktor.shared.NativeEvidence
@@ -54,6 +56,8 @@ import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.parseNativeAbortAck
 import dev.faktor.shared.parseNativeAgentControlAck
 import dev.faktor.shared.parseNativeAgents
+import dev.faktor.shared.parseNativeBoardPage
+import dev.faktor.shared.parseNativeBoardPost
 import dev.faktor.shared.parseNativeEventPage
 import dev.faktor.shared.parseNativeEvidence
 import dev.faktor.shared.parseNativeEvidenceRetrieval
@@ -241,6 +245,34 @@ class NativeClient(
 
     fun taskViews(sessionId: String): List<NativeTaskView> = parseNativeTaskViews(
         request("GET", "/native/session/" + encode(sessionId) + "/tasks")
+    )
+
+    // ------------------------------------------------------ coordination board
+
+    /**
+     * One bounded newest-first page of the path session's run-family board.
+     * `since` is the exclusive cursor for the next OLDER page (the value a
+     * previous page returned as `next_before_revision`).
+     */
+    fun board(sessionId: String, since: Long? = null, limit: Long? = null): NativeBoardPage =
+        parseNativeBoardPage(
+            request(
+                "GET", "/native/session/" + encode(sessionId) + "/board",
+                query("since" to since?.toString(), "limit" to limit?.toString())
+            )
+        )
+
+    /** Append one bounded post AS the session (201); the server is the guard. */
+    fun boardPost(
+        sessionId: String,
+        subject: String,
+        body: String,
+        refs: List<String>? = null
+    ): NativeBoardPost = parseNativeBoardPost(
+        request(
+            "POST", "/native/session/" + encode(sessionId) + "/board", null,
+            NativeRequests.boardPost(subject, body, refs)
+        )
     )
 
     // ------------------------------------------------------------ tournaments

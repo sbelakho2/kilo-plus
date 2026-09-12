@@ -854,6 +854,9 @@ export const bridgeTests = [
       if (frames.faktorBoardState.posts.length > BRIDGE_LIMITS.maxPageEntries) {
         throw new Error('board posts must be capped');
       }
+      if (frames.faktorBoardState.available !== true || frames.faktorBoardState.unread !== 3) {
+        throw new Error('an available board must carry its availability and unread count');
+      }
       if (frames.faktorTournament.tournament.candidates.length > 8) {
         throw new Error('tournament candidates must be capped');
       }
