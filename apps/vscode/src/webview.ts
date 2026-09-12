@@ -1,13 +1,21 @@
 // The Faktor chat webview. Two render modes over one message transport:
 //
-//   - vendored (preferred): when the pinned Kilo v7.5.6 bundle exists at
-//     <repo>/ui/kilo-v756-webview/dist (built `dist/index.html` entry when
-//     present, else the upstream esbuild pair dist/webview.js +
-//     dist/webview.css; FAKTOR_UI_BUNDLE overrides the root), its HTML shell
-//     is served with a strict CSP + script nonce, and the kilo-bridge
-//     translates between the frozen UI message ABI and the native snapshot.
+//   - vendored (preferred): when the pinned Kilo v7.5.6 closure was staged
+//     inside the installed extension by `npm run prepackage:vsix` at
+//     <extensionUri>/media/kilo-v756-webview/dist (built `dist/index.html`
+//     entry when present, else the upstream esbuild pair dist/webview.js +
+//     dist/webview.css), its HTML shell is served with a strict CSP + script
+//     nonce, and the kilo-bridge translates between the frozen UI message ABI
+//     and the native snapshot. Resolution NEVER leaves extensionUri, so a
+//     checkout-relative path cannot be picked up by an installed VSIX.
 //   - built-in (fallback): the hand-written HTML surface over native state
-//     (`media/chat.js`), used when the vendored bundle is absent.
+//     (`media/chat.js`), used when the vendored bundle is absent; the missing
+//     bundle is recorded once via vendoredFallbackNotice().
+//
+// Repo development only: FAKTOR_UI_BUNDLE is an explicit opt-in env override
+// that points the vendored lookup at a local bundle checkout (typically
+// <repo>/ui/kilo-v756-webview). It is never inferred from the directory
+// layout; packaged installs must ship the bundle under media/.
 //
 // This module owns ONLY VS Code webview plumbing — HTML generation, CSP,
 // message transport and bridge routing — and delegates every daemon action to
@@ -43,13 +51,18 @@ export interface ChatHost {
 
 const MAX_LOUD_DROPS = 20;
 
+/**
+ * Bundle root resolution. The packaged layout is always
+ * <extensionUri>/media/kilo-v756-webview; no checkout-relative path is ever
+ * consulted. FAKTOR_UI_BUNDLE is the only escape hatch and exists for repo
+ * development only.
+ */
 function vendoredRoot(extensionUri: vscode.Uri): string {
   const override = process.env.FAKTOR_UI_BUNDLE;
-  if (override !== undefined && override.length > 0) {
-    return override;
+  if (override !== undefined && override.trim().length > 0) {
+    return override.trim();
   }
-  // apps/vscode -> repository root -> ui/kilo-v756-webview
-  return join(extensionUri.fsPath, '..', '..', 'ui', 'kilo-v756-webview');
+  return join(extensionUri.fsPath, 'media', 'kilo-v756-webview');
 }
 
 function locateVendoredUi(extensionUri: vscode.Uri): VendoredBundle | null {

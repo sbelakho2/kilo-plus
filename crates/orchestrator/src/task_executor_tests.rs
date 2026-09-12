@@ -38,9 +38,11 @@ use faktor_provider::{
 use faktor_session::{BudgetAuthority, SessionManager};
 
 use crate::caps::{CapabilityGrant, CapabilitySet, LatticeCap, ScopePattern};
+use crate::runtime::completion_steps::commit_message;
 use crate::runtime::shadow::{ShadowCopyLimits, ShadowRoots};
 use crate::runtime::task_executor::{
-    MutationMode, TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow, TASK_RUN_ROW_KIND,
+    MutationMode, RunSettlement, TaskExecutor, TaskRunMode, TaskRunRequest, TaskRunRow,
+    TASK_RUN_ROW_KIND,
 };
 use crate::runtime::{CrashSeam, ExecError, OrchestratorRuntime};
 use crate::{OwnershipSpec, TaskPlan, WorkItem, WorkKind};
@@ -3771,4 +3773,804 @@ async fn completion_steps_are_additive_and_fail_closed() {
         String::from_utf8_lossy(&porcelain.stdout).trim().is_empty(),
         "the owner root must be committed clean"
     );
+}
+
+// ----------------------------------- attachments + unified settlement (P1)
+
+/// Every durable USER message's `files` set of one session.
+fn message_files(handle: &faktor_session::SessionHandle) -> Vec<Vec<String>> {
+    handle
+        .messages_before(None, 200)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.role == "user")
+        .map(|m| {
+            m.data
+                .get("files")
+                .and_then(|f| f.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn child_session_handle(
+    manager: &Arc<SessionManager>,
+    row: &crate::runtime::ChildRuntime,
+) -> faktor_session::SessionHandle {
+    manager
+        .get_session(SessionId::new(row.session_id))
+        .unwrap()
+        .unwrap()
+}
+
+fn child_root(
+    manager: &Arc<SessionManager>,
+    row: &crate::runtime::ChildRuntime,
+) -> std::path::PathBuf {
+    let wts = manager
+        .worktrees_of(WorkspaceId::new(row.workspace_id))
+        .unwrap();
+    std::path::PathBuf::from(
+        wts.iter()
+            .find(|w| (w.id.max(0) as u64) == row.worktree_id)
+            .expect("child worktree row")
+            .path
+            .clone(),
+    )
+}
+
+fn run_registry(
+    manager: &Arc<SessionManager>,
+    parent: SessionId,
+    run_id: &str,
+) -> Vec<crate::runtime::ChildRuntime> {
+    OrchestratorRuntime::registry_rows(manager.clone(), parent, run_id).unwrap()
+}
+
+fn assert_prompt_files(
+    manager: &Arc<SessionManager>,
+    rows: &[crate::runtime::ChildRuntime],
+    files: &[String],
+) {
+    for row in rows {
+        let handle = child_session_handle(manager, row);
+        let sets = message_files(&handle);
+        assert!(
+            sets.iter().any(|s| s == files),
+            "child {} must submit exactly the run files {files:?}: {sets:?}",
+            row.child_id
+        );
+    }
+}
+
+fn plan_row_of(env: &Arc<Env>, run_id: &str) -> serde_json::Value {
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    let facts = handle.memory_facts().unwrap();
+    let row = facts
+        .iter()
+        .find(|(kind, key, _)| kind == crate::runtime::PLAN_ROW_KIND && key == run_id)
+        .expect("durable plan row");
+    serde_json::from_str(&row.2).unwrap()
+}
+
+/// FIX 1 (a): a 3-item orchestrated run's files reach EVERY child's
+/// submitted prompt, the durable plan row carries the identical set, and
+/// the set survives a store reopen.
+#[tokio::test]
+async fn multi_item_run_files_reach_every_child_and_survive_reopen() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = (0..4)
+        .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
+        .collect();
+    let env = open_env(dir.path(), scripts);
+    let files = vec![
+        "src/a.rs".to_string(),
+        "docs/b.md".to_string(),
+        "c.txt".to_string(),
+    ];
+    let mut req = request(
+        "attached 3-item run",
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &[]),
+            wi("c", WorkKind::Analysis, &[]),
+        ],
+        &env,
+    );
+    req.files = files.clone();
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("attached run starts");
+    wait_until(
+        || {
+            let rows = run_registry(&env.manager, env.parent, &receipt.run_id);
+            rows.len() == 3 && rows.iter().all(|c| c.state.is_terminal())
+        },
+        120,
+    )
+    .await;
+    let rows = run_registry(&env.manager, env.parent, &receipt.run_id);
+    assert_prompt_files(&env.manager, &rows, &files);
+    let plan = plan_row_of(&env, &receipt.run_id);
+    let specs: Vec<crate::runtime::ChildSpec> =
+        serde_json::from_value(plan["specs"].clone()).unwrap();
+    assert_eq!(specs.len(), 3);
+    assert!(
+        specs.iter().all(|s| s.files == files),
+        "every durable spec carries the run's files: {specs:?}"
+    );
+    // The durable row is byte-identical across a reopen of the same store.
+    let reopened =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let h2 = reopened.get_session(env.parent).unwrap().unwrap();
+    let plan2 = h2
+        .memory_facts()
+        .unwrap()
+        .into_iter()
+        .find(|(kind, key, _)| kind == crate::runtime::PLAN_ROW_KIND && key == &receipt.run_id)
+        .expect("plan row after reopen");
+    let v2: serde_json::Value = serde_json::from_str(&plan2.2).unwrap();
+    assert_eq!(plan, v2, "the plan row (files included) is durable");
+}
+
+/// FIX 1 (b): a run that crashes after the durable plan/assignments (before
+/// ANY spawn) re-attaches and every re-spawned child submits the files
+/// decoded from the DURABLE plan row — never from the lost request memory.
+#[tokio::test]
+async fn crashed_orchestrated_run_reattaches_files_from_durable_plan_not_memory() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = (0..4)
+        .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
+        .collect();
+    let env = open_env(dir.path(), scripts);
+    let files = vec!["src/one.rs".to_string(), "src/two.rs".to_string()];
+    let mut req = request(
+        "crash-before-spawn attached run",
+        vec![
+            wi("a", WorkKind::Analysis, &[]),
+            wi("b", WorkKind::Analysis, &[]),
+            wi("c", WorkKind::Analysis, &[]),
+        ],
+        &env,
+    );
+    req.files = files.clone();
+    req.crash_seam = Some(CrashSeam::AfterAssignmentsPersisted);
+    let receipt = env
+        .executor
+        .start_task(env.parent, req)
+        .expect("start accepted before the crash seam");
+    wait_until(
+        || {
+            OrchestratorRuntime::assignment_rows(env.manager.clone(), env.parent, &receipt.run_id)
+                .map(|a| a.len() == 3)
+                .unwrap_or(false)
+        },
+        60,
+    )
+    .await;
+    wait_until(|| env.executor.active_runs().is_empty(), 60).await;
+    assert!(
+        run_registry(&env.manager, env.parent, &receipt.run_id).is_empty(),
+        "the crash seam fired BEFORE any spawn"
+    );
+    env.executor
+        .resume_run(
+            env.parent,
+            &receipt.run_id,
+            crate::runtime::Ceilings::default(),
+            read_caps(),
+            None,
+        )
+        .expect("resume accepted");
+    wait_until(
+        || {
+            let rows = run_registry(&env.manager, env.parent, &receipt.run_id);
+            rows.len() == 3 && rows.iter().all(|c| c.state.is_terminal())
+        },
+        120,
+    )
+    .await;
+    assert_prompt_files(
+        &env.manager,
+        &run_registry(&env.manager, env.parent, &receipt.run_id),
+        &files,
+    );
+}
+
+/// FIX 1 (c): hostile and oversized file lists are typed refusals BEFORE
+/// any durable orchestration row (no spawn, no plan, no assignment).
+#[tokio::test]
+async fn hostile_or_oversized_task_files_are_refused_before_any_durable_row() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_env(dir.path(), vec![vec![ScriptedResponse::End]]);
+    let base = || {
+        request(
+            "hostile attachments",
+            vec![
+                wi("a", WorkKind::Analysis, &[]),
+                wi("b", WorkKind::Analysis, &[]),
+            ],
+            &env,
+        )
+    };
+    // Oversized COUNT.
+    let mut req = base();
+    req.files = (0..=faktor_session::MAX_FILES_PER_PROMPT)
+        .map(|i| format!("f{i}.rs"))
+        .collect();
+    let err = env
+        .executor
+        .start_task(env.parent, req)
+        .expect_err("count over MAX_FILES_PER_PROMPT");
+    assert!(matches!(err, ExecError::Oversized(_)), "{err:?}");
+    // Oversized PATH.
+    let mut req = base();
+    req.files = vec!["x".repeat(faktor_session::MAX_FILE_PATH_BYTES + 1)];
+    let err = env
+        .executor
+        .start_task(env.parent, req)
+        .expect_err("path over MAX_FILE_PATH_BYTES");
+    assert!(matches!(err, ExecError::Oversized(_)), "{err:?}");
+    // Hostile paths.
+    for hostile in [
+        "/etc/passwd",
+        "../secrets",
+        "src/../../secrets",
+        "",
+        "\0bad",
+    ] {
+        let mut req = base();
+        req.files = vec![hostile.to_string()];
+        let err = env
+            .executor
+            .start_task(env.parent, req)
+            .expect_err("hostile path");
+        assert!(
+            matches!(err, ExecError::Malformed(_)),
+            "{hostile:?}: {err:?}"
+        );
+    }
+    let handle = env.manager.get_session(env.parent).unwrap().unwrap();
+    assert!(
+        !handle
+            .memory_facts()
+            .unwrap()
+            .iter()
+            .any(|(kind, _, _)| matches!(
+                kind.as_str(),
+                crate::runtime::PLAN_ROW_KIND
+                    | crate::runtime::ASSIGNMENT_ROW_KIND
+                    | crate::runtime::REGISTRY_ROW_KIND
+            )),
+        "refused attachment lists leave no orchestration rows"
+    );
+}
+
+/// FIX 1 parity: an attachment-free orchestrated run submits EMPTY file
+/// sets to every child — byte-identical to every previous wave.
+#[tokio::test]
+async fn attachment_free_orchestrated_run_submits_empty_file_sets() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = (0..3)
+        .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
+        .collect();
+    let env = open_env(dir.path(), scripts);
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            request(
+                "no attachments",
+                vec![
+                    wi("a", WorkKind::Analysis, &[]),
+                    wi("b", WorkKind::Analysis, &[]),
+                ],
+                &env,
+            ),
+        )
+        .expect("start");
+    wait_until(
+        || {
+            let rows = run_registry(&env.manager, env.parent, &receipt.run_id);
+            rows.len() == 2 && rows.iter().all(|c| c.state.is_terminal())
+        },
+        120,
+    )
+    .await;
+    assert_prompt_files(
+        &env.manager,
+        &run_registry(&env.manager, env.parent, &receipt.run_id),
+        &[],
+    );
+}
+
+fn completion_step_runner_with(
+    root: &std::path::Path,
+    config: crate::runtime::completion_steps::CompletionStepsConfig,
+) -> Arc<crate::runtime::completion_steps::CompletionStepRunner> {
+    use crate::runtime::completion_steps::{CompletionStepRunner, EgressPolicy};
+    let cas = Arc::new(faktor_cas::Cas::open(root.join("completion-cas")).unwrap());
+    let supervisor = faktor_terminal::ProcessSupervisor::new(cas);
+    let egress: Arc<dyn EgressPolicy> = Arc::new(|_url: &str| Ok(()));
+    Arc::new(CompletionStepRunner::new(supervisor, egress, config).unwrap())
+}
+
+fn seed_contract_task(
+    env: &Arc<RealToolEnv>,
+    goal: &str,
+    contract: faktor_core::completion::CompletionContract,
+) -> TaskId {
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let now = h.now_ms();
+    h.create_task(faktor_session::Task {
+        task_id,
+        session_id: env.parent,
+        goal: goal.to_string(),
+        acceptance_criteria: vec![],
+        plan: vec![],
+        budget: faktor_session::TaskBudget::default(),
+        state: TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    })
+    .unwrap();
+    let rev = h.task_revision(task_id).unwrap();
+    h.set_completion_contract(task_id, rev, contract).unwrap();
+    h.upsert_memory_fact("verification", "last", r#"{"status":"passed"}"#)
+        .unwrap();
+    task_id
+}
+
+fn cs_head(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn cs_porcelain(root: &std::path::Path) -> String {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// FIX 2 crash seam: the commit side effect landed but its status row did
+/// not; `settle_run` replays idempotently (HEAD recognized, `Succeeded`),
+/// without a second commit.
+#[tokio::test]
+async fn settle_run_converges_after_the_commit_status_write_seam() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    env.executor
+        .set_completion_steps(Some(completion_step_runner(dir.path())));
+    cs_seed_repo(&env.owner_root);
+    let goal = "ship the committed feature";
+    let task_id = seed_contract_task(
+        &env,
+        goal,
+        faktor_core::completion::CompletionContract {
+            include_commit: true,
+            include_push: false,
+            include_pr: false,
+        },
+    );
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let contract_rev = h.task_revision(task_id).unwrap();
+    // The crash window: the runner committed, the process died BEFORE the
+    // durable status row landed.
+    std::fs::write(env.owner_root.join("feature.txt"), "content\n").unwrap();
+    cs_git(&env.owner_root, &["add", "-A"]);
+    cs_git(
+        &env.owner_root,
+        &["commit", "-q", "-m", &commit_message(goal)],
+    );
+    let head = cs_head(&env.owner_root);
+    assert!(h
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap()
+        .is_empty());
+    // Reopen + settle: the replay records Succeeded and never commits again.
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: "tx-commit-seam".into(),
+        })
+        .await
+        .unwrap();
+    assert!(outcome.steps.is_some(), "{outcome:?}");
+    assert_eq!(cs_head(&env.owner_root), head, "no double commit");
+    let rows = h
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+    assert!(
+        rows.last().unwrap().detail.contains("already committed"),
+        "{:?}",
+        rows.last()
+    );
+    assert!(outcome.steps.unwrap().all_succeeded());
+    // A FRESH manager over the same store (the daemon-restart view) reads
+    // exactly the converged row: nothing lived only in this process.
+    let reopened =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let h2 = reopened.get_session(env.parent).unwrap().unwrap();
+    let rows2 = h2
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows2.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+}
+
+/// FIX 2 crash seam: the push side effect landed but its status row did
+/// not; the replay recognizes the already-pushed HEAD and records
+/// `Succeeded` without touching the remote again.
+#[tokio::test]
+async fn settle_run_converges_after_the_push_status_write_seam() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    env.executor
+        .set_completion_steps(Some(completion_step_runner(dir.path())));
+    cs_seed_repo(&env.owner_root);
+    let remote = dir.path().join("remote.git");
+    cs_git(
+        dir.path(),
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    cs_git(
+        &env.owner_root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let goal = "ship the pushed feature";
+    let task_id = seed_contract_task(
+        &env,
+        goal,
+        faktor_core::completion::CompletionContract {
+            include_commit: false,
+            include_push: true,
+            include_pr: false,
+        },
+    );
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let contract_rev = h.task_revision(task_id).unwrap();
+    // The crash window: commit + push landed externally, no status row.
+    std::fs::write(env.owner_root.join("feature.txt"), "content\n").unwrap();
+    cs_git(&env.owner_root, &["add", "-A"]);
+    cs_git(
+        &env.owner_root,
+        &["commit", "-q", "-m", &commit_message(goal)],
+    );
+    cs_git(&env.owner_root, &["push", "-q", "-u", "origin", "main"]);
+    let remote_head = cs_head(&remote);
+    assert_eq!(remote_head, cs_head(&env.owner_root));
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: "tx-push-seam".into(),
+        })
+        .await
+        .unwrap();
+    assert!(outcome.steps.unwrap().all_succeeded());
+    assert_eq!(cs_head(&remote), remote_head, "remote untouched by replay");
+    let rows = h
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+    assert!(
+        rows.last().unwrap().detail.contains("already pushed"),
+        "{:?}",
+        rows.last()
+    );
+    // The daemon-restart view reads the same converged row from the store.
+    let reopened =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let h2 = reopened.get_session(env.parent).unwrap().unwrap();
+    let rows2 = h2
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows2.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+}
+
+/// FIX 2 crash seam: the PR exists but its status row never landed; the
+/// replay's configured command reports the existing PR and records
+/// `Succeeded` (URL parsed), never a second PR gate.
+#[tokio::test]
+async fn settle_run_converges_after_the_pr_status_write_seam() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    let mut config = crate::runtime::completion_steps::CompletionStepsConfig::default();
+    // The external PR already exists: the helper reports it and exits
+    // non-zero (the exact crash-replay shape the runner recognizes).
+    let script = dir.path().join("existing-pr.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'already exists: https://example.test/pr/7'\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    config.pr_command = Some(format!("{} {{branch}}", script.display()));
+    env.executor
+        .set_completion_steps(Some(completion_step_runner_with(dir.path(), config)));
+    cs_seed_repo(&env.owner_root);
+    let goal = "ship the PR feature";
+    let task_id = seed_contract_task(
+        &env,
+        goal,
+        faktor_core::completion::CompletionContract {
+            include_commit: false,
+            include_push: false,
+            include_pr: true,
+        },
+    );
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let contract_rev = h.task_revision(task_id).unwrap();
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::InSession {
+            parent: env.parent,
+            run_id: "tx-pr-seam".into(),
+        })
+        .await
+        .unwrap();
+    assert!(outcome.steps.unwrap().all_succeeded());
+    let rows = h
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+    assert!(
+        rows.last().unwrap().detail.contains("already exists"),
+        "{:?}",
+        rows.last()
+    );
+    // The daemon-restart view reads the same converged row from the store.
+    let reopened =
+        SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let h2 = reopened.get_session(env.parent).unwrap().unwrap();
+    let rows2 = h2
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows2.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+}
+
+/// FIX 2 end-to-end: a multi-item contracted task's root row completes ONLY
+/// after the commit step row is `Succeeded`; the parent settlement commits
+/// the owner root and NEVER a child candidate root.
+#[tokio::test]
+async fn orchestrated_contract_settles_only_after_succeeded_commit_and_never_commits_child_roots() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = (0..6)
+        .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
+        .collect();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        scripts,
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    env.executor
+        .set_completion_steps(Some(completion_step_runner(dir.path())));
+    cs_seed_repo(&env.owner_root);
+    let goal = "ship the multi-item change";
+    let items: Vec<WorkItem> = ["impl-a", "impl-b"]
+        .iter()
+        .map(|id| {
+            WorkItem::with_ownership(
+                *id,
+                format!("work {id}"),
+                WorkKind::Implementation,
+                OwnershipSpec::IsolatedWorktree,
+            )
+        })
+        .collect();
+    let receipt = env
+        .executor
+        .start_task(
+            env.parent,
+            TaskRunRequest {
+                goal: goal.to_string(),
+                work_items: items,
+                criteria: vec!["all items land".to_string()],
+                completion_contract: Some(faktor_core::completion::CompletionContract {
+                    include_commit: true,
+                    include_push: false,
+                    include_pr: false,
+                }),
+                parent_caps: read_caps(),
+                isolated_root: env.isolated_root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("orchestrated contracted start");
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let contract_rev = h
+        .completion_contract(task_id)
+        .unwrap()
+        .expect("contract recorded before spawn")
+        .0;
+    // Children drive to terminal; the auto settlement then runs the steps
+    // against a CLEAN owner root: the commit is honestly Skipped and the
+    // gate refuses — the root task must NOT complete.
+    wait_until(
+        || {
+            let rows = run_registry(&env.manager, env.parent, &receipt.run_id);
+            rows.len() == 2 && rows.iter().all(|c| c.state.is_terminal())
+        },
+        120,
+    )
+    .await;
+    wait_until(
+        || {
+            h.ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+                .map(|r| !r.is_empty())
+                .unwrap_or(false)
+        },
+        60,
+    )
+    .await;
+    wait_until(|| env.executor.active_runs().is_empty(), 60).await;
+    assert_eq!(
+        h.ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+            .unwrap()
+            .last()
+            .unwrap()
+            .status,
+        faktor_core::completion::CompletionStepOutcome::Skipped,
+        "a clean tree is honestly Skipped"
+    );
+    assert_ne!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete,
+        "a Skipped commit never completes the run"
+    );
+    // A change lands; the SAME settlement retries the Skipped step and
+    // completes only once its row is Succeeded.
+    std::fs::write(env.owner_root.join("feature.txt"), "shipped\n").unwrap();
+    let outcome = env
+        .executor
+        .settle_run(RunSettlement::Orchestrated {
+            parent: env.parent,
+            run_id: receipt.run_id.clone(),
+        })
+        .await
+        .expect("settlement");
+    assert!(outcome.completed, "{outcome:?}");
+    assert!(outcome.verified, "{outcome:?}");
+    assert_eq!(
+        h.get_task(task_id).unwrap().unwrap().state,
+        TaskState::VerifiedComplete
+    );
+    let rows = h
+        .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
+        .unwrap();
+    assert_eq!(
+        rows.last().unwrap().status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+    // The OWNER root holds exactly one new commit with the deterministic
+    // message and is clean.
+    assert!(cs_porcelain(&env.owner_root).is_empty());
+    let message = std::process::Command::new("git")
+        .args(["log", "-1", "--pretty=%s"])
+        .current_dir(&env.owner_root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&message.stdout).trim(),
+        commit_message(goal)
+    );
+    let count = std::process::Command::new("git")
+        .args(["rev-list", "--count", "HEAD"])
+        .current_dir(&env.owner_root)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+    // No child candidate root was ever committed or even initialized by the
+    // settlement.
+    let child_rows = run_registry(&env.manager, env.parent, &receipt.run_id);
+    assert_eq!(outcome.merge_proposals.len(), 2);
+    for row in &child_rows {
+        let root = child_root(&env.manager, row);
+        assert!(root.is_dir());
+        assert!(
+            !root.join(".git").exists(),
+            "settlement must never initialize/commit child root {}",
+            row.child_id
+        );
+    }
+    // Spy: give each child root its own history, replay the settlement, and
+    // prove the parent settlement never touches those histories.
+    let mut spies = Vec::new();
+    for row in &child_rows {
+        let root = child_root(&env.manager, row);
+        cs_git(&root, &["init", "-q", "-b", "main"]);
+        cs_git(&root, &["config", "user.email", "test@kilo.local"]);
+        cs_git(&root, &["config", "user.name", "Kilo Test"]);
+        std::fs::write(root.join("candidate.txt"), "candidate\n").unwrap();
+        cs_git(&root, &["add", "-A"]);
+        cs_git(&root, &["commit", "-q", "-m", "candidate work"]);
+        let head = cs_head(&root);
+        let porcelain = cs_porcelain(&root);
+        spies.push((root, head, porcelain));
+    }
+    let replay = env
+        .executor
+        .settle_run(RunSettlement::Orchestrated {
+            parent: env.parent,
+            run_id: receipt.run_id.clone(),
+        })
+        .await
+        .expect("idempotent replay");
+    assert!(replay.completed, "{replay:?}");
+    for (root, head, porcelain) in spies {
+        assert_eq!(cs_head(&root), head, "child root HEAD unchanged");
+        assert_eq!(cs_porcelain(&root), porcelain, "child worktree untouched");
+    }
 }

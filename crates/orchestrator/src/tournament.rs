@@ -196,6 +196,22 @@ pub fn derive_check_specs(criteria: &[Criterion]) -> Vec<TournamentCheckSpec> {
         .collect()
 }
 
+/// The AGGREGATE root check set of one orchestrated run: the tournament
+/// derivation applied to the run's OWN acceptance criteria. The post-run
+/// settlement verifies the whole run against EXACTLY this set (one
+/// deterministic check per criterion, in order) — never per candidate.
+/// Every spec is validated with the tournament criterion bounds; an empty
+/// criterion list yields an empty (vacuously passing) set.
+pub fn aggregate_check_specs(
+    criteria_specs: &[String],
+) -> Result<Vec<TournamentCheckSpec>, TournamentError> {
+    let mut criteria = Vec::with_capacity(criteria_specs.len());
+    for spec in criteria_specs {
+        criteria.push(Criterion::derive(spec)?);
+    }
+    Ok(derive_check_specs(&criteria))
+}
+
 fn specs_byte_equal(a: &[TournamentCheckSpec], b: &[TournamentCheckSpec]) -> bool {
     match (serde_json::to_vec(a), serde_json::to_vec(b)) {
         (Ok(a), Ok(b)) => a == b,

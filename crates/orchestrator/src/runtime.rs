@@ -285,6 +285,14 @@ pub struct ChildSpec {
     pub model: Option<String>,
     /// Durable token budget cap (the wave-9 Task budget fields).
     pub max_tokens: Option<u64>,
+    /// Attachment file paths of the run (the SDK `PromptRequest.files`
+    /// vocabulary). They are part of the DURABLE spec (the plan row carries
+    /// the whole spec list), so every child — fresh spawn AND re-attach —
+    /// submits the byte-identical set; a durable tampered list is a typed
+    /// refusal before any spawn ([`validate_attachment_files`]). Old rows
+    /// decode with an empty list (field-level serde default): the
+    /// attachment-free run stays byte-identical.
+    pub files: Vec<String>,
     /// Task-level typed policy.
     pub task_caps: CapabilitySet,
     /// Child-level typed policy.
@@ -298,6 +306,7 @@ impl Default for ChildSpec {
             spawn: true,
             model: None,
             max_tokens: None,
+            files: Vec::new(),
             task_caps: CapabilitySet::new(),
             child_caps: CapabilitySet::new(),
         }
@@ -1369,6 +1378,17 @@ impl OrchestratorRuntime {
             default_model: durable_model,
             isolated_root: durable_root,
         } = self.plan_row(parent, run_id)?;
+        // The durable attachment set is re-validated before any re-drive: a
+        // tampered/oversized/hostile stored list refuses the re-attach
+        // loudly instead of being submitted.
+        for spec in specs.values() {
+            validate_attachment_files(&spec.files).map_err(|e| {
+                ExecError::InvalidPlan(format!(
+                    "durable attached files of work item {}: {e}",
+                    spec.item_id
+                ))
+            })?;
+        }
         let _ = isolated_root;
         let config = ExecConfig {
             run_id: run_id.to_string(),
@@ -2706,6 +2726,18 @@ impl OrchestratorRuntime {
         let prompt = self.child_prompt(run_id, child)?;
         let model_override = child.model_policy.model.clone();
         let max_tokens = child.budget_max_tokens;
+        // The run's durable attachment set: read from THIS child's durable
+        // spec (persisted with the plan row BEFORE any spawn and decoded
+        // identically on re-attach). An absent spec is an empty set — the
+        // attachment-free behavior of every previous wave.
+        let files = {
+            let guard = self.exec.lock().expect("exec lock");
+            guard
+                .get(run_id)
+                .and_then(|exec| exec.specs.get(&child.item_id))
+                .map(|spec| spec.files.clone())
+                .unwrap_or_default()
+        };
         let outcomes = {
             let guard = self.exec.lock().expect("exec lock");
             guard
@@ -2734,6 +2766,7 @@ impl OrchestratorRuntime {
             let manager = manager.clone();
             let agent = agent.clone();
             let prompt = prompt.clone();
+            let files = files.clone();
             let model_override = model_override.clone();
             let run_id = run_id_owned.clone();
             let child_id = child_id.clone();
@@ -2743,6 +2776,7 @@ impl OrchestratorRuntime {
                 agent,
                 session_id,
                 prompt,
+                files,
                 model_override,
                 max_tokens,
                 parent_session,
@@ -2913,8 +2947,66 @@ fn validate_specs(
                 "child model must be 1..=128 characters".into(),
             ));
         }
+        validate_attachment_files(&s.files).map_err(|e| {
+            ExecError::InvalidPlan(format!("attached files of work item {}: {e}", s.item_id))
+        })?;
     }
     Ok(map)
+}
+
+/// The ONE attachment-file validation rule of a run (shared by the request
+/// boundary, the durable spec decode and the server DTO): bounded by the
+/// SAME constants the single-session prompt submission enforces
+/// ([`faktor_session::MAX_FILES_PER_PROMPT`],
+/// [`faktor_session::MAX_FILE_PATH_BYTES`]) plus the typed hostile-path
+/// refusal (empty/control-character paths and absolute or `..` traversal
+/// components). Returns a typed [`ExecError::Oversized`]/[`ExecError::Malformed`]
+/// — never a truncation or a silent drop.
+pub fn validate_attachment_files(files: &[String]) -> Result<(), ExecError> {
+    if files.len() > faktor_session::MAX_FILES_PER_PROMPT {
+        return Err(ExecError::Oversized(format!(
+            "{} files exceed MAX_FILES_PER_PROMPT ({})",
+            files.len(),
+            faktor_session::MAX_FILES_PER_PROMPT
+        )));
+    }
+    for f in files {
+        if f.len() > faktor_session::MAX_FILE_PATH_BYTES {
+            return Err(ExecError::Oversized(format!(
+                "file path of {} bytes exceeds MAX_FILE_PATH_BYTES ({})",
+                f.len(),
+                faktor_session::MAX_FILE_PATH_BYTES
+            )));
+        }
+        if f.trim().is_empty() {
+            return Err(ExecError::Malformed(
+                "an attached file path is empty or whitespace-only".into(),
+            ));
+        }
+        if f.chars().any(|c| c.is_control()) {
+            return Err(ExecError::Malformed(format!(
+                "attached file path {f:?} carries control characters"
+            )));
+        }
+        let path = std::path::Path::new(f);
+        let drive_prefixed = f.len() >= 2
+            && f.as_bytes()[0].is_ascii_alphabetic()
+            && f.as_bytes()[1] == b':'
+            && f.as_bytes()
+                .get(2)
+                .is_some_and(|b| *b == b'/' || *b == b'\\');
+        if path.is_absolute() || drive_prefixed {
+            return Err(ExecError::Malformed(format!(
+                "attached file path {f:?} is absolute; attached files are workspace-relative"
+            )));
+        }
+        if f.split(['/', '\\']).any(|segment| segment == "..") {
+            return Err(ExecError::Malformed(format!(
+                "attached file path {f:?} traverses outside the workspace ('..')"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// (audits 7/8/21/22) The typed-policy half of the per-item ownership
@@ -3091,11 +3183,17 @@ fn truncate(s: &str, max: usize) -> String {
 /// drive resumes the SAME recorded turn (continue_turn — never a
 /// synthesized operation); otherwise submit → drive_receipt. The drive ends
 /// when the child's durable op record ends; the executor never polls.
+///
+/// `files` is the run's immutable attachment set (decoded from the durable
+/// child spec): a fresh submit carries EXACTLY it, and a crash-resumed turn
+/// re-continues the SAME recorded prompt (whose durable message already
+/// carries the same set), so attachments survive acceptance and re-attach.
 async fn drive_child_turn(
     manager: Arc<SessionManager>,
     agent: Arc<AgentRuntime>,
     session: SessionId,
     prompt: &str,
+    files: &[String],
     model_override: Option<String>,
     max_tokens: Option<u64>,
 ) -> (Result<TurnOutcome, String>, Option<OpId>) {
@@ -3125,7 +3223,7 @@ async fn drive_child_turn(
             return (Err(e.message), None);
         }
     }
-    let receipt = match agent.submit(session, prompt, &[]) {
+    let receipt = match agent.submit(session, prompt, files) {
         Ok(r) => r,
         Err(e) => return (Err(e.message), None),
     };
@@ -3159,6 +3257,7 @@ fn drive_op_entry(
     agent: Arc<AgentRuntime>,
     session_id: SessionId,
     prompt: String,
+    files: Vec<String>,
     model_override: Option<String>,
     max_tokens: Option<u64>,
     parent_session: SessionId,
@@ -3173,6 +3272,7 @@ fn drive_op_entry(
             agent,
             session_id,
             &prompt,
+            &files,
             model_override,
             max_tokens,
         )

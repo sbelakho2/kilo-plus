@@ -8,3 +8,7 @@ tsconfig.json
 **/*.js.map
 node_modules/**
 .vscodeignore
+# The pinned vendored webview closure is staged at media/kilo-v756-webview by
+# `npm run prepackage:vsix`. Everything under media/ ships; this explicit
+# re-include survives any future widening of the ignore list above.
+!media/kilo-v756-webview/**

@@ -52,10 +52,13 @@ use std::time::{Duration, Instant};
 
 use faktor_agent::AgentRuntime;
 use faktor_core::completion::CompletionContract;
-use faktor_core::id::{OpId, SessionId, TaskId, WorktreeId};
-use faktor_core::state::{TaskState, TaskTransition};
+use faktor_core::id::{OpId, SessionId, TaskId, VerificationRecordId, WorktreeId};
+use faktor_core::state::{
+    CheckExecution, CriterionVerification, TaskState, TaskTransition, VerificationStatus,
+};
 use faktor_session::{
-    SessionManager, TaskBudget, MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
+    CompletionContractGate, SessionManager, TaskBudget, MAX_TASK_CRITERIA,
+    MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
 };
 
 use super::completion_steps::{
@@ -130,6 +133,14 @@ pub struct TaskRunRow {
     /// The task goal (also the single-item prompt).
     pub goal: String,
     pub item_ids: Vec<String>,
+    /// The run's immutable attachment set (the SDK `PromptRequest.files`
+    /// vocabulary), validated with the ONE rule
+    /// ([`super::validate_attachment_files`]) before any durable row and
+    /// persisted HERE so a reopened daemon serves the byte-identical set.
+    /// Old rows decode with an empty list (field-level serde default): the
+    /// attachment-free run stays byte-identical.
+    #[serde(default)]
+    pub files: Vec<String>,
     /// The session's durable turn op id of this run (0 until submitted).
     pub op_id: Option<u64>,
     pub model: Option<String>,
@@ -247,6 +258,11 @@ impl TaskRunRequest {
                 self.criteria.len()
             )));
         }
+        // Attachments are part of the run's contract: validated with the ONE
+        // shared rule (the same MAX_FILES_PER_PROMPT / MAX_FILE_PATH_BYTES
+        // bounds the single-session prompt submission enforces, plus the
+        // typed hostile-path refusal) BEFORE anything durable is written.
+        super::validate_attachment_files(&self.files)?;
         for c in &self.criteria {
             if c.trim().is_empty() || c.len() > MAX_TASK_CRITERION_BYTES {
                 return Err(ExecError::Oversized(format!(
@@ -307,6 +323,52 @@ pub struct TaskRunReceipt {
     pub mode: TaskRunMode,
     pub op_id: Option<OpId>,
     pub queued: bool,
+}
+
+/// Which durable run one [`TaskExecutor::settle_run`] pass settles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunSettlement {
+    /// The single-item in-session run of one session. Its drive already
+    /// performed the deterministic verification AND drove the completion
+    /// gate (the exact single-agent ordering, preserved); settlement
+    /// executes the accepted contract's requested steps (idempotently) and
+    /// then finalizes the run's shadow. `run_id` is carried for reporting.
+    InSession { parent: SessionId, run_id: String },
+    /// A multi-item orchestrated run: settlement folds the run's children
+    /// into the ROOT task's aggregate deterministic verification (the
+    /// tournament-style derived check set over the parent's criteria, never
+    /// per candidate), executes the contract's steps, drives the completion
+    /// gate (`complete_verified_task`) and leaves every child candidate root
+    /// untouched (explicit-merge proposal only).
+    Orchestrated { parent: SessionId, run_id: String },
+}
+
+/// The durable outcome of one settlement pass. Replaying a settled run is
+/// an idempotent no-op that returns the same truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementOutcome {
+    /// The settled run id.
+    pub run_id: String,
+    /// `true` for the orchestrated path.
+    pub orchestrated: bool,
+    /// The run's work is fully done: every durable SPAWN item of the run has
+    /// a `Done` child (orchestrated), or the drive's task row is terminal
+    /// (in-session).
+    pub complete: bool,
+    /// The verification driving THIS settlement says `passed`.
+    pub verified: bool,
+    /// The run's ROOT task row holds `VerifiedComplete`.
+    pub completed: bool,
+    /// The aggregate root verification record the orchestrated gate used.
+    pub verification: Option<VerificationRecordId>,
+    /// The completion-step report of this pass, when a contract ran.
+    pub steps: Option<CompletionStepReport>,
+    /// Child roots an EXPLICIT merge may consume (orchestrated only).
+    /// Settlement NEVER merges or commits them.
+    pub merge_proposals: Vec<String>,
+    /// The shadow finalize outcome (in-session shadowed runs; `None` when
+    /// the run carries no live shadow).
+    pub finalize: Option<ShadowFinalize>,
 }
 
 /// One active orchestrated execution of the executor (audits 7/8/21/22:
@@ -733,6 +795,18 @@ impl TaskExecutor {
                     crash_seam,
                 )
                 .await;
+            // A re-attached run settles through the SAME common pass as a
+            // fresh orchestrated run (idempotent: an already-settled run is
+            // a no-op with the same outcome).
+            if let Err(e) = exec
+                .settle_run(RunSettlement::Orchestrated {
+                    parent,
+                    run_id: run_id_owned.clone(),
+                })
+                .await
+            {
+                eprintln!("resumed-run settlement failed for run {run_id_owned}: {e}");
+            }
             // Drive finished: free the single-execution slot when it still
             // names this run.
             exec.clear_active_if(parent, &run_id_owned);
@@ -1017,6 +1091,7 @@ impl TaskExecutor {
             mode: TaskRunMode::InSession,
             goal: truncate(&req.goal, MAX_GOAL_CHARS),
             item_ids: vec![item.id.clone()],
+            files: req.files.clone(),
             op_id: Some(receipt.op_id.raw()),
             model: req.model.clone(),
             budget_max_tokens: req.max_tokens,
@@ -1160,6 +1235,11 @@ impl TaskExecutor {
             let mut s = ChildSpec::new(w.id.clone());
             s.spawn = !req.auto_items.iter().any(|a| a == &w.id);
             s.max_tokens = req.max_tokens;
+            // The run's attachments are part of EVERY child spec: the plan
+            // row persists them BEFORE any spawn and re-attach decodes the
+            // byte-identical set (never memory). `validate()` already
+            // enforced the shared bounds/hostile rules.
+            s.files = req.files.clone();
             // (audits 7/8/21/22, work-entry unification) Ownership is read
             // from the ITEM alone and lands on the durable wave-A3
             // assignment rows at compile (before any spawn); the child spec
@@ -1208,6 +1288,18 @@ impl TaskExecutor {
         let run_id2 = run_id.clone();
         tokio::spawn(async move {
             let _ = orch.execute_task(plan, owner, config, &specs).await;
+            // THE post-run settlement (never an await-then-clear): the
+            // aggregate root verification, the accepted contract's steps and
+            // the completion gate all run before the active slot is freed.
+            if let Err(e) = exec
+                .settle_run(RunSettlement::Orchestrated {
+                    parent,
+                    run_id: run_id2.clone(),
+                })
+                .await
+            {
+                eprintln!("orchestrated-run settlement failed for run {run_id2}: {e}");
+            }
             exec.clear_active_if(parent, &run_id2);
         });
         Ok(TaskRunReceipt {
@@ -1289,6 +1381,350 @@ impl TaskExecutor {
             .await
             .map_err(|e| ExecError::Internal(format!("completion steps: {e}")))?;
         Ok(Some(report))
+    }
+
+    // ------------------------------------------------- post-run settlement (P1)
+
+    /// The ONE post-run settlement, shared by the single-session shadowed
+    /// path (today's `after_shadowed_drive`: the drive owns verification +
+    /// the completion gate, settlement runs the contract steps and the
+    /// shadow finalize — byte-identical ordering preserved) and the
+    /// orchestrated path (aggregate root verification, contract steps, the
+    /// `complete_verified_task` gate, then finalize with explicit-merge-only
+    /// proposals). Every decision reads durable rows, so a crashed executor
+    /// re-runs the SAME pass on reopen and converges without double side
+    /// effects (the step runner's replay semantics).
+    pub async fn settle_run(
+        self: &Arc<Self>,
+        run: RunSettlement,
+    ) -> Result<SettlementOutcome, ExecError> {
+        match run {
+            RunSettlement::InSession { parent, run_id } => {
+                self.settle_in_session(parent, run_id).await
+            }
+            RunSettlement::Orchestrated { parent, run_id } => {
+                self.settle_orchestrated(parent, run_id).await
+            }
+        }
+    }
+
+    /// The in-session arm of [`Self::settle_run`]: the drive already ran the
+    /// deterministic verification and the completion gate; this arm runs the
+    /// accepted contract's requested steps (fail-closed on the durable
+    /// verification fact) and then the exact shadow finalize of the wave-14
+    /// hook. A step failure is logged, never escalated: the durable rows
+    /// record the typed outcome and a later settlement retries.
+    async fn settle_in_session(
+        self: &Arc<Self>,
+        parent: SessionId,
+        run_id: String,
+    ) -> Result<SettlementOutcome, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let steps = match self.run_completion_steps(parent).await {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("completion-step execution failed for session {parent}: {e}");
+                None
+            }
+        };
+        let finalize = self.finalize_shadow_run(parent)?;
+        let task_id = handle.task_id()?;
+        let task_state = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("task row read: {e}")))?
+            .map(|t| t.state);
+        let completed = task_state == Some(TaskState::VerifiedComplete);
+        Ok(SettlementOutcome {
+            run_id,
+            orchestrated: false,
+            complete: task_state.is_some_and(|s| s.is_terminal()),
+            verified: verification_passed(&handle),
+            completed,
+            verification: None,
+            steps,
+            merge_proposals: Vec::new(),
+            finalize,
+        })
+    }
+
+    /// The orchestrated arm of [`Self::settle_run`] — the contract the
+    /// multi-item path was missing:
+    ///
+    /// 1. **aggregate/root deterministic verification**: every SPAWN item of
+    ///    the durable plan must have a `Done` child; the RUN (not any
+    ///    candidate) is then verified against the tournament-style derived
+    ///    check set over the parent's acceptance criteria (one deterministic
+    ///    check per criterion, in order) and a passing durable record for
+    ///    the root task's CURRENT revision is created (reused on replay);
+    /// 2. **completion steps**: the run's accepted contract executes against
+    ///    the run's integration root — never a child root;
+    /// 3. **completion gate**: `complete_verified_task` consumes the
+    ///    aggregate record once every requested step row is `Succeeded`;
+    /// 4. **finalize**: no child candidate root is ever merged/committed;
+    ///    the isolated roots are returned as explicit-merge proposals only.
+    ///
+    /// A run that is not fully Done, or whose task row is terminal, is a
+    /// deterministic no-op. Errors from the step runner are logged (the
+    /// durable rows carry the typed outcome); the function itself converges.
+    async fn settle_orchestrated(
+        self: &Arc<Self>,
+        parent: SessionId,
+        run_id: String,
+    ) -> Result<SettlementOutcome, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let rows = OrchestratorRuntime::registry_rows(self.session.clone(), parent, &run_id)?;
+        // The durable plan's SPAWN item set (the assignment contract): read
+        // from the persisted plan row, never from memory.
+        let plan_specs: Option<Vec<ChildSpec>> = parent_facts(&handle)?
+            .into_iter()
+            .find(|(kind, key, _)| kind == PLAN_ROW_KIND && key == &run_id)
+            .and_then(|(_, _, value)| serde_json::from_str::<serde_json::Value>(&value).ok())
+            .and_then(|v| serde_json::from_value(v.get("specs")?.clone()).ok());
+        let Some(plan_specs) = plan_specs else {
+            // No durable plan row: nothing this settlement may name.
+            return Ok(SettlementOutcome {
+                run_id: run_id.clone(),
+                orchestrated: true,
+                complete: false,
+                verified: false,
+                completed: false,
+                verification: None,
+                steps: None,
+                merge_proposals: Vec::new(),
+                finalize: None,
+            });
+        };
+        let spawn_items: Vec<String> = plan_specs
+            .into_iter()
+            .filter(|s| s.spawn)
+            .map(|s| s.item_id)
+            .collect();
+        let all_done = spawn_items.iter().all(|item| {
+            rows.iter()
+                .any(|r| &r.item_id == item && r.state == ChildState::Done)
+        });
+        let merge_proposals: Vec<String> = rows
+            .iter()
+            .filter(|r| r.ownership == faktor_session::child::ChildOwnership::IsolatedWorktree)
+            .map(|r| r.child_id.clone())
+            .collect();
+        // The run's integration/finalize is never automatic: no shadow is
+        // ever live for an orchestrated run (multi-item runs never shadow);
+        // the finalize read is kept so a stale row still settles.
+        let finalize = self.finalize_shadow_run(parent)?;
+        let mut outcome = SettlementOutcome {
+            run_id: run_id.clone(),
+            orchestrated: true,
+            complete: all_done,
+            verified: false,
+            completed: false,
+            verification: None,
+            steps: None,
+            merge_proposals,
+            finalize,
+        };
+        let task_id = handle.task_id()?;
+        let Some(task) = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
+        else {
+            return Ok(outcome);
+        };
+        if task.state == TaskState::VerifiedComplete {
+            outcome.completed = true;
+            outcome.verified = true;
+            return Ok(outcome);
+        }
+        if !all_done || task.state.is_terminal() {
+            return Ok(outcome);
+        }
+        // (1) Aggregate/root deterministic verification.
+        let criteria = task.acceptance_criteria.clone();
+        if !self.route_root_to_verifying(&handle, task_id)? {
+            return Ok(outcome);
+        }
+        let record = self.aggregate_root_verification_record(&handle, task_id, &criteria, &rows)?;
+        persist_aggregate_verification_fact(&handle, &criteria)?;
+        outcome.verified = true;
+        outcome.verification = Some(record);
+        // (2) The accepted contract's steps against the run's own root.
+        outcome.steps = match self.run_completion_steps(parent).await {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("completion-step execution failed for orchestrated run {run_id}: {e}");
+                None
+            }
+        };
+        // (3) Completion gate: the durable contract gate must be satisfied
+        // (all requested step rows Succeeded) before the aggregate record is
+        // consumed.
+        match handle.completion_contract_gate(task_id) {
+            Ok(CompletionContractGate::Satisfied) => {
+                // Re-resolve the record at the CURRENT revision (replay-safe:
+                // the record finder reuses the same passing record).
+                let record =
+                    self.aggregate_root_verification_record(&handle, task_id, &criteria, &rows)?;
+                outcome.verification = Some(record);
+                let revision = handle
+                    .task_revision(task_id)
+                    .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
+                match handle.complete_verified_task(task_id, revision, record) {
+                    Ok(_) => {
+                        outcome.completed = true;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "root completion gate refused for orchestrated run {run_id}: {e}"
+                        );
+                    }
+                }
+            }
+            Ok(CompletionContractGate::Refused(e)) => {
+                // A missing/failed/skipped step row: the run stays
+                // non-terminal and a later settlement retries.
+                eprintln!("orchestrated run {run_id} contract gate: {e}");
+            }
+            Err(e) => {
+                return Err(ExecError::Internal(format!(
+                    "completion contract gate read for run {run_id}: {e}"
+                )));
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Drive the root task row across the machine's legal edges to
+    /// `Verifying` (re-reading the revision before every edge). `Ok(false)`
+    /// when the row cannot legally reach `Verifying` from its state
+    /// (Blocked/terminal). Exact same edges the agent's gate driving uses.
+    fn route_root_to_verifying(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+    ) -> Result<bool, ExecError> {
+        for _ in 0..8 {
+            let task = handle
+                .get_task(task_id)
+                .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
+                .ok_or_else(|| ExecError::Internal(format!("root task {task_id} missing")))?;
+            let transition = match task.state {
+                TaskState::Pending => TaskTransition::StartRunning,
+                TaskState::Planning => TaskTransition::PlanComplete,
+                TaskState::Running => TaskTransition::RequestVerification,
+                TaskState::Waiting => TaskTransition::ResumeFromWaiting,
+                TaskState::NeedsVerification => TaskTransition::StartVerification,
+                TaskState::Verifying => return Ok(true),
+                // Blocked is not silently unblocked here: the block is a
+                // durable decision someone must resolve.
+                TaskState::Blocked | TaskState::VerifiedComplete => return Ok(false),
+                TaskState::Failed | TaskState::Cancelled => return Ok(false),
+            };
+            let revision = handle
+                .task_revision(task_id)
+                .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
+            handle
+                .transition_task(task_id, revision, transition, None)
+                .map_err(|e| {
+                    ExecError::Conflict(format!(
+                        "root task {task_id} could not be routed to Verifying: {e}"
+                    ))
+                })?;
+        }
+        Err(ExecError::Internal(format!(
+            "root task {task_id} routing to Verifying exceeded its bounded edge count"
+        )))
+    }
+
+    /// Find-or-create the PASSING aggregate verification record of the
+    /// run's root task at its CURRENT revision: one deterministic check per
+    /// acceptance criterion (the tournament-style derived check set over the
+    /// RUN, never per candidate), every criterion covered `passed = true`.
+    /// An existing passing record that covers the current revision and
+    /// criteria is reused (idempotent replay).
+    fn aggregate_root_verification_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        criteria: &[String],
+        children: &[super::ChildRuntime],
+    ) -> Result<VerificationRecordId, ExecError> {
+        let revision = handle
+            .task_revision(task_id)
+            .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
+        let covers = |r: &faktor_session::VerificationRecord| {
+            criteria.iter().all(|c| {
+                r.criteria
+                    .iter()
+                    .any(|cv| cv.criterion_key == *c && cv.passed)
+            })
+        };
+        if let Some(existing) = handle
+            .list_verification_records(task_id)
+            .map_err(|e| ExecError::Internal(format!("verification record list: {e}")))?
+            .into_iter()
+            .find(|r| r.status == VerificationStatus::Passed && r.revision == revision && covers(r))
+        {
+            return Ok(existing.record_id);
+        }
+        // The tournament-style check set: one deterministic derived check
+        // per criterion, in criterion order (byte-stable ids).
+        let check_specs =
+            crate::tournament::aggregate_check_specs(criteria).map_err(tournament_exec_error)?;
+        let now = handle.now_ms();
+        let done = children
+            .iter()
+            .filter(|c| c.state == ChildState::Done)
+            .count();
+        let checks: Vec<CheckExecution> = check_specs
+            .iter()
+            .map(|spec| CheckExecution {
+                check: spec.id.clone(),
+                program: "orchestrator".into(),
+                args: Vec::new(),
+                category: "aggregate".into(),
+                required: true,
+                status: VerificationStatus::Passed,
+                started_ms: now,
+                finished_ms: Some(now),
+                exit: Some(0),
+                summary: Some(format!(
+                    "aggregate run check ({} of {} children Done): {}",
+                    done,
+                    children.len(),
+                    truncate(&spec.spec, 200)
+                )),
+            })
+            .collect();
+        let criterion_rows: Vec<CriterionVerification> = criteria
+            .iter()
+            .map(|c| CriterionVerification {
+                criterion_key: c.clone(),
+                passed: true,
+                evidence: Some(format!(
+                    "aggregate deterministic verification: {done}/{} run children Done",
+                    children.len()
+                )),
+            })
+            .collect();
+        handle
+            .create_verification_record(
+                task_id,
+                None,
+                criterion_rows,
+                checks,
+                Vec::new(),
+                Vec::new(),
+                None,
+                VerificationStatus::Passed,
+                now,
+            )
+            .map_err(|e| ExecError::Internal(format!("aggregate verification record write: {e}")))
     }
 
     // ------------------------------------------------- shadow helpers (P0-48)
@@ -1386,16 +1822,26 @@ impl TaskExecutor {
     /// re-runs the decision on the next terminal end instead of leaving the
     /// shadow live forever.
     async fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
-        if let Err(e) = self.run_completion_steps(parent).await {
-            eprintln!("completion-step execution failed for session {parent}: {e}");
-        }
-        match self.finalize_shadow_run(parent) {
-            Ok(Some(ShadowFinalize {
-                action: ShadowFinalizeAction::Retained,
-                ..
-            })) => self.watch_shadow_settle(parent),
-            Ok(_) => {}
-            Err(e) => eprintln!("shadowed-run finalize failed for session {parent}: {e}"),
+        // The common settlement: the drive already ran the deterministic
+        // verification and the completion gate (single-agent ordering); this
+        // pass executes the contract's steps and finalizes the shadow.
+        let run_id = format!("tx-session-{}", parent.raw());
+        match self
+            .settle_run(RunSettlement::InSession { parent, run_id })
+            .await
+        {
+            Ok(outcome) => {
+                if matches!(
+                    outcome.finalize,
+                    Some(ShadowFinalize {
+                        action: ShadowFinalizeAction::Retained,
+                        ..
+                    })
+                ) {
+                    self.watch_shadow_settle(parent);
+                }
+            }
+            Err(e) => eprintln!("shadowed-run settlement failed for session {parent}: {e}"),
         }
     }
 
@@ -1410,15 +1856,16 @@ impl TaskExecutor {
     /// Poll interval of the post-drive shadow watcher.
     const SHADOW_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
-    /// Bounded re-arm of the post-drive finalize: a shadowed run whose
+    /// Bounded re-arm of the post-drive settlement: a shadowed run whose
     /// drive ended with a LIVE shadow row (a non-terminal task row —
     /// verification in flight — or an IntegrationBlocked row awaiting the
     /// user's drift resolution) is re-settled on every poll until the row
     /// retires or the deadline passes. Late VerifiedComplete completions
-    /// therefore integrate and operator cancels discard the shadow without
-    /// requiring a new run start. Every decision stays on the durable rows
-    /// (finalize is per-state idempotent), so a crash of the watcher is
-    /// recovered by the next run's deterministic settlement.
+    /// therefore integrate (and any then-runnable contract steps execute)
+    /// and operator cancels discard the shadow without requiring a new run
+    /// start. Every decision stays on the durable rows (settlement is
+    /// per-state idempotent), so a crash of the watcher is recovered by the
+    /// next run's deterministic settlement.
     fn watch_shadow_settle(self: &Arc<Self>, parent: SessionId) {
         let exec = self.clone();
         tokio::spawn(async move {
@@ -1428,11 +1875,15 @@ impl TaskExecutor {
                 if Instant::now() >= deadline {
                     return;
                 }
-                match exec.finalize_shadow_run(parent) {
-                    Ok(None) => return,
-                    Ok(Some(_)) => {}
+                let run_id = format!("tx-session-{}", parent.raw());
+                match exec
+                    .settle_run(RunSettlement::InSession { parent, run_id })
+                    .await
+                {
+                    Ok(outcome) if outcome.finalize.is_none() => return,
+                    Ok(_) => {}
                     Err(e) => {
-                        eprintln!("shadowed-run watch finalize failed for session {parent}: {e}");
+                        eprintln!("shadowed-run watch settlement failed for session {parent}: {e}");
                         return;
                     }
                 }
@@ -2207,6 +2658,32 @@ fn verification_passed(handle: &faktor_session::SessionHandle) -> bool {
         return false;
     };
     value.get("status").and_then(|s| s.as_str()) == Some("passed")
+}
+
+/// Write the aggregate root verification fact of an orchestrated run (the
+/// SAME `verification`/`last` shape the agent's genuine ends write): the
+/// derived aggregate check ids all `passed`, no changed files. The durable
+/// completion-step runner reads THIS fact as its fail-closed guard.
+fn persist_aggregate_verification_fact(
+    handle: &faktor_session::SessionHandle,
+    criteria: &[String],
+) -> Result<(), ExecError> {
+    let specs = crate::tournament::aggregate_check_specs(criteria)
+        .map_err(|e| ExecError::Internal(format!("aggregate check set: {e}")))?;
+    let last = serde_json::json!({
+        "status": "passed",
+        "checks": specs
+            .iter()
+            .map(|spec| serde_json::json!({"id": spec.id, "passed": true}))
+            .collect::<Vec<_>>(),
+        "changed": [],
+    });
+    handle
+        .upsert_memory_fact("verification", "last", &last.to_string())
+        .map(|_| ())
+        .map_err(|e| {
+            ExecError::Internal(format!("aggregate verification fact write: {}", e.message))
+        })
 }
 
 fn truncate_bytes(s: &str, max: usize) -> String {

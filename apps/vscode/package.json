@@ -137,6 +137,7 @@
   "scripts": {
     "build": "tsc -p .",
     "selftest": "node scripts/selftest.mjs",
+    "prepackage:vsix": "node scripts/prepare-vendored-webview.mjs",
     "package:vsix": "npx --yes @vscode/vsce package"
   },
   "dependencies": {},

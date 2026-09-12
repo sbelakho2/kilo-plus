@@ -25,9 +25,17 @@ import * as wb from '../src/workspaceBinding.ts';
 import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import composerPolicy from '../media/composer-state.js';
-import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { bridgeTests } from './bridge-selftest.mjs';
+
+// `--packaged <extension-dir>` additionally asserts the extracted VSIX layout
+// (out/ + media/ + the pinned vendored webview closure) without a daemon.
+const packagedIndex = process.argv.indexOf('--packaged');
+const packagedDir = packagedIndex !== -1 ? process.argv[packagedIndex + 1] : null;
 
 // ------------------------------------------------------------- test harness
 
@@ -1713,6 +1721,95 @@ async function presentationWebviewTests() {
 }
 
 
+// ------------------------------------------- vendored webview packaging (P0)
+
+function sha256File(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function walkPackagedFiles(root) {
+  const out = [];
+  const visit = (dir, prefix) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const rel = prefix.length > 0 ? `${prefix}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) {
+        throw new Error(`symlink not allowed in the packaged webview: ${rel}`);
+      }
+      if (entry.isDirectory()) {
+        visit(join(dir, entry.name), rel);
+      } else if (entry.isFile()) {
+        out.push(rel);
+      }
+    }
+  };
+  visit(root, '');
+  return out;
+}
+
+async function vendoredResolutionTests() {
+  await test('vendored resolution never leaves extensionUri (no checkout escape)', () => {
+    const source = readFileSync(new URL('../src/webview.ts', import.meta.url), 'utf8');
+    assert(
+      source.includes("'media', 'kilo-v756-webview'"),
+      'vendoredRoot must join extensionUri with media/kilo-v756-webview',
+    );
+    assert(!/'\.\.',\s*'\.\.'/.test(source), 'checkout-relative ../.. resolution must be gone');
+    assert(source.includes('FAKTOR_UI_BUNDLE'), 'the explicit dev override must stay documented');
+    assert(source.includes('vendoredFallbackNotice'), 'the missing-bundle notice path must stay wired');
+  });
+}
+
+async function packagedLayoutTests(dir) {
+  await test(`packaged VSIX layout is self-contained (${dir})`, () => {
+    assert(existsSync(dir), `packaged dir does not exist: ${dir}`);
+    for (const rel of [
+      'out/extension.js',
+      'out/webview.js',
+      'out/kilo-bridge.js',
+      'media/chat.js',
+      'media/chat.css',
+      'media/composer-state.js',
+      'media/faktor.svg',
+      'media/kilo-v756-webview/dist/webview.js',
+      'media/kilo-v756-webview/dist/webview.css',
+      'media/kilo-v756-webview/dist/shiki-worker.js',
+    ]) {
+      assert(existsSync(join(dir, ...rel.split('/'))), `packaged extension is missing ${rel}`);
+    }
+    const webviewRoot = join(dir, 'media', 'kilo-v756-webview');
+    const files = walkPackagedFiles(webviewRoot);
+    assert(files.length >= 25, `packaged vendored webview must hold >= 25 files, found ${files.length}`);
+
+    const built = readFileSync(join(dir, 'out', 'webview.js'), 'utf8');
+    assert(
+      built.includes("'media', 'kilo-v756-webview'"),
+      'compiled webview.js must resolve inside extensionUri/media/kilo-v756-webview',
+    );
+    assert(!/'\.\.',\s*'\.\.'/.test(built), 'compiled webview.js must not escape the extension');
+
+    const manifestPath = fileURLToPath(
+      new URL('../../../ui/kilo-v756-webview/dist/build-manifest.json', import.meta.url),
+    );
+    assert(existsSync(manifestPath), `pinned manifest must exist: ${manifestPath}`);
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    let verified = 0;
+    for (const file of manifest.vendored ?? []) {
+      const packaged = join(webviewRoot, ...file.path.split('/'));
+      assert(existsSync(packaged), `packaged vendored file missing: ${file.path}`);
+      const stat = statSync(packaged);
+      assert(
+        stat.size === file.size && sha256File(packaged) === file.sha256,
+        `packaged vendored file diverges from the pin: ${file.path}`,
+      );
+      verified += 1;
+    }
+    assert(
+      verified === (manifest.vendored ?? []).length && verified > 0,
+      `expected the full pinned closure, verified ${verified}`,
+    );
+  });
+}
+
 // -------------------------------------------------------------------- main
 
 async function main() {
@@ -1731,6 +1828,10 @@ async function main() {
   await pixelAgentTests();
   await cockpitTests();
   await presentationWebviewTests();
+  await vendoredResolutionTests();
+  if (packagedDir !== null && packagedDir !== undefined) {
+    await packagedLayoutTests(packagedDir);
+  }
   for (const { label, fn } of bridgeTests) {
     await test(`bridge: ${label}`, fn);
   }

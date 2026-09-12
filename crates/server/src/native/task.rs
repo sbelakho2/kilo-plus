@@ -298,6 +298,13 @@ pub(crate) async fn native_task_run_start(
     }
     let prompts = PromptExecutionService::from_state(&state);
     let files = req.files.take().unwrap_or_default();
+    // Additive attachment validation at the DTO boundary: the SAME one rule
+    // the executor enforces (MAX_FILES_PER_PROMPT / MAX_FILE_PATH_BYTES +
+    // the typed hostile-path refusal) is a plain 400 BEFORE any dispatch —
+    // on both the explicit-work-items and the plain-prompt path.
+    if let Err(e) = faktor_orchestrator::runtime::validate_attachment_files(&files) {
+        return exec_error_response(&e);
+    }
     // P2: the plain-prompt path (`work_items` absent) carries no completion
     // contract seam; a non-default contract is refused loudly here, never
     // silently dropped. The default all-false contract is accepted and
@@ -505,6 +512,13 @@ pub(crate) async fn native_tournament_start(
     // candidate children need a real owner worktree.
     if let Err(e) = state.deps.session.ensure_owner_worktree(sid) {
         return api_err(&e);
+    }
+    // Additive attachment validation (the ONE shared rule): hostile or
+    // oversized candidate file lists are plain 400s before any durable row.
+    if let Err(e) =
+        faktor_orchestrator::runtime::validate_attachment_files(req.files.as_deref().unwrap_or(&[]))
+    {
+        return exec_error_response(&e);
     }
     let request = faktor_orchestrator::runtime::task_executor::TournamentStartRequest {
         goal: req.goal,
@@ -728,6 +742,53 @@ pub(crate) async fn native_tournaments_list(
     match faktor_orchestrator::tournament::Tournament::summaries(&handle) {
         Ok(list) => Json(list).into_response(),
         Err(e) => tournament_error_response(&e),
+    }
+}
+
+#[cfg(test)]
+mod attachment_dto_tests {
+    //! Additive cover of the task-start attachment validation: the SAME one
+    //! rule the executor enforces is applied at the DTO boundary and maps to
+    //! a plain 400 (via [`super::exec_error_response`]) before any dispatch —
+    //! hostile and oversized lists never reach a spawn.
+    use super::exec_error_response;
+    use faktor_orchestrator::runtime::validate_attachment_files;
+
+    fn status_of(files: &[String]) -> u16 {
+        let err = validate_attachment_files(files).expect_err("hostile/oversized list must refuse");
+        exec_error_response(&err).status().as_u16()
+    }
+
+    #[test]
+    fn task_attachment_lists_are_validated_with_the_shared_rule() {
+        // Workspace-relative paths (including nested and dot segments) pass.
+        assert!(validate_attachment_files(&[
+            "src/a.rs".to_string(),
+            "docs/sub/b.md".to_string(),
+            "./c.txt".to_string(),
+        ])
+        .is_ok());
+        // Oversized COUNT is a typed 400.
+        let many: Vec<String> = (0..faktor_session::MAX_FILES_PER_PROMPT + 1)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
+        assert_eq!(status_of(&many), 400, "count over MAX_FILES_PER_PROMPT");
+        // Oversized PATH is a typed 400.
+        let huge = vec!["x".repeat(faktor_session::MAX_FILE_PATH_BYTES + 1)];
+        assert_eq!(status_of(&huge), 400, "path over MAX_FILE_PATH_BYTES");
+        // Hostile paths are typed 400s: absolute, traversal, empty,
+        // control-character, and Windows drive-prefixed.
+        for hostile in [
+            "/etc/passwd",
+            "../secrets",
+            "src/../../secrets",
+            "",
+            "   ",
+            "bad\0path",
+            "C:\\Windows",
+        ] {
+            assert_eq!(status_of(&[hostile.to_string()]), 400, "{hostile:?}");
+        }
     }
 }
 

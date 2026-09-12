@@ -17,6 +17,8 @@ name: CI
 #   docs-drift              scripts/check-docs-sync.sh
 #   protocol-compat         faktor-protocol + tests/compat + tests/streams
 #   vscode-build            npm ci + tsc build + offline extension selftest
+#                           + self-contained VSIX (vendored webview staged,
+#                             unzipped and hash-asserted; IDE launch recorded)
 #   vscode-visual-with-skip playwright visual gate; recorded skip when the
 #                           browser cannot be installed (never a silent pass)
 #   jetbrains-build         java 17 + gradle buildPlugin (network allowed)
@@ -193,9 +195,9 @@ jobs:
         run: cargo test -p faktor-protocol -p faktor-tests-compat -p faktor-tests-streams
 
   vscode-build:
-    name: vscode-build (extension build + offline selftest)
+    name: vscode-build (extension build + offline selftest + self-contained VSIX)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -209,6 +211,31 @@ jobs:
       - name: Offline extension + bridge selftest (no daemon, no network)
         working-directory: apps/vscode
         run: node scripts/selftest.mjs
+      - name: Stage vendored webview and package the VSIX
+        # prepackage:vsix verifies the pinned source (verify-upstream) and dist
+        # closure (build-webview --verify), then stages the hashed closure at
+        # media/kilo-v756-webview/ before vsce packages it into the archive.
+        working-directory: apps/vscode
+        run: |
+          npm run prepackage:vsix
+          npx --yes @vscode/vsce package --out faktor-ci.vsix
+          node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+      - name: Assert the packaged extension offline (unzip + pinned hashes)
+        # No VS Code harness on GitHub runners: unzip the VSIX, re-run the
+        # extension's offline selftest against the packaged dir and verify
+        # every vendored file byte-for-byte against build-manifest.json.
+        working-directory: apps/vscode
+        run: |
+          rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix
+          unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
+          node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
+          node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
+      - name: Load the packaged extension in a VS Code harness (recorded skip when unavailable)
+        # Required job: this step is only skippable with an explicit recorded
+        # reason (target/certification/vsix-ide-load.json); a `code` CLI that
+        # exists but fails to load the VSIX fails the job.
+        working-directory: apps/vscode
+        run: node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
 
   vscode-visual-with-skip:
     name: vscode-visual-with-skip (playwright gate, recorded skip)
