@@ -94,4 +94,15 @@ wordmark tokens survive only inside frozen compatibility fixtures and
 attribution prose (enforced by `scripts/branding-scan.sh`). The external
 GitHub repository name and description cannot be changed from this
 repository — rename them in the repository settings; package/manifest
-metadata in-tree is the authoritative surface and is scan-enforced.
+metadata in-tree is the authoritative surface and is scan-enforced. The
+external repository has since been renamed to `faktor` via `gh repo rename`;
+in-tree metadata is unchanged.
+
+## Status notes
+
+- **Completion contract (P2 follow-up).** The reviewed PR/CI-fix item that
+  lets a native task declare `completion_contract` (`include_commit`,
+  `include_push`, `include_pr`) and gates `VerifiedComplete` on the
+  corresponding steps is specified but **not implemented** in this tree; the
+  normative semantics, the exact code seams, and why the current change's
+  allowed files block them are recorded in `docs/certification.md` §3.3.

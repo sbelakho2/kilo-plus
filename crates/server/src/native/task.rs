@@ -210,10 +210,11 @@ pub(crate) fn native_run_parent_caps() -> faktor_orchestrator::caps::CapabilityS
 /// 400s, never silent truncation). The response carries the run's durable
 /// identity + task id + its current per-run state.
 ///
-/// Multi-item MUTATING plans are refused by the executor's own validation
-/// (they need an isolated child root this surface does not carry); a
-/// single-item mutating task is the intended shape and is shadowed by
-/// default.
+/// Multi-item MUTATING plans are accepted: `TaskExecutor::start_task`
+/// allocates the run's daemon-owned isolated root itself (through the
+/// executor's single `CandidateWorkspaceService` authority), so this
+/// surface never carries a filesystem path; a single-item mutating task is
+/// shadowed by default.
 pub(crate) async fn native_task_run_start(
     State(state): State<AppState>,
     headers: HeaderMap,

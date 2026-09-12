@@ -361,6 +361,7 @@ profile).
 | Compat fixtures jetbrains-712 | reserved corpus | absent (`false` in manifest) | BLOCKED_EXTERNAL |
 | Fuzz harnesses | seeded pseudo-fuzz | CI `fuzz-suite` / manual | CI-LANE |
 | Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |
+| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet` ledger + `VerifiedComplete` gate | specified, not implemented; blocked by this change's allowed files (§3.3) | NOT IMPLEMENTED (follow-up) |
 
 ### 3.1 Last recorded local fast run
 
@@ -400,6 +401,56 @@ release certificate):
   exercised by this run.
 - `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `SMOKE PASS` plus
   `NATIVE SMOKE PASS`.
+
+### 3.3 PR/CI-fix completion contract (P2 follow-up — specified, NOT implemented)
+
+The reviewed P2 item asks for a first-class PR/CI-fix completion contract so a
+native task can declare:
+
+```json
+"completion_contract": { "include_commit": true, "include_push": true, "include_pr": true }
+```
+
+Normative semantics (recorded so the follow-up cannot drift):
+
+- The native task-run start DTO parses `completion_contract` strictly (typed
+  400 on unknown fields or non-boolean members; never a silent default).
+- The accepted contract is recorded durably as the typed ledger entry
+  `CompletionContractSet` before the run is driven; the completion gate reads
+  the durable record, never the request.
+- `include_commit`, `include_push` and `include_pr` are conditional steps:
+  the completion path refuses `VerifiedComplete` with a typed error while any
+  requested step has no succeeding durable step-status row. A missing row is
+  "not done", never "probably fine".
+- Commit/push/PR step *execution* does not exist in this tree. The gate is
+  therefore specified against a durable per-step status row that the future
+  step executor (or the caller) sets; until that exists, the follow-up must
+  land the row or ledger kind and the gate together.
+
+Status in this change: **NOT IMPLEMENTED**. This change's allowed files are
+`crates/server/src/native/task.rs` (the stale-comment fix only), additive
+docs, and GitHub repository settings; the required seams are outside that
+scope:
+
+- DTO + typed validation: `crates/server/src/native/task.rs`
+  (`StartTaskRunRequest`).
+- Durable contract + step status: `crates/session/src/ledger.rs`
+  (`LedgerPayload` variant, `entry_tag_of`, `decode_payload` loud-refusal
+  table, head fold, public `SessionHandle` accessor). A raw
+  `Store::append_ledger_entry` write from the server is NOT an option: the
+  typed ledger rejects unknown `entry_type` rows as `Malformed`, so a
+  server-written row would break compaction and `ledger_verify_open`.
+- Gate at completion: `crates/session/src/task.rs`
+  (`SessionHandle::complete_verified_task`) and the only production
+  `VerifiedComplete` producer, `crates/agent/src/runtime.rs`; the executor
+  surface (`TaskRunRequest` / `TaskExecutor::start_task`) is
+  `crates/orchestrator/src/task_executor.rs`.
+
+The item stays open with this written follow-up; it must not be marked
+certified until the gate, the ledger entry and adversarial tests
+(non-succeeded step refuses `VerifiedComplete`; succeeded steps do not gate;
+crash between step status and completion recovers consistently) exist in the
+same change that authorizes those files.
 
 ---
 
