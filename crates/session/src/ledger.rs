@@ -99,6 +99,79 @@ pub const ENTRY_EDIT_TXN_PREPARED: &str = "edit_txn_prepared";
 pub const ENTRY_EDIT_TXN_PROGRESS: &str = "edit_txn_progress";
 pub const ENTRY_EDIT_TXN_COMMITTED: &str = "edit_txn_committed";
 pub const ENTRY_EDIT_TXN_ROLLED_BACK: &str = "edit_txn_rolled_back";
+// Durable multi-candidate tournament rows: the whole lifecycle of one
+// implementation tournament (`TournamentStarted` -> zero or more
+// `CandidateSettled` -> one `TournamentDecided`). They are the durable
+// authority an executor re-opens from after a crash; they fold nowhere in
+// the head and are PINNED across compaction (like learning corpus rows) so
+// a compacted ledger always reconstructs every tournament exactly.
+pub const ENTRY_TOURNAMENT_STARTED: &str = "tournament_started";
+pub const ENTRY_CANDIDATE_SETTLED: &str = "candidate_settled";
+pub const ENTRY_TOURNAMENT_DECIDED: &str = "tournament_decided";
+
+// ---------------------------------------------------------------- tournament bounds
+
+/// Hard bound on the candidate band of one tournament (N = 2..=4).
+pub const MIN_TOURNAMENT_CANDIDATES: usize = 2;
+pub const MAX_TOURNAMENT_CANDIDATES: usize = 4;
+/// Max criteria rows of one tournament.
+pub const MAX_TOURNAMENT_CRITERIA: usize = 16;
+/// Max bytes of one criterion id / spec / candidate text field.
+pub const MAX_TOURNAMENT_TEXT: usize = 512;
+/// Max bytes of one tournament id / run family / child id.
+pub const MAX_TOURNAMENT_ID: usize = 64;
+/// Max bytes of the decision outcome text.
+pub const MAX_TOURNAMENT_OUTCOME: usize = 1024;
+/// The only legal settlement state tags.
+pub const TOURNAMENT_STATE_DONE: &str = "done";
+pub const TOURNAMENT_STATE_FAILED: &str = "failed";
+pub const TOURNAMENT_STATE_CANCELLED: &str = "cancelled";
+/// The only legal independent-review verdict ranks (ascending severity).
+pub const TOURNAMENT_REVIEW_BLOCK: &str = "block";
+pub const TOURNAMENT_REVIEW_CONCERN: &str = "concern";
+pub const TOURNAMENT_REVIEW_CLEAN: &str = "clean";
+/// The only legal tournament outcome tags.
+pub const TOURNAMENT_OUTCOME_DECIDED: &str = "decided";
+pub const TOURNAMENT_OUTCOME_ABORTED: &str = "aborted";
+
+// Durable agent-coordination board rows: the parent/descendant-scoped
+// coordination board of ONE run family lives in the ROOT session's typed
+// ledger as append-only rows (`board_post` / `board_read` /
+// `board_receipt` / `board_reset`). All board rows are PINNED across
+// compaction (like learning corpus rows): the pinned stream is the durable
+// authority a board read reconstructs the live surface from after a crash
+// or reopen. The root session's ledger head caches the board revision for
+// O(1) CAS allocation; the entry stream remains the authority.
+pub const ENTRY_BOARD_POST: &str = "board_post";
+pub const ENTRY_BOARD_READ: &str = "board_read";
+pub const ENTRY_BOARD_RECEIPT: &str = "board_receipt";
+pub const ENTRY_BOARD_RESET: &str = "board_reset";
+
+// ---------------------------------------------------------------- board bounds
+
+/// Hard bound on one board post subject (UTF-8 bytes).
+pub const MAX_BOARD_SUBJECT_BYTES: usize = 512;
+/// Hard bound on one board post body (16 KiB, as advertised). The
+/// serialized row must additionally fit [`MAX_LEDGER_ENTRY_BYTES`], so a
+/// body near this bound is only accepted when its JSON encoding fits the
+/// ledger entry cap (an oversized encoded row is a typed reject).
+pub const MAX_BOARD_BODY_BYTES: usize = 16 * 1024;
+/// Max evidence/path/artifact references of one board post.
+pub const MAX_BOARD_REFS: usize = 32;
+/// Max bytes of one board post reference.
+pub const MAX_BOARD_REF_BYTES: usize = 1024;
+/// Max bytes of one board receipt note.
+pub const MAX_BOARD_RECEIPT_NOTE_BYTES: usize = 2048;
+/// The only legal board receipt action tags.
+pub const BOARD_RECEIPT_ACK: &str = "ack";
+pub const BOARD_RECEIPT_TASK_UPDATE: &str = "task_update";
+pub const BOARD_RECEIPT_BLOCKED: &str = "blocked";
+pub const BOARD_RECEIPT_QUESTION: &str = "question";
+/// Bounded page size for one descending board scan step.
+pub const MAX_BOARD_SCAN_PAGE: u64 = 500;
+/// Hard cap on receipts returned for one `(child, post)` pair; beyond this
+/// the read refuses loudly instead of returning an unbounded list.
+pub const MAX_BOARD_RECEIPTS_PER_POST: usize = 256;
 
 // ---------------------------------------------------------------- edit txn bounds
 
@@ -150,6 +223,69 @@ pub struct EditTxnOpenRow {
     pub strategy: String,
     pub files: Vec<EditTxnLedgerFile>,
     pub progress: Vec<EditTxnOpenProgress>,
+}
+
+/// One criterion of a tournament: its deterministic id plus the exact
+/// specification text every candidate was handed (byte-identical across
+/// candidates is an executor-side assertion; these rows are the durable
+/// copy).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentCriterionRow {
+    pub id: String,
+    pub spec: String,
+}
+
+/// One derived verification check of a tournament criterion. The check SET
+/// is a pure function of the criteria; every candidate settlement must
+/// carry the byte-identical set (the orchestrator asserts it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentCheckSpec {
+    pub id: String,
+    pub spec: String,
+}
+
+/// One candidate seed of a tournament: the child it names and where that
+/// child's isolated work landed at start time (`worktree`/`base_revision`
+/// may be empty until the first settlement records the real location).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentCandidateRow {
+    pub child_id: String,
+    pub worktree: String,
+    pub base_revision: String,
+}
+
+/// One settled candidate: the full evidence the deterministic comparison
+/// consumes. `state` is `done|failed|cancelled`; `verification` is the
+/// durable verification record id (raw, optional), `checks` the derived
+/// check set the candidate was verified against, `review` the independent
+/// reviewer's rank (`block|concern|clean`) with its reviewer identity, and
+/// `reason` the bounded audit text (why settled/discarded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TournamentSettlementRow {
+    pub child_id: String,
+    pub worktree: String,
+    pub base_revision: String,
+    pub state: String,
+    /// Durable verification record id (raw u64); `None` = no record.
+    #[serde(default)]
+    pub verification: Option<u64>,
+    /// The verification verdict the record certified; `None` = unverified.
+    #[serde(default)]
+    pub verification_pass: Option<bool>,
+    pub checks: Vec<TournamentCheckSpec>,
+    /// `block|concern|clean`; `None` = not reviewed (never eligible).
+    #[serde(default)]
+    pub review: Option<String>,
+    /// The independent reviewer's identity (child id / agent id); must
+    /// differ from every candidate child id.
+    #[serde(default)]
+    pub reviewer: Option<String>,
+    #[serde(default)]
+    pub cost_micro: u64,
+    #[serde(default)]
+    pub wall_ms: u64,
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// The typed payload of ONE ledger entry. The serde `kind` field is the
@@ -264,6 +400,75 @@ pub enum LedgerPayload {
         rolled_back: Vec<String>,
         rollback_conflicts: Vec<String>,
     },
+    /// One implementation tournament was started: the goal every candidate
+    /// received, the byte-identical criteria, and the N candidate seeds
+    /// (`child-0..child-{N-1}`) with their isolated worktrees. The durable
+    /// anchor a crash re-opens from.
+    TournamentStarted {
+        tournament_id: String,
+        run_family: String,
+        goal: String,
+        criteria: Vec<TournamentCriterionRow>,
+        candidates: Vec<TournamentCandidateRow>,
+    },
+    /// One candidate settled: its child terminal state, location, and the
+    /// verification + independent-review evidence the comparison ranks.
+    CandidateSettled {
+        tournament_id: String,
+        settlement: TournamentSettlementRow,
+    },
+    /// The tournament reached a terminal state: `outcome` is
+    /// `decided|aborted`; `winner` names the candidate proposed for the
+    /// explicit approved-merge path (None on abort). `rationale` records
+    /// WHY (bounded), including the loser-discard reason.
+    TournamentDecided {
+        tournament_id: String,
+        winner: Option<String>,
+        outcome: String,
+        rationale: String,
+    },
+    /// One coordination-board post. `board_id` is the ROOT session's raw
+    /// id (one board per run family); `post_id` is the post's durable
+    /// identity and equals `revision` (revisions are never reused, a reset
+    /// consumes one); `author_child` is the acting child's session raw id
+    /// (None = the root agent); `author_session` the session whose handle
+    /// posted; `revision` the per-board monotonic revision. `body` is
+    /// bounded by [`MAX_BOARD_BODY_BYTES`] and `refs` by [`MAX_BOARD_REFS`].
+    BoardPost {
+        board_id: u64,
+        post_id: u64,
+        author_child: Option<u64>,
+        author_session: u64,
+        subject: String,
+        body: String,
+        refs: Vec<String>,
+        revision: u64,
+    },
+    /// One read receipt: `child` read `post_id`. Read rows are append-only
+    /// and idempotent per (child, post) — a re-read never duplicates a row.
+    BoardRead {
+        board_id: u64,
+        child: u64,
+        post_id: u64,
+    },
+    /// One action receipt on a board post (`ack` / `task_update` /
+    /// `blocked` / `question`); `child` is None for a root-agent action.
+    BoardReceipt {
+        board_id: u64,
+        child: Option<u64>,
+        post_id: u64,
+        action: String,
+        note: String,
+    },
+    /// The durable reset marker: the live reading surface restarts AFTER
+    /// this row (`previous_revision` CAS-checked, `new_revision` bumped by
+    /// exactly one). History before the marker is retained in the stream
+    /// but hidden from reads.
+    BoardReset {
+        board_id: u64,
+        previous_revision: u64,
+        new_revision: u64,
+    },
 }
 
 /// One decoded ledger row.
@@ -303,6 +508,13 @@ pub struct LedgerHead {
     pub epoch: Option<u64>,
     /// The last genuine VerifyRun (bounded summary).
     pub last_verify: Option<LedgerVerifySummary>,
+    /// Newest coordination-board revision folded so far (0 = none). The
+    /// board rows themselves are pinned in the stream; this head field is
+    /// only the O(1) revision allocation/CAS cursor and is rebuilt by
+    /// replay when a head is missing. Additive with a serde default so
+    /// heads written before the board feature decode unchanged.
+    #[serde(default)]
+    pub board_revision: u64,
     /// The materialized checkpoint: seq of the newest folded entry (0 when
     /// nothing is folded yet). Compaction rewrites it to the pre-prune max;
     /// appends always allocate ABOVE it, so the fold cursor never rewinds.
@@ -405,6 +617,13 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::EditTxnProgress { .. } => ENTRY_EDIT_TXN_PROGRESS,
         LedgerPayload::EditTxnCommitted { .. } => ENTRY_EDIT_TXN_COMMITTED,
         LedgerPayload::EditTxnRolledBack { .. } => ENTRY_EDIT_TXN_ROLLED_BACK,
+        LedgerPayload::TournamentStarted { .. } => ENTRY_TOURNAMENT_STARTED,
+        LedgerPayload::CandidateSettled { .. } => ENTRY_CANDIDATE_SETTLED,
+        LedgerPayload::TournamentDecided { .. } => ENTRY_TOURNAMENT_DECIDED,
+        LedgerPayload::BoardPost { .. } => ENTRY_BOARD_POST,
+        LedgerPayload::BoardRead { .. } => ENTRY_BOARD_READ,
+        LedgerPayload::BoardReceipt { .. } => ENTRY_BOARD_RECEIPT,
+        LedgerPayload::BoardReset { .. } => ENTRY_BOARD_RESET,
     }
 }
 
@@ -454,6 +673,131 @@ fn decode_payload(
         ENTRY_EDIT_TXN_PROGRESS => decode(entry_type),
         ENTRY_EDIT_TXN_COMMITTED => decode(entry_type),
         ENTRY_EDIT_TXN_ROLLED_BACK => decode(entry_type),
+        ENTRY_TOURNAMENT_STARTED => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::TournamentStarted {
+                tournament_id,
+                run_family,
+                goal,
+                criteria,
+                candidates,
+            } = &decoded
+            {
+                validate_tournament_started(tournament_id, run_family, goal, criteria, candidates)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_CANDIDATE_SETTLED => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::CandidateSettled {
+                tournament_id,
+                settlement,
+            } = &decoded
+            {
+                validate_tournament_id(tournament_id, "tournament id")?;
+                validate_tournament_settlement(settlement)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_TOURNAMENT_DECIDED => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::TournamentDecided {
+                tournament_id,
+                winner,
+                outcome,
+                rationale,
+            } = &decoded
+            {
+                validate_tournament_id(tournament_id, "tournament id")?;
+                if let Some(w) = winner {
+                    validate_tournament_text(w, "tournament winner")?;
+                }
+                if !matches!(
+                    outcome.as_str(),
+                    TOURNAMENT_OUTCOME_DECIDED | TOURNAMENT_OUTCOME_ABORTED
+                ) {
+                    return Err(SessionError::Malformed(format!(
+                        "ledger tournament_decided outcome {outcome:?} is not decided|aborted"
+                    )));
+                }
+                if outcome == TOURNAMENT_OUTCOME_DECIDED && winner.is_none() {
+                    return Err(SessionError::Malformed(
+                        "ledger tournament_decided with outcome decided requires a winner".into(),
+                    ));
+                }
+                if rationale.is_empty() || rationale.len() > MAX_TOURNAMENT_OUTCOME {
+                    return Err(SessionError::Malformed(
+                        "ledger tournament_decided rationale must be 1..=MAX_TOURNAMENT_OUTCOME bytes"
+                            .into(),
+                    ));
+                }
+            }
+            Ok(decoded)
+        }
+        ENTRY_BOARD_POST => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::BoardPost {
+                board_id,
+                post_id,
+                author_child,
+                author_session,
+                subject,
+                body,
+                refs,
+                revision,
+            } = &decoded
+            {
+                validate_board_post(
+                    *board_id,
+                    *post_id,
+                    *author_child,
+                    *author_session,
+                    subject,
+                    body,
+                    refs,
+                    *revision,
+                )?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_BOARD_READ => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::BoardRead {
+                board_id,
+                child,
+                post_id,
+            } = &decoded
+            {
+                validate_board_read(*board_id, *child, *post_id)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_BOARD_RECEIPT => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::BoardReceipt {
+                board_id,
+                child,
+                post_id,
+                action,
+                note,
+            } = &decoded
+            {
+                validate_board_receipt(*board_id, *child, *post_id, action, note)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_BOARD_RESET => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::BoardReset {
+                board_id,
+                previous_revision,
+                new_revision,
+            } = &decoded
+            {
+                validate_board_reset(*board_id, *previous_revision, *new_revision)?;
+            }
+            Ok(decoded)
+        }
         other => Err(SessionError::Malformed(format!(
             "ledger entry type {other:?} is unknown to this reader"
         ))),
@@ -497,6 +841,336 @@ fn check_text(value: &str, what: &str) -> Result<(), SessionError> {
         return Err(SessionError::Oversized(format!(
             "ledger entry {what} of {} bytes exceeds {MAX_LEDGER_TEXT}",
             value.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tournament_id(value: &str, what: &str) -> Result<(), SessionError> {
+    if value.is_empty() || value.len() > MAX_TOURNAMENT_ID {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} must be 1..={MAX_TOURNAMENT_ID} bytes"
+        )));
+    }
+    if !value.is_ascii()
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(|c| c.is_control())
+    {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} must be printable ASCII without '/' or '\\\\'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tournament_text(value: &str, what: &str) -> Result<(), SessionError> {
+    if value.is_empty() {
+        return Err(SessionError::Malformed(format!(
+            "ledger {what} must be non-empty"
+        )));
+    }
+    if value.len() > MAX_TOURNAMENT_TEXT {
+        return Err(SessionError::Oversized(format!(
+            "ledger {what} of {} bytes exceeds MAX_TOURNAMENT_TEXT ({MAX_TOURNAMENT_TEXT})",
+            value.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tournament_checks(checks: &[TournamentCheckSpec]) -> Result<(), SessionError> {
+    if checks.is_empty() {
+        return Err(SessionError::Malformed(
+            "ledger candidate settlement requires the derived check set".into(),
+        ));
+    }
+    if checks.len() > MAX_TOURNAMENT_CRITERIA {
+        return Err(SessionError::Oversized(format!(
+            "ledger candidate settlement of {} checks exceeds MAX_TOURNAMENT_CRITERIA",
+            checks.len()
+        )));
+    }
+    for c in checks {
+        validate_tournament_text(&c.id, "tournament check id")?;
+        validate_tournament_text(&c.spec, "tournament check spec")?;
+    }
+    Ok(())
+}
+
+fn validate_tournament_started(
+    tournament_id: &str,
+    run_family: &str,
+    goal: &str,
+    criteria: &[TournamentCriterionRow],
+    candidates: &[TournamentCandidateRow],
+) -> Result<(), SessionError> {
+    validate_tournament_id(tournament_id, "tournament id")?;
+    validate_tournament_id(run_family, "tournament run family")?;
+    validate_tournament_text(goal, "tournament goal")?;
+    if criteria.is_empty() || criteria.len() > MAX_TOURNAMENT_CRITERIA {
+        return Err(SessionError::Malformed(format!(
+            "ledger tournament_started must carry 1..={MAX_TOURNAMENT_CRITERIA} criteria"
+        )));
+    }
+    let mut seen_criteria: Vec<&str> = Vec::with_capacity(criteria.len());
+    for c in criteria {
+        validate_tournament_text(&c.id, "tournament criterion id")?;
+        validate_tournament_text(&c.spec, "tournament criterion spec")?;
+        if seen_criteria.contains(&c.id.as_str()) {
+            return Err(SessionError::Malformed(format!(
+                "ledger tournament_started carries duplicate criterion id {:?}",
+                c.id
+            )));
+        }
+        seen_criteria.push(&c.id);
+    }
+    if !(MIN_TOURNAMENT_CANDIDATES..=MAX_TOURNAMENT_CANDIDATES).contains(&candidates.len()) {
+        return Err(SessionError::Malformed(format!(
+            "ledger tournament_started carries {} candidates outside the supported band {MIN_TOURNAMENT_CANDIDATES}..={MAX_TOURNAMENT_CANDIDATES}",
+            candidates.len()
+        )));
+    }
+    let mut seen_children: Vec<&str> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        validate_tournament_id(&c.child_id, "tournament candidate child id")?;
+        if !c.worktree.is_empty() && c.worktree.len() > MAX_LEDGER_TEXT {
+            return Err(SessionError::Oversized(
+                "ledger tournament candidate worktree exceeds MAX_LEDGER_TEXT".into(),
+            ));
+        }
+        if c.base_revision.len() > MAX_LEDGER_TEXT {
+            return Err(SessionError::Oversized(
+                "ledger tournament candidate base revision exceeds MAX_LEDGER_TEXT".into(),
+            ));
+        }
+        if seen_children.contains(&c.child_id.as_str()) {
+            return Err(SessionError::Malformed(format!(
+                "ledger tournament_started carries duplicate candidate child id {:?}",
+                c.child_id
+            )));
+        }
+        seen_children.push(&c.child_id);
+    }
+    Ok(())
+}
+
+fn validate_tournament_settlement(
+    settlement: &TournamentSettlementRow,
+) -> Result<(), SessionError> {
+    validate_tournament_id(&settlement.child_id, "candidate child id")?;
+    if settlement.worktree.len() > MAX_LEDGER_TEXT {
+        return Err(SessionError::Oversized(
+            "ledger candidate settlement worktree exceeds MAX_LEDGER_TEXT".into(),
+        ));
+    }
+    if settlement.base_revision.len() > MAX_LEDGER_TEXT {
+        return Err(SessionError::Oversized(
+            "ledger candidate settlement base revision exceeds MAX_LEDGER_TEXT".into(),
+        ));
+    }
+    if !matches!(
+        settlement.state.as_str(),
+        TOURNAMENT_STATE_DONE | TOURNAMENT_STATE_FAILED | TOURNAMENT_STATE_CANCELLED
+    ) {
+        return Err(SessionError::Malformed(format!(
+            "ledger candidate settlement state {:?} is not done|failed|cancelled",
+            settlement.state
+        )));
+    }
+    if settlement.verification == Some(0) {
+        return Err(SessionError::Malformed(
+            "ledger candidate settlement verification record id cannot be 0".into(),
+        ));
+    }
+    validate_tournament_checks(&settlement.checks)?;
+    match (&settlement.review, &settlement.reviewer) {
+        (Some(rank), Some(reviewer)) => {
+            if !matches!(
+                rank.as_str(),
+                TOURNAMENT_REVIEW_BLOCK | TOURNAMENT_REVIEW_CONCERN | TOURNAMENT_REVIEW_CLEAN
+            ) {
+                return Err(SessionError::Malformed(format!(
+                    "ledger candidate review {rank:?} is not block|concern|clean"
+                )));
+            }
+            validate_tournament_id(reviewer, "candidate reviewer")?;
+        }
+        (None, None) => {}
+        (Some(_), None) => {
+            return Err(SessionError::Malformed(
+                "ledger candidate review requires its reviewer identity".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(SessionError::Malformed(
+                "ledger candidate settlement carries a reviewer without a review verdict".into(),
+            ));
+        }
+    }
+    if settlement.reason.len() > MAX_TOURNAMENT_OUTCOME {
+        return Err(SessionError::Oversized(
+            "ledger candidate settlement reason exceeds MAX_TOURNAMENT_OUTCOME".into(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- board bounds checks
+
+fn check_board_id(value: u64, what: &str) -> Result<(), SessionError> {
+    if value == 0 {
+        return Err(SessionError::Malformed(format!(
+            "ledger board {what} must be non-zero"
+        )));
+    }
+    Ok(())
+}
+
+/// One board text field: non-empty, bounded, and free of control characters
+/// except the layout characters a coordination message legitimately carries
+/// (newline / carriage return / tab).
+fn check_board_text(field: &str, value: &str, max: usize) -> Result<(), SessionError> {
+    if value.is_empty() {
+        return Err(SessionError::Malformed(format!(
+            "ledger board {field} must be non-empty"
+        )));
+    }
+    if value.len() > max {
+        return Err(SessionError::Oversized(format!(
+            "ledger board {field} of {} bytes exceeds {max}",
+            value.len()
+        )));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(SessionError::Malformed(format!(
+            "ledger board {field} carries control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Board note fields may be empty (an `ack` needs no prose) but carry the
+/// same bound and control-character rule.
+fn check_board_note(field: &str, value: &str, max: usize) -> Result<(), SessionError> {
+    if value.len() > max {
+        return Err(SessionError::Oversized(format!(
+            "ledger board {field} of {} bytes exceeds {max}",
+            value.len()
+        )));
+    }
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(SessionError::Malformed(format!(
+            "ledger board {field} carries control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Shape bounds of one `board_post` row, shared by the appender and the
+/// strict decoder (a hostile raw row must fail loudly on read too).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_board_post(
+    board_id: u64,
+    post_id: u64,
+    author_child: Option<u64>,
+    author_session: u64,
+    subject: &str,
+    body: &str,
+    refs: &[String],
+    revision: u64,
+) -> Result<(), SessionError> {
+    check_board_id(board_id, "board_id")?;
+    check_board_id(post_id, "post_id")?;
+    check_board_id(author_session, "author_session")?;
+    if author_child == Some(0) {
+        return Err(SessionError::Malformed(
+            "ledger board author_child cannot be 0 (None means the root agent)".into(),
+        ));
+    }
+    check_board_text("subject", subject, MAX_BOARD_SUBJECT_BYTES)?;
+    check_board_text("body", body, MAX_BOARD_BODY_BYTES)?;
+    if refs.len() > MAX_BOARD_REFS {
+        return Err(SessionError::Oversized(format!(
+            "ledger board post of {} refs exceeds MAX_BOARD_REFS",
+            refs.len()
+        )));
+    }
+    for r in refs {
+        check_board_text("ref", r, MAX_BOARD_REF_BYTES)?;
+    }
+    if revision == 0 {
+        return Err(SessionError::Malformed(
+            "ledger board post revision must be >= 1".into(),
+        ));
+    }
+    if post_id != revision {
+        // The durable post identity IS the revision that created it:
+        // revisions are never reused (a reset consumes one), so the id is
+        // stable, unique per board and recoverable from the pinned stream.
+        return Err(SessionError::Malformed(format!(
+            "ledger board post id {post_id} does not equal its revision {revision}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_board_read(
+    board_id: u64,
+    child: u64,
+    post_id: u64,
+) -> Result<(), SessionError> {
+    check_board_id(board_id, "board_id")?;
+    check_board_id(child, "read child")?;
+    check_board_id(post_id, "post_id")?;
+    Ok(())
+}
+
+pub(crate) fn validate_board_receipt(
+    board_id: u64,
+    child: Option<u64>,
+    post_id: u64,
+    action: &str,
+    note: &str,
+) -> Result<(), SessionError> {
+    check_board_id(board_id, "board_id")?;
+    if child == Some(0) {
+        return Err(SessionError::Malformed(
+            "ledger board receipt child cannot be 0 (None means the root agent)".into(),
+        ));
+    }
+    check_board_id(post_id, "post_id")?;
+    if !matches!(
+        action,
+        BOARD_RECEIPT_ACK
+            | BOARD_RECEIPT_TASK_UPDATE
+            | BOARD_RECEIPT_BLOCKED
+            | BOARD_RECEIPT_QUESTION
+    ) {
+        return Err(SessionError::Malformed(format!(
+            "ledger board receipt action {action:?} is not ack|task_update|blocked|question"
+        )));
+    }
+    check_board_note("receipt note", note, MAX_BOARD_RECEIPT_NOTE_BYTES)?;
+    Ok(())
+}
+
+pub(crate) fn validate_board_reset(
+    board_id: u64,
+    previous_revision: u64,
+    new_revision: u64,
+) -> Result<(), SessionError> {
+    check_board_id(board_id, "board_id")?;
+    if previous_revision.checked_add(1) != Some(new_revision) {
+        return Err(SessionError::Malformed(format!(
+            "ledger board reset must bump the revision by exactly one \
+             ({previous_revision} -> {new_revision})"
         )));
     }
     Ok(())
@@ -724,6 +1398,23 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         | LedgerPayload::EditTxnProgress { .. }
         | LedgerPayload::EditTxnCommitted { .. }
         | LedgerPayload::EditTxnRolledBack { .. } => {}
+        // Tournament rows are the durable authority `Tournament::reopen`
+        // folds them into a reconstructed tournament it owns: they fold
+        // nowhere in the session head and are pinned in the stream (see
+        // `compact_typed_ledger`).
+        LedgerPayload::TournamentStarted { .. }
+        | LedgerPayload::CandidateSettled { .. }
+        | LedgerPayload::TournamentDecided { .. } => {}
+        // Board rows project only their newest revision into the head (the
+        // O(1) allocation/CAS cursor); the pinned rows themselves are the
+        // authority the board reader reconstructs the live surface from.
+        LedgerPayload::BoardPost { revision, .. } => {
+            head.board_revision = head.board_revision.max(*revision);
+        }
+        LedgerPayload::BoardReset { new_revision, .. } => {
+            head.board_revision = head.board_revision.max(*new_revision);
+        }
+        LedgerPayload::BoardRead { .. } | LedgerPayload::BoardReceipt { .. } => {}
     }
     Ok(())
 }
@@ -766,7 +1457,7 @@ fn head_from_json(raw: &serde_json::Value) -> Result<LedgerHead, SessionError> {
 // ---------------------------------------------------------------- handle API
 
 impl SessionHandle {
-    fn decode_row(
+    pub(crate) fn decode_row(
         &self,
         row: &faktor_store::LedgerEntryRow,
     ) -> Result<TypedLedgerEntry, SessionError> {
@@ -1236,6 +1927,93 @@ impl SessionHandle {
         })
     }
 
+    // ------------------------------------------ durable tournament entries
+
+    /// Record that one implementation tournament started: the goal every
+    /// candidate received, the byte-identical criteria and the N candidate
+    /// seeds. Shape bounds are enforced before any byte is journaled.
+    pub fn ledger_tournament_started(
+        &self,
+        tournament_id: &str,
+        run_family: &str,
+        goal: &str,
+        criteria: &[TournamentCriterionRow],
+        candidates: &[TournamentCandidateRow],
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_tournament_started(tournament_id, run_family, goal, criteria, candidates)?;
+        self.append_entry(LedgerPayload::TournamentStarted {
+            tournament_id: tournament_id.to_string(),
+            run_family: run_family.to_string(),
+            goal: goal.to_string(),
+            criteria: criteria.to_vec(),
+            candidates: candidates.to_vec(),
+        })
+    }
+
+    /// Record one settled candidate of a tournament (verification +
+    /// independent review + cost/wall evidence). Shape bounds only —
+    /// cross-row consistency (known tournament, one settlement per
+    /// candidate, derived-spec equality) is enforced by the orchestrator's
+    /// `Tournament::reopen`, never silently accepted.
+    pub fn ledger_candidate_settled(
+        &self,
+        tournament_id: &str,
+        settlement: &TournamentSettlementRow,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_tournament_id(tournament_id, "tournament id")?;
+        validate_tournament_settlement(settlement)?;
+        self.append_entry(LedgerPayload::CandidateSettled {
+            tournament_id: tournament_id.to_string(),
+            settlement: settlement.clone(),
+        })
+    }
+
+    /// Record the terminal row of one tournament: `outcome` is
+    /// `decided|aborted`, `winner` names the candidate proposed for the
+    /// explicit approved-merge path (None on abort). The bounded outcome
+    /// text is the audit rationale (why the winner won, why losers were
+    /// discarded).
+    pub fn ledger_tournament_decided(
+        &self,
+        tournament_id: &str,
+        winner: Option<&str>,
+        outcome: &str,
+        rationale: &str,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_tournament_id(tournament_id, "tournament id")?;
+        if let Some(w) = winner {
+            validate_tournament_text(w, "tournament winner")?;
+        }
+        if !matches!(
+            outcome,
+            TOURNAMENT_OUTCOME_DECIDED | TOURNAMENT_OUTCOME_ABORTED
+        ) {
+            return Err(SessionError::Malformed(format!(
+                "ledger tournament_decided outcome {outcome:?} is not decided|aborted"
+            ))
+            .into());
+        }
+        if outcome == TOURNAMENT_OUTCOME_DECIDED && winner.is_none() {
+            return Err(SessionError::Malformed(
+                "ledger tournament_decided with outcome decided requires a winner".into(),
+            )
+            .into());
+        }
+        if rationale.is_empty() || rationale.len() > MAX_TOURNAMENT_OUTCOME {
+            return Err(SessionError::Malformed(
+                "ledger tournament_decided rationale must be 1..=MAX_TOURNAMENT_OUTCOME bytes"
+                    .into(),
+            )
+            .into());
+        }
+        self.append_entry(LedgerPayload::TournamentDecided {
+            tournament_id: tournament_id.to_string(),
+            winner: winner.map(str::to_string),
+            outcome: outcome.to_string(),
+            rationale: rationale.to_string(),
+        })
+    }
+
     // ------------------------------------------ durable edit txn entries (P0-53)
 
     /// Record that a multi-file edit transaction was durably PREPARED
@@ -1574,6 +2352,17 @@ impl SessionHandle {
         Ok(Some(seq))
     }
 
+    /// Crate-internal typed append seam for additive durable kinds owned by
+    /// sibling modules (the coordination board): the SAME payload-bound and
+    /// tag tail as every typed accessor, so a sibling can never bypass the
+    /// ledger entry bound. The caller validates the payload's shape via the
+    /// shared `pub(crate)` validators before calling.
+    pub(crate) fn append_typed_entry(&self, payload: LedgerPayload) -> faktor_core::Result<i64> {
+        self.append_entry(payload)?.ok_or_else(|| {
+            SessionError::Internal("ledger typed append returned no seq".into()).into()
+        })
+    }
+
     // ------------------------------------------------------------ compaction
 
     /// Watermark compaction of the typed ledger. Reads and strictly decodes
@@ -1629,6 +2418,16 @@ impl SessionHandle {
         // durable corpus `faktor-learning` reopens from, not turn history —
         // watermark compaction must never silently delete a mined learning.
         let mut learning_seqs: Vec<i64> = Vec::new();
+        // Tournament rows are pinned the same way: the whole lifecycle
+        // (`TournamentStarted`/`CandidateSettled`/`TournamentDecided`) is
+        // the durable authority a crashed executor re-opens from, so
+        // compaction must never silently delete a tournament history.
+        let mut tournament_seqs: Vec<i64> = Vec::new();
+        // Board rows are pinned too: the append-only stream IS the live
+        // board surface (posts, reads, receipts, reset markers) — a
+        // compacted ledger must still reconstruct every visible post and
+        // every unread count exactly.
+        let mut board_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -1647,6 +2446,13 @@ impl SessionHandle {
                         .then_some(entry.seq),
                 ),
                 LedgerPayload::LearningRecord { .. } => learning_seqs.push(entry.seq),
+                LedgerPayload::TournamentStarted { .. }
+                | LedgerPayload::CandidateSettled { .. }
+                | LedgerPayload::TournamentDecided { .. } => tournament_seqs.push(entry.seq),
+                LedgerPayload::BoardPost { .. }
+                | LedgerPayload::BoardRead { .. }
+                | LedgerPayload::BoardReceipt { .. }
+                | LedgerPayload::BoardReset { .. } => board_seqs.push(entry.seq),
                 _ => {}
             }
         }
@@ -1682,6 +2488,8 @@ impl SessionHandle {
         }
         pinned.extend(open_opener_seqs);
         pinned.extend(learning_seqs);
+        pinned.extend(tournament_seqs);
+        pinned.extend(board_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;

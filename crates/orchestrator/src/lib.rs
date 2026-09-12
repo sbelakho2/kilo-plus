@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod caps;
 pub mod runtime;
+pub mod tournament;
 
 /// Per-WORK-ITEM write ownership (audits 7/8/21/22 + work-entry
 /// unification): the actual write authority of one planned item. Ownership
@@ -46,6 +47,17 @@ pub use runtime::graph::{derived_item_states, derived_root_state};
 /// "everything non-terminal is Running" conversions are forbidden: they
 /// erase Paused/Waiting/Blocked truth.
 pub use runtime::project_child_state;
+
+/// The multi-candidate implementation tournament engine (N = 2..=4) and its
+/// durable ledger reconstruction: the deterministic ordering, the
+/// verification-spec byte check, the independent-review gate and the loser
+/// cleanup all live in [`tournament`]; the TaskExecutor only wires it to
+/// the session ledger and the child registry.
+pub use tournament::{
+    assert_candidates_identical, canonical_criteria_text, derive_check_specs, Candidate,
+    CandidateSettlement, CandidateState, Criterion, ReviewRank, ReviewVerdict, Tournament,
+    TournamentDecision, TournamentError, TournamentState, MAX_CANDIDATES, MIN_CANDIDATES,
+};
 
 /// Maximum length of a steering note, in characters.
 pub const MAX_STEERING_NOTE_CHARS: usize = 500;

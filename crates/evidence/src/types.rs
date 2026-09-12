@@ -218,12 +218,17 @@ pub enum ProvenanceSource {
     Model,
     /// External semantic provider output (embeddings, rerankers).
     SemanticProvider,
+    /// Agent-coordination board content (another agent's post, receipt or
+    /// task update). Peer-agent DATA: like tool/model output it can never
+    /// instruct — a sibling's post is evidence to weigh, never policy.
+    AgentCoordination,
 }
 
 impl ProvenanceSource {
     /// True only for [`ProvenanceSource::UserPolicy`]. Tool output, repo
-    /// content, verification records, model output and provider output can
-    /// never acquire instruction authority by flowing through evidence.
+    /// content, verification records, model output, provider output and
+    /// agent-coordination board content can never acquire instruction
+    /// authority by flowing through evidence.
     pub const fn is_instruction_authority(&self) -> bool {
         matches!(self, ProvenanceSource::UserPolicy)
     }
@@ -678,6 +683,10 @@ mod tests {
             "\"semantic_provider\""
         );
         assert_eq!(
+            serde_json::to_string(&ProvenanceSource::AgentCoordination).unwrap(),
+            "\"agent_coordination\""
+        );
+        assert_eq!(
             serde_json::to_string(&Severity::Error).unwrap(),
             "\"error\""
         );
@@ -744,6 +753,7 @@ mod tests {
             ProvenanceSource::Verification,
             ProvenanceSource::Model,
             ProvenanceSource::SemanticProvider,
+            ProvenanceSource::AgentCoordination,
         ] {
             assert!(
                 !source.is_instruction_authority(),

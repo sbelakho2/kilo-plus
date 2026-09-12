@@ -42,8 +42,10 @@ pub use runtime::{
 };
 pub use stall::{StallTracker, DEFAULT_STALL_SILENCE_MS};
 pub use tool::{
-    FilePostcondition, RecoveryHint, ReplayDescriptor, Tool, ToolBundle, ToolBundleId, ToolOutcome,
-    ToolRegistry, ToolRunCtx, SEMANTIC_BUNDLE_MAX_SPECS, SEMANTIC_QUERY_TOOL,
+    board_post_tool, board_read_tool, BoardToolGateway, FilePostcondition, RecoveryHint,
+    ReplayDescriptor, Tool, ToolBundle, ToolBundleId, ToolOutcome, ToolRegistry, ToolRunCtx,
+    BOARD_POST_TOOL, BOARD_READ_TOOL, BOARD_TOOL_MAX_LIMIT, BOARD_TOOL_MAX_REFS,
+    BOARD_TOOL_TEXT_MAX, SEMANTIC_BUNDLE_MAX_SPECS, SEMANTIC_QUERY_TOOL,
 };
 pub use tool_json::{parse_tool_calls, repair_json, ToolCallMode};
 

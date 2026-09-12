@@ -1490,6 +1490,427 @@ impl TaskExecutor {
             })),
         }
     }
+
+    // ------------------------------------------------------ tournament entry
+
+    /// Start a multi-candidate implementation tournament (N = 2..=4): the
+    /// SAME goal and the SAME criteria are fanned out to N ISOLATED
+    /// candidate worktrees through the existing executor/assignment
+    /// machinery (an N-item plan of `Implementation` items under
+    /// `OwnershipSpec::IsolatedWorktree`), and the durable
+    /// `TournamentStarted` ledger anchor is written on the parent session.
+    /// The candidate child ids are the deterministic plan-order ids
+    /// (`child-0..child-{n-1}`) the assignment compile mints; the receipt
+    /// returns them plus the orchestrated run id whose registry rows carry
+    /// the candidate drives.
+    pub fn start_tournament(
+        self: &Arc<Self>,
+        parent: SessionId,
+        goal: &str,
+        criteria: &[String],
+        n: usize,
+        mutation_mode: Option<MutationMode>,
+    ) -> Result<TournamentReceipt, ExecError> {
+        self.start_tournament_with(
+            parent,
+            TournamentStartRequest {
+                goal: goal.to_string(),
+                criteria: criteria.to_vec(),
+                n,
+                mutation_mode,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`Self::start_tournament`] with the full request (model, budgets,
+    /// ceilings, files, isolated root, crash seam). The tournament engine
+    /// enforces the candidate band and the criterion bounds; the task
+    /// start validates the plan through the ONE task-start authority.
+    pub fn start_tournament_with(
+        self: &Arc<Self>,
+        parent: SessionId,
+        req: TournamentStartRequest,
+    ) -> Result<TournamentReceipt, ExecError> {
+        req.validate()?;
+        let criteria = build_tournament_criteria(&req.criteria)?;
+        let tournament_id = format!("tour-{:016x}", self.session.next_op_id().raw());
+        let mut tournament = crate::tournament::Tournament::new(
+            &tournament_id,
+            "pending-run",
+            &req.goal,
+            criteria,
+            req.n,
+        )
+        .map_err(tournament_exec_error)?;
+        // All candidates receive the byte-identical goal summary and the
+        // byte-identical criterion ids/specs: the assertion is a typed
+        // refusal BEFORE any child spawns (a drift never fans out).
+        let canonical = crate::tournament::canonical_criteria_text(&tournament.criteria);
+        let criterion_specs: Vec<String> =
+            tournament.criteria.iter().map(|c| c.spec.clone()).collect();
+        let work_items: Vec<WorkItem> = (0..req.n)
+            .map(|i| {
+                let mut item = WorkItem::new(
+                    format!("candidate-{i}"),
+                    canonical.clone(),
+                    WorkKind::Implementation,
+                );
+                item.acceptance_checks = criterion_specs.clone();
+                item
+            })
+            .collect();
+        crate::tournament::assert_candidates_identical(&work_items, &tournament.criteria)
+            .map_err(tournament_exec_error)?;
+        let run_request = TaskRunRequest {
+            goal: req.goal.clone(),
+            work_items,
+            model: req.model,
+            max_tokens: req.max_tokens,
+            max_cost_micro: req.max_cost_micro,
+            criteria: req.criteria.clone(),
+            mutation_mode: req.mutation_mode,
+            files: req.files,
+            parent_caps: req.parent_caps,
+            ceilings: req.ceilings,
+            isolated_root: req.isolated_root,
+            crash_seam: req.crash_seam,
+            ..Default::default()
+        };
+        let receipt = self.start_task(parent, run_request)?;
+        if receipt.mode != TaskRunMode::Orchestrated {
+            return Err(ExecError::Internal(
+                "a tournament start must dispatch to the orchestrated child path".into(),
+            ));
+        }
+        tournament.run_family = receipt.run_id.clone();
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        tournament
+            .persist_started(&handle)
+            .map_err(tournament_exec_error)?;
+        Ok(TournamentReceipt {
+            tournament_id,
+            run_id: receipt.run_id,
+            candidates: tournament
+                .candidates
+                .iter()
+                .map(|c| c.child_id.clone())
+                .collect(),
+        })
+    }
+
+    /// Read ONE tournament's durable state (reconstructed from the ledger)
+    /// with RUNNING candidates refreshed from the run's registry rows
+    /// (location, base revision, observed child state). Unknown ids are
+    /// typed `NotFound`.
+    pub fn tournament_state(
+        self: &Arc<Self>,
+        parent: SessionId,
+        tournament_id: &str,
+    ) -> Result<crate::tournament::Tournament, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let mut tournament = crate::tournament::Tournament::load(&handle, tournament_id)
+            .map_err(tournament_exec_error)?;
+        crate::tournament::refresh_candidates_from_registry(&self.session, parent, &mut tournament)
+            .map_err(tournament_exec_error)?;
+        Ok(tournament)
+    }
+
+    /// Every reconstructed tournament of one session, oldest first.
+    pub fn tournaments_of(
+        self: &Arc<Self>,
+        parent: SessionId,
+    ) -> Result<Vec<crate::tournament::Tournament>, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        crate::tournament::Tournament::reopen(&handle).map_err(tournament_exec_error)
+    }
+
+    /// Build the settlement skeleton of ONE candidate from its durable
+    /// state: the DERIVED check set of the tournament, the candidate's
+    /// worktree/base revision from the run's registry row, and its observed
+    /// terminal state. The caller attaches the verification record, the
+    /// independent review and the measured cost/wall axes. A candidate that
+    /// has not settled (`Running`) is a typed Conflict.
+    pub fn candidate_settlement(
+        self: &Arc<Self>,
+        parent: SessionId,
+        tournament_id: &str,
+        child_id: &str,
+        reason: &str,
+    ) -> Result<crate::tournament::CandidateSettlement, ExecError> {
+        let tournament = self.tournament_state(parent, tournament_id)?;
+        let candidate = tournament
+            .candidates
+            .iter()
+            .find(|c| c.child_id == child_id)
+            .ok_or_else(|| {
+                ExecError::NotFound(format!(
+                    "candidate {child_id} of tournament {tournament_id}"
+                ))
+            })?;
+        if matches!(
+            candidate.state,
+            crate::tournament::CandidateState::Running
+                | crate::tournament::CandidateState::Discarded
+        ) {
+            return Err(ExecError::Conflict(format!(
+                "candidate {child_id} of tournament {tournament_id} has not settled (state {:?})",
+                candidate.state
+            )));
+        }
+        Ok(crate::tournament::CandidateSettlement {
+            child_id: candidate.child_id.clone(),
+            worktree: candidate.worktree.clone(),
+            base_revision: candidate.base_revision.clone(),
+            state: candidate.state,
+            verification: None,
+            verification_pass: None,
+            checks: tournament.check_specs(),
+            review: None,
+            cost_micro: 0,
+            wall_ms: 0,
+            reason: reason.to_string(),
+        })
+    }
+
+    /// Settle ONE candidate: validate the settlement against the durable
+    /// tournament (byte-identical derived check set, independent reviewer),
+    /// then persist the `CandidateSettled` ledger row.
+    pub fn settle_tournament_candidate(
+        self: &Arc<Self>,
+        parent: SessionId,
+        tournament_id: &str,
+        settlement: crate::tournament::CandidateSettlement,
+    ) -> Result<crate::tournament::Tournament, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let mut tournament = crate::tournament::Tournament::load(&handle, tournament_id)
+            .map_err(tournament_exec_error)?;
+        tournament
+            .settle_candidate(settlement.clone())
+            .map_err(tournament_exec_error)?;
+        tournament
+            .persist_settlement(&handle, &settlement)
+            .map_err(tournament_exec_error)?;
+        Ok(tournament)
+    }
+
+    /// Decide ONE tournament with the documented deterministic ordering
+    /// (verification pass > review rank > cost > ordinal): persist the
+    /// `TournamentDecided` audit row FIRST, then discard every loser
+    /// (registry row settled terminal, isolated worktree directory + row
+    /// removed). The winner's worktree is only PROPOSED — integration stays
+    /// the explicit approved-merge path and is never called here.
+    pub fn decide_tournament(
+        self: &Arc<Self>,
+        parent: SessionId,
+        tournament_id: &str,
+    ) -> Result<crate::tournament::TournamentDecision, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let mut tournament = crate::tournament::Tournament::load(&handle, tournament_id)
+            .map_err(tournament_exec_error)?;
+        crate::tournament::refresh_candidates_from_registry(&self.session, parent, &mut tournament)
+            .map_err(tournament_exec_error)?;
+        let decision = tournament.decide().map_err(tournament_exec_error)?;
+        tournament
+            .persist_decision(
+                &handle,
+                faktor_session::TOURNAMENT_OUTCOME_DECIDED,
+                &decision.rationale,
+            )
+            .map_err(tournament_exec_error)?;
+        for (loser_id, _why) in &decision.discarded {
+            if let Some(candidate) = tournament
+                .candidates
+                .iter()
+                .find(|c| &c.child_id == loser_id)
+            {
+                crate::tournament::discard_candidate_worktree(
+                    &self.session,
+                    &handle,
+                    &tournament.run_family,
+                    candidate,
+                )
+                .map_err(tournament_exec_error)?;
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Abort ONE tournament: every candidate is discarded (registry rows
+    /// settled terminal; isolated worktrees removed), the terminal
+    /// `TournamentDecided { outcome: aborted }` audit row records WHY, and
+    /// no winner is proposed.
+    pub fn abort_tournament(
+        self: &Arc<Self>,
+        parent: SessionId,
+        tournament_id: &str,
+        reason: &str,
+    ) -> Result<crate::tournament::Tournament, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let mut tournament = crate::tournament::Tournament::load(&handle, tournament_id)
+            .map_err(tournament_exec_error)?;
+        crate::tournament::refresh_candidates_from_registry(&self.session, parent, &mut tournament)
+            .map_err(tournament_exec_error)?;
+        tournament.abort(reason).map_err(tournament_exec_error)?;
+        let rationale = if reason.trim().is_empty() {
+            "aborted by operator; every candidate discarded".to_string()
+        } else {
+            reason.to_string()
+        };
+        tournament
+            .persist_decision(
+                &handle,
+                faktor_session::TOURNAMENT_OUTCOME_ABORTED,
+                &rationale,
+            )
+            .map_err(tournament_exec_error)?;
+        for candidate in &tournament.candidates {
+            crate::tournament::discard_candidate_worktree(
+                &self.session,
+                &handle,
+                &tournament.run_family,
+                candidate,
+            )
+            .map_err(tournament_exec_error)?;
+        }
+        Ok(tournament)
+    }
+}
+
+/// One tournament start: goal + criteria + candidate count + the
+/// per-run knobs the one task-start authority understands. The strict
+/// server DTO maps onto this; the programmatic/test boundary may set the
+/// isolated root and crash seam directly.
+#[derive(Debug, Clone)]
+pub struct TournamentStartRequest {
+    pub goal: String,
+    pub criteria: Vec<String>,
+    pub n: usize,
+    pub mutation_mode: Option<MutationMode>,
+    pub model: Option<String>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micro: Option<u64>,
+    /// Files attached to every candidate's ordinary drive.
+    pub files: Vec<String>,
+    /// Capability ceiling of the parent. Default: read+write on the whole
+    /// workspace (candidate writes land ONLY in daemon-allocated isolated
+    /// worktrees; integration stays explicit).
+    pub parent_caps: CapabilitySet,
+    pub ceilings: super::Ceilings,
+    /// Root under which isolated candidate workspaces are created. Empty =
+    /// the executor's daemon-owned [`CandidateWorkspaceService`] allocates
+    /// one (the wire never carries a path).
+    pub isolated_root: PathBuf,
+    /// Deterministic crash seam (adversarial tests only).
+    pub crash_seam: Option<CrashSeam>,
+}
+
+impl Default for TournamentStartRequest {
+    fn default() -> Self {
+        Self {
+            goal: String::new(),
+            criteria: Vec::new(),
+            n: 0,
+            mutation_mode: None,
+            model: None,
+            max_tokens: None,
+            max_cost_micro: None,
+            files: Vec::new(),
+            parent_caps: child_caps(WorkKind::Implementation),
+            ceilings: super::Ceilings::default(),
+            isolated_root: PathBuf::new(),
+            crash_seam: None,
+        }
+    }
+}
+
+impl TournamentStartRequest {
+    /// Structural validation (the engine enforces the typed candidate band
+    /// and criterion bounds; this only checks the request shape before any
+    /// durable write).
+    pub fn validate(&self) -> Result<(), ExecError> {
+        if !(crate::tournament::MIN_CANDIDATES..=crate::tournament::MAX_CANDIDATES)
+            .contains(&self.n)
+        {
+            return Err(ExecError::InvalidPlan(format!(
+                "tournament candidate count {} is outside the supported band {}..={}",
+                self.n,
+                crate::tournament::MIN_CANDIDATES,
+                crate::tournament::MAX_CANDIDATES
+            )));
+        }
+        if self.goal.trim().is_empty() {
+            return Err(ExecError::InvalidPlan("tournament goal is empty".into()));
+        }
+        if self.criteria.is_empty() {
+            return Err(ExecError::InvalidPlan(
+                "a tournament needs at least one criterion".into(),
+            ));
+        }
+        self.ceilings.validate().map_err(ExecError::InvalidPlan)?;
+        Ok(())
+    }
+}
+
+/// The receipt of one accepted tournament start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TournamentReceipt {
+    pub tournament_id: String,
+    pub run_id: String,
+    /// The deterministic candidate child ids (`child-0..child-{n-1}`).
+    pub candidates: Vec<String>,
+}
+
+fn build_tournament_criteria(
+    specs: &[String],
+) -> Result<Vec<crate::tournament::Criterion>, ExecError> {
+    let mut criteria = Vec::with_capacity(specs.len());
+    for spec in specs {
+        criteria.push(crate::tournament::Criterion::derive(spec).map_err(tournament_exec_error)?);
+    }
+    Ok(criteria)
+}
+
+/// Map the tournament engine's typed refusals onto the executor error
+/// space (the HTTP layer maps these onto 400/404/409 exactly like every
+/// other executor refusal).
+fn tournament_exec_error(e: crate::tournament::TournamentError) -> ExecError {
+    use crate::tournament::TournamentError as T;
+    match &e {
+        T::NotFound(_) => ExecError::NotFound(e.to_string()),
+        T::Oversized(_) => ExecError::Oversized(e.to_string()),
+        T::NotOpen(_) | T::DuplicateSettlement(_) | T::NoEligibleWinner(_) => {
+            ExecError::Conflict(e.to_string())
+        }
+        T::Corrupt { .. } | T::Ledger(_) | T::Cleanup(_) => ExecError::Internal(e.to_string()),
+        T::InvalidCandidateCount { .. }
+        | T::InvalidCriteriaCount { .. }
+        | T::InvalidCriterion(_)
+        | T::DuplicateCriterion(_)
+        | T::InvalidId(_)
+        | T::UnknownCandidate(_)
+        | T::IllegalSettlementState(_)
+        | T::VerificationSpecDrift
+        | T::ReviewNotIndependent(_) => ExecError::InvalidPlan(e.to_string()),
+    }
 }
 
 /// The default effective capability grant of one work item's child:

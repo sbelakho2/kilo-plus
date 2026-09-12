@@ -365,6 +365,15 @@ fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
 /// `Implement` keeps the full registered set (including MCP tools) — today's
 /// wire behavior, now the explicit `implement` bundle.
 fn phase_allows(phase: RouterPhase, tool: &Tool) -> bool {
+    // Coordination tools are cross-cutting: a child may need to read or
+    // post in any tool-bearing phase (a question during exploration is the
+    // point). They are still hidden from the model-only phases.
+    if tool.name == BOARD_POST_TOOL || tool.name == BOARD_READ_TOOL {
+        return !matches!(
+            phase,
+            RouterPhase::Compact | RouterPhase::Title | RouterPhase::Embed
+        );
+    }
     match phase {
         RouterPhase::Implement => true,
         // Exploration / planning / summary: read-only surface. Summarize must
@@ -483,6 +492,206 @@ pub fn bound_args(args: &serde_json::Value, max_bytes: usize) -> Result<serde_js
     Ok(args.clone())
 }
 
+// --------------------------------------------------------------------------
+// Coordination-board tools (additive): the model-visible surface of the
+// durable parent/descendant agent board. The tools themselves stay
+// persistence-free (Commandment 1): the daemon injects a
+// [`BoardToolGateway`] over its durable board authority, the tool only
+// shapes bounded arguments and a bounded JSON result. Every bound and
+// scope check (family scoping, terminal-child refusal, reset CAS) lives in
+// the session layer behind the gateway.
+// --------------------------------------------------------------------------
+
+/// Model-visible name of the board post tool.
+pub const BOARD_POST_TOOL: &str = "board_post";
+/// Model-visible name of the board read tool.
+pub const BOARD_READ_TOOL: &str = "board_read";
+/// Hard bound on one board tool's result text handed to the model.
+pub const BOARD_TOOL_TEXT_MAX: usize = 64 * 1024;
+/// Max `limit` one `board_read` may request (mirrors the session board page).
+pub const BOARD_TOOL_MAX_LIMIT: usize = 100;
+/// Max refs one `board_post` may carry (mirrors the session board bound).
+pub const BOARD_TOOL_MAX_REFS: usize = 32;
+
+/// The durable coordination-board authority injected into the board tools.
+/// Implementations resolve the calling session and delegate to the session
+/// board API; errors stay typed ([`Error`]).
+pub trait BoardToolGateway: Send + Sync {
+    /// Post to the calling session's run-family board; returns the created
+    /// post as JSON.
+    fn board_post(
+        &self,
+        session: SessionId,
+        subject: &str,
+        body: &str,
+        refs: &[String],
+    ) -> Result<serde_json::Value, Error>;
+
+    /// Newest-first read of the calling session's board; returns the page
+    /// as JSON.
+    fn board_read(
+        &self,
+        session: SessionId,
+        since_revision: Option<u64>,
+        limit: usize,
+        exclude_self: bool,
+    ) -> Result<serde_json::Value, Error>;
+}
+
+/// Bounded JSON text of one board tool result (never an unbounded dump).
+fn board_tool_text(value: &serde_json::Value) -> Result<String, Error> {
+    let text = serde_json::to_string(value)
+        .map_err(|e| Error::internal(format!("board result serialization: {e}")))?;
+    if text.len() <= BOARD_TOOL_TEXT_MAX {
+        return Ok(text);
+    }
+    let mut cut = BOARD_TOOL_TEXT_MAX;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Ok(format!(
+        "{}\n[board output truncated at {BOARD_TOOL_TEXT_MAX} bytes]",
+        &text[..cut]
+    ))
+}
+
+/// The `board_post(subject, body, refs)` tool: bounded schema, typed
+/// argument errors, and the durable posting authority injected through the
+/// gateway (a terminal child is refused there, before any write).
+pub fn board_post_tool(gateway: Arc<dyn BoardToolGateway>) -> Tool {
+    Tool {
+        name: BOARD_POST_TOOL.into(),
+        description: "Post a bounded note to the run-family agent coordination board \
+                      (subject, body, optional evidence/path/artifact refs). The board is \
+                      append-only and scoped to this run family."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "subject": { "type": "string", "minLength": 1, "maxLength": 512 },
+                "body": { "type": "string", "minLength": 1, "maxLength": 16384 },
+                "refs": {
+                    "type": "array",
+                    "maxItems": BOARD_TOOL_MAX_REFS,
+                    "items": { "type": "string", "minLength": 1, "maxLength": 1024 }
+                }
+            },
+            "required": ["subject", "body"],
+            "additionalProperties": false
+        }),
+        // Coordination is in-process durable bookkeeping, not disk work;
+        // Cpu keeps it out of the disk-ownership sets.
+        resource_class: ResourceClass::Cpu,
+        capability: None,
+        // A post is a durable append: blind re-execution after a crash
+        // would duplicate it, so recovery never silently replays it.
+        recovery_hint: RecoveryHint::UnknownEffect,
+        path_args: vec![],
+        execute: Arc::new(move |ctx, args| {
+            let gateway = gateway.clone();
+            Box::pin(async move {
+                let subject = args
+                    .get("subject")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::malformed("board_post requires a string subject"))?;
+                let body = args
+                    .get("body")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::malformed("board_post requires a string body"))?;
+                let refs = match args.get("refs") {
+                    None | Some(serde_json::Value::Null) => Vec::new(),
+                    Some(serde_json::Value::Array(items)) => {
+                        if items.len() > BOARD_TOOL_MAX_REFS {
+                            return Err(Error::oversized(format!(
+                                "board_post carries more than {BOARD_TOOL_MAX_REFS} refs"
+                            )));
+                        }
+                        let mut refs = Vec::with_capacity(items.len());
+                        for item in items {
+                            let Some(s) = item.as_str() else {
+                                return Err(Error::malformed("board_post refs must be strings"));
+                            };
+                            refs.push(s.to_string());
+                        }
+                        refs
+                    }
+                    Some(_) => {
+                        return Err(Error::malformed("board_post refs must be an array"));
+                    }
+                };
+                let value = gateway.board_post(ctx.session_id, subject, body, &refs)?;
+                Ok(ToolOutcome {
+                    text: board_tool_text(&value)?,
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
+/// The `board_read(since_revision, limit, exclude_self)` tool: one bounded
+/// newest-first page of the calling session's run-family board.
+pub fn board_read_tool(gateway: Arc<dyn BoardToolGateway>) -> Tool {
+    Tool {
+        name: BOARD_READ_TOOL.into(),
+        description: "Read the newest-first coordination board of this run family \
+                      (bounded page). Posts hidden by a board reset are never returned."
+            .into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "since_revision": { "type": "integer", "minimum": 0 },
+                "limit": { "type": "integer", "minimum": 1, "maximum": BOARD_TOOL_MAX_LIMIT },
+                "exclude_self": { "type": "boolean" }
+            },
+            "additionalProperties": false
+        }),
+        resource_class: ResourceClass::DiskRead,
+        capability: None,
+        recovery_hint: RecoveryHint::Idempotent,
+        path_args: vec![],
+        execute: Arc::new(move |ctx, args| {
+            let gateway = gateway.clone();
+            Box::pin(async move {
+                let since_revision = match args.get("since_revision") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => Some(v.as_u64().ok_or_else(|| {
+                        Error::malformed("board_read since_revision must be a non-negative integer")
+                    })?),
+                };
+                let limit = match args.get("limit") {
+                    None | Some(serde_json::Value::Null) => 20,
+                    Some(v) => {
+                        let raw = v.as_u64().ok_or_else(|| {
+                            Error::malformed("board_read limit must be an integer")
+                        })?;
+                        if raw == 0 || raw > BOARD_TOOL_MAX_LIMIT as u64 {
+                            return Err(Error::oversized(format!(
+                                "board_read limit must be 1..={BOARD_TOOL_MAX_LIMIT}"
+                            )));
+                        }
+                        raw as usize
+                    }
+                };
+                let exclude_self = match args.get("exclude_self") {
+                    None | Some(serde_json::Value::Null) => false,
+                    Some(v) => v.as_bool().ok_or_else(|| {
+                        Error::malformed("board_read exclude_self must be a boolean")
+                    })?,
+                };
+                let value =
+                    gateway.board_read(ctx.session_id, since_revision, limit, exclude_self)?;
+                Ok(ToolOutcome {
+                    text: board_tool_text(&value)?,
+                    exit_code: Some(0),
+                    ..Default::default()
+                })
+            })
+        }),
+    }
+}
+
 /// Parse tool-call text extracted from a stream (StructuredFallback path).
 pub fn parse_tool_text(text: &str, mode: ToolCallMode) -> Vec<crate::tool_json::ParsedToolCall> {
     parse_tool_calls(text, mode)
@@ -491,6 +700,7 @@ pub fn parse_tool_text(text: &str, mode: ToolCallMode) -> Vec<crate::tool_json::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faktor_core::error::ErrorKind;
 
     #[test]
     fn registry_roundtrip_and_unknown() {
@@ -883,6 +1093,194 @@ mod tests {
         for phase in [RouterPhase::Compact, RouterPhase::Title, RouterPhase::Embed] {
             let bundle = registry.bundle_for_phase(phase, &caps_semantic());
             assert!(bundle.tools.is_empty(), "{phase:?} exposes no tools");
+        }
+    }
+
+    // ---- coordination-board tools --------------------------------------
+
+    type PostCall = (SessionId, String, String, Vec<String>);
+    type ReadCall = (SessionId, Option<u64>, usize, bool);
+
+    #[derive(Default)]
+    struct FakeBoard {
+        posts: std::sync::Mutex<Vec<PostCall>>,
+        reads: std::sync::Mutex<Vec<ReadCall>>,
+        fail: std::sync::Mutex<Option<Error>>,
+    }
+
+    impl FakeBoard {
+        fn post_calls(&self) -> Vec<PostCall> {
+            self.posts.lock().unwrap().clone()
+        }
+
+        fn read_calls(&self) -> Vec<ReadCall> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    impl BoardToolGateway for FakeBoard {
+        fn board_post(
+            &self,
+            session: SessionId,
+            subject: &str,
+            body: &str,
+            refs: &[String],
+        ) -> Result<serde_json::Value, Error> {
+            if let Some(e) = self.fail.lock().unwrap().take() {
+                return Err(e);
+            }
+            self.posts.lock().unwrap().push((
+                session,
+                subject.to_string(),
+                body.to_string(),
+                refs.to_vec(),
+            ));
+            Ok(serde_json::json!({"id": 1, "revision": 1}))
+        }
+
+        fn board_read(
+            &self,
+            session: SessionId,
+            since_revision: Option<u64>,
+            limit: usize,
+            exclude_self: bool,
+        ) -> Result<serde_json::Value, Error> {
+            if let Some(e) = self.fail.lock().unwrap().take() {
+                return Err(e);
+            }
+            self.reads
+                .lock()
+                .unwrap()
+                .push((session, since_revision, limit, exclude_self));
+            Ok(serde_json::json!({"posts": [], "has_more": false}))
+        }
+    }
+
+    fn board_ctx() -> ToolRunCtx {
+        ToolRunCtx {
+            session_id: SessionId::new(7),
+            op_id: OpId::new(8),
+            identity: WorkspaceIdentity::new(
+                faktor_core::WorkspaceId::new(1),
+                faktor_core::WorktreeId::new(2),
+                faktor_core::TaskId::new(3),
+            ),
+            cancellation: faktor_core::cancellation::CancellationToken::new(),
+            artifacts: Arc::new(crate::ToolArtifactSink::Null),
+            tool_call_mode: ToolCallMode::Native,
+            workspace: None,
+            edit: None,
+            snapshots: None,
+            sandbox: None,
+            supervisor: None,
+            deadline_ms: 0,
+            permission_granted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn board_tools_forward_bounded_args_and_typed_errors() {
+        let fake = Arc::new(FakeBoard::default());
+        let post = board_post_tool(fake.clone());
+        let read = board_read_tool(fake.clone());
+
+        let out = (post.execute)(
+            board_ctx(),
+            serde_json::json!({"subject": "s", "body": "b", "refs": ["a.txt", "ev/1"]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("\"revision\":1"));
+        let calls = fake.post_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, SessionId::new(7));
+        assert_eq!(calls[0].3, vec!["a.txt".to_string(), "ev/1".to_string()]);
+
+        let out = (read.execute)(
+            board_ctx(),
+            serde_json::json!({"since_revision": 4, "limit": 5, "exclude_self": true}),
+        )
+        .await
+        .unwrap();
+        assert!(out.text.contains("has_more"));
+        let calls = fake.read_calls();
+        assert_eq!(calls[0], (SessionId::new(7), Some(4), 5, true));
+
+        // Typed argument refusals: no gateway call, no write.
+        for (tool, args) in [
+            (post.clone(), serde_json::json!({"body": "b"})),
+            (
+                post.clone(),
+                serde_json::json!({"subject": "s", "body": "b", "refs": "not-array"}),
+            ),
+            (
+                post.clone(),
+                serde_json::json!({"subject": "s", "body": "b", "refs": [1]}),
+            ),
+            (read.clone(), serde_json::json!({"since_revision": "4"})),
+            (read.clone(), serde_json::json!({"limit": 0})),
+            (read.clone(), serde_json::json!({"limit": 101})),
+            (read.clone(), serde_json::json!({"exclude_self": "yes"})),
+        ] {
+            let err = (tool.execute)(board_ctx(), args).await.unwrap_err();
+            assert!(
+                matches!(err.kind, ErrorKind::Malformed | ErrorKind::Oversized),
+                "{err:?}"
+            );
+        }
+        assert!(fake.post_calls().len() == 1, "no rejected write ran");
+        assert!(fake.read_calls().len() == 1);
+
+        // A gateway failure stays typed (terminal-child refusal).
+        *fake.fail.lock().unwrap() = Some(Error::permission("terminal child"));
+        let err = (post.execute)(
+            board_ctx(),
+            serde_json::json!({"subject": "s", "body": "b"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Permission);
+    }
+
+    #[test]
+    fn board_tool_schemas_are_bounded_and_cross_phase_visible() {
+        let registry_tools = [
+            board_post_tool(Arc::new(FakeBoard::default())),
+            board_read_tool(Arc::new(FakeBoard::default())),
+        ];
+        // Schema bounds: the model-visible definitions carry the hard caps.
+        let post_schema = &registry_tools[0].input_schema;
+        assert_eq!(post_schema["properties"]["subject"]["maxLength"], 512);
+        assert_eq!(post_schema["properties"]["body"]["maxLength"], 16384);
+        assert_eq!(
+            post_schema["properties"]["refs"]["items"]["maxLength"],
+            1024
+        );
+        let read_schema = &registry_tools[1].input_schema;
+        assert_eq!(read_schema["properties"]["limit"]["maximum"], 100);
+
+        let mut registry = phase_registry(&["read_file", "write_file", "run_command"]);
+        for tool in registry_tools {
+            registry.register(tool);
+        }
+        for phase in [
+            RouterPhase::Implement,
+            RouterPhase::Explore,
+            RouterPhase::Plan,
+            RouterPhase::Summarize,
+            RouterPhase::Review,
+            RouterPhase::Debug,
+        ] {
+            let bundle = registry.bundle_for_phase(phase, &ModelCapabilities::default());
+            let names = bundle.tool_names();
+            assert!(names.contains(&"board_post"), "{phase:?}");
+            assert!(names.contains(&"board_read"), "{phase:?}");
+        }
+        for phase in [RouterPhase::Compact, RouterPhase::Title, RouterPhase::Embed] {
+            let bundle = registry.bundle_for_phase(phase, &ModelCapabilities::default());
+            let names = bundle.tool_names();
+            assert!(!names.contains(&"board_post"), "{phase:?}");
+            assert!(!names.contains(&"board_read"), "{phase:?}");
         }
     }
 }

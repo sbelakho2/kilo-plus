@@ -393,3 +393,135 @@ pub(crate) async fn native_task_run_cancel(
         Err(e) => exec_error_response(&e),
     }
 }
+
+/// The strict request DTO of ONE native tournament start
+/// (`POST /native/session/{id}/tournament`). `n` is the candidate count
+/// (the executor enforces the typed 2..=4 band), `criteria` the acceptance
+/// criteria fanned out byte-identically to every candidate, and
+/// `mutation_mode` overrides the daemon default for the candidate drives.
+/// Unknown fields, typos, a missing body field or an out-of-band `n` are
+/// plain 400s.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartTournamentRequest {
+    goal: String,
+    criteria: Vec<String>,
+    n: usize,
+    model: Option<String>,
+    max_tokens: Option<u64>,
+    max_cost_micro: Option<u64>,
+    mutation_mode: Option<faktor_orchestrator::runtime::task_executor::MutationMode>,
+    files: Option<Vec<String>>,
+}
+
+/// The capability ceiling of a tournament's parent: read + write on the
+/// whole workspace — candidate writes land ONLY in daemon-owned isolated
+/// worktrees, and integration stays the explicit approved-merge path. The
+/// per-tool permission requester still gates every actual call.
+pub(crate) fn native_tournament_parent_caps() -> faktor_orchestrator::caps::CapabilitySet {
+    faktor_orchestrator::runtime::task_executor::child_caps(
+        faktor_orchestrator::WorkKind::Implementation,
+    )
+}
+
+/// `POST /native/session/{id}/tournament` — start a multi-candidate
+/// implementation tournament (N = 2..=4) through the executor's ONE
+/// tournament entry: N isolated candidate worktrees + children under the
+/// existing executor/assignments machinery, all receiving the identical
+/// goal+criteria, plus the durable `TournamentStarted` ledger anchor. The
+/// response is the durable tournament state (unknown/hostile bodies are
+/// 400s; no automatic integration happens at any point).
+pub(crate) async fn native_tournament_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Result<Json<StartTournamentRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    // Strict native DTO: every body rejection (syntax AND data errors —
+    // unknown fields, typos, bad enum values, missing fields) is a plain
+    // 400, never a 422.
+    let Json(req) = match body {
+        Ok(b) => b,
+        Err(_) => {
+            return wire_status(ApiError {
+                code: "malformed",
+                message: "invalid native tournament start body".into(),
+                http_status: 400,
+                retryable: false,
+            })
+        }
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    let sid = handle.id();
+    // Same self-healing owner registration as the task-run start (older
+    // sessions may carry the standalone default worktree id); tournament
+    // candidate children need a real owner worktree.
+    if let Err(e) = state.deps.session.ensure_owner_worktree(sid) {
+        return api_err(&e);
+    }
+    let request = faktor_orchestrator::runtime::task_executor::TournamentStartRequest {
+        goal: req.goal,
+        criteria: req.criteria,
+        n: req.n,
+        mutation_mode: req.mutation_mode,
+        model: req.model,
+        max_tokens: req.max_tokens,
+        max_cost_micro: req.max_cost_micro,
+        files: req.files.unwrap_or_default(),
+        parent_caps: native_tournament_parent_caps(),
+        ..Default::default()
+    };
+    let receipt = match state.deps.tasks.start_tournament_with(sid, request) {
+        Ok(r) => r,
+        Err(e) => return exec_error_response(&e),
+    };
+    // Converge through the durable rows: the just-persisted anchor is read
+    // back so the response is the real tournament state, never a phantom.
+    match state
+        .deps
+        .tasks
+        .tournament_state(sid, &receipt.tournament_id)
+    {
+        Ok(tournament) => Json(serde_json::json!({
+            "tournament_id": receipt.tournament_id,
+            "run_id": receipt.run_id,
+            "candidates": receipt.candidates,
+            "state": tournament.state,
+            "winner": tournament.winner,
+        }))
+        .into_response(),
+        Err(e) => exec_error_response(&e),
+    }
+}
+
+/// `GET /native/session/{id}/tournament/{tournament_id}` — the durable
+/// state of ONE tournament reconstructed from its ledger rows
+/// (`TournamentStarted` + settlements + decision), with running candidates
+/// refreshed from the run's registry rows. Unknown ids are typed 404s.
+pub(crate) async fn native_tournament_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, tournament_id)): Path<(String, String)>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match state
+        .deps
+        .tasks
+        .tournament_state(handle.id(), &tournament_id)
+    {
+        Ok(tournament) => Json(tournament).into_response(),
+        Err(e) => exec_error_response(&e),
+    }
+}

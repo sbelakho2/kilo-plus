@@ -873,6 +873,11 @@ fn build_daemon_core(
     tools.register(tools::edit_file_tool());
     tools.register(tools::search_tool());
     tools.register(tools::run_command_tool());
+    // Coordination board: the tools are agent-crate definitions, the board
+    // authority is THIS daemon's session manager (run-family scoped).
+    let board_gateway = Arc::new(tools::SessionBoardGateway::new(session.clone()));
+    tools.register(faktor_agent::board_post_tool(board_gateway.clone()));
+    tools.register(faktor_agent::board_read_tool(board_gateway));
     for t in extra_tools {
         if tools.names().contains(&t.name) {
             tracing::warn!(

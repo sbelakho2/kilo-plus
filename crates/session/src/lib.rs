@@ -44,6 +44,7 @@
 
 pub mod actor;
 pub mod artifacts;
+pub mod board;
 pub mod budget;
 pub mod checkpoints;
 pub mod child;
@@ -64,6 +65,12 @@ pub mod task;
 pub mod verification_job;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
+pub use board::{
+    BoardAction, BoardId, BoardPage, BoardPost, BoardPostId, BoardRead, BoardReceipt,
+    BoardReceipts, BoardReset, ChildId, MAX_BOARD_BODY_BYTES, MAX_BOARD_FAMILY_DEPTH,
+    MAX_BOARD_PAGE, MAX_BOARD_RECEIPTS_PER_POST, MAX_BOARD_RECEIPT_NOTE_BYTES, MAX_BOARD_REFS,
+    MAX_BOARD_REF_BYTES, MAX_BOARD_SCAN_ROWS, MAX_BOARD_SUBJECT_BYTES,
+};
 pub use budget::{
     BudgetAuthority, BudgetError, BudgetView, DurableBudgetLedger, NoopBudget, ReservationId,
     MAX_ROUTE_DECISION_JSON_BYTES,
@@ -79,8 +86,16 @@ pub use ledger::{
     blocker_is_open, EditTxnLedgerFile, EditTxnOpenProgress, EditTxnOpenRow, LearningRecordRow,
     LedgerCheckRun, LedgerChild, LedgerCompactReport, LedgerDecision, LedgerEntryPage, LedgerHead,
     LedgerPayload, LedgerPlanStep, LedgerRouting, LedgerVerifySummary, LedgerView,
-    TypedLedgerEntry, ENTRY_LEARNING_RECORD, LEARNING_RECORD_EPISODE, LEARNING_RECORD_LEARNING,
+    TournamentCandidateRow, TournamentCheckSpec, TournamentCriterionRow, TournamentSettlementRow,
+    TypedLedgerEntry, ENTRY_BOARD_POST, ENTRY_BOARD_READ, ENTRY_BOARD_RECEIPT, ENTRY_BOARD_RESET,
+    ENTRY_CANDIDATE_SETTLED, ENTRY_LEARNING_RECORD, ENTRY_TOURNAMENT_DECIDED,
+    ENTRY_TOURNAMENT_STARTED, LEARNING_RECORD_EPISODE, LEARNING_RECORD_LEARNING,
     LEARNING_RECORD_REMOVED, MAX_EDIT_TXN_FILES, MAX_LEARNING_RECORD_PAYLOAD, MAX_LEDGER_PAGE,
+    MAX_TOURNAMENT_CANDIDATES, MAX_TOURNAMENT_CRITERIA, MAX_TOURNAMENT_ID, MAX_TOURNAMENT_OUTCOME,
+    MAX_TOURNAMENT_TEXT, MIN_TOURNAMENT_CANDIDATES, TOURNAMENT_OUTCOME_ABORTED,
+    TOURNAMENT_OUTCOME_DECIDED, TOURNAMENT_REVIEW_BLOCK, TOURNAMENT_REVIEW_CLEAN,
+    TOURNAMENT_REVIEW_CONCERN, TOURNAMENT_STATE_CANCELLED, TOURNAMENT_STATE_DONE,
+    TOURNAMENT_STATE_FAILED,
 };
 pub use manager::{
     SessionManager, ShadowRow, ShadowRowState, SHADOW_ID_MAX_BYTES, SHADOW_PATH_MAX_BYTES,

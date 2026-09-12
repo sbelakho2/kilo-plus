@@ -441,6 +441,18 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/session/{id}/task-runs/{run_id}/cancel",
             post(native_task_run_cancel),
         )
+        // Multi-candidate implementation tournaments (additive): start an
+        // N = 2..=4 candidate tournament through the executor's ONE entry
+        // (identical goal+criteria, isolated candidate worktrees) and read
+        // its durable state. Strict DTOs; hostile bodies are 400s.
+        .route(
+            "/native/session/{id}/tournament",
+            post(native_tournament_start),
+        )
+        .route(
+            "/native/session/{id}/tournament/{tournament_id}",
+            get(native_tournament_state),
+        )
         .route("/native/evidence/{id}", get(native_evidence_get))
         .route(
             "/native/evidence/{id}/retrieve",
@@ -10644,6 +10656,92 @@ mod tests {
             .send()
             .await
             .unwrap();
+        assert_eq!(resp.status(), 404);
+        // No provider call ever happened on the hostile attempts.
+        let h = manager.get_session(sid).unwrap().unwrap();
+        assert_eq!(h.message_count().unwrap(), 0, "hostile starts never drive");
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_tournament_start_hostile_dtos_are_typed_400s() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let sid = manager
+            .create_session(ws, "hostile-tournament", "fake", "m")
+            .unwrap()
+            .id();
+
+        // Unauthenticated is 401 before anything else.
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/tournament"))
+            .json(&serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        let oversized_goal = "x".repeat(513);
+        let hostile_bodies: Vec<serde_json::Value> = vec![
+            serde_json::json!({}),
+            serde_json::json!({"goal": "x", "criteria": ["c"]}),
+            serde_json::json!({"goal": "", "criteria": ["c"], "n": 2}),
+            serde_json::json!({"goal": "x", "criteria": [], "n": 2}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": 0}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": 1}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": 5}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": "two"}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2, "bogus": 1}),
+            serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2, "mutation_mode": "nonsense"}),
+            serde_json::json!({"goal": oversized_goal, "criteria": ["c"], "n": 2}),
+            serde_json::json!({"goal": "x", "criteria": ["c".repeat(600)], "n": 2}),
+        ];
+        for body in hostile_bodies {
+            let resp = client
+                .post(format!("{base}/native/session/{sid}/tournament"))
+                .bearer_auth(token.as_str())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                400,
+                "hostile tournament body must 400: {body}"
+            );
+        }
+        // Non-JSON bodies are plain 400s; unknown sessions are 404s; an
+        // unknown tournament id is a 404 (never a phantom tournament).
+        let resp = client
+            .post(format!("{base}/native/session/{sid}/tournament"))
+            .bearer_auth(token.as_str())
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!("{base}/native/session/999999/tournament"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"goal": "x", "criteria": ["c"], "n": 2}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tournament/does-not-exist"),
+        )
+        .await;
         assert_eq!(resp.status(), 404);
         // No provider call ever happened on the hostile attempts.
         let h = manager.get_session(sid).unwrap().unwrap();

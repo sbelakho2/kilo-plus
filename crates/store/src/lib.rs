@@ -2653,6 +2653,36 @@ impl Store {
         Ok(out)
     }
 
+    /// Read ledger entries of one session NEWEST-FIRST (descending seq),
+    /// strictly below `before_seq` (exclusive; `None` starts at the newest).
+    /// Additive read used by the coordination-board reader, whose pages are
+    /// newest-first by contract: the (session_id, seq) primary key serves
+    /// the ORDER BY seq DESC scan, so one page reads O(limit) rows — never
+    /// the whole stream. Same row shape and decode contract as
+    /// [`Store::ledger_entries`].
+    pub fn ledger_entries_desc(
+        &self,
+        session_id: SessionId,
+        before_seq: Option<i64>,
+        limit: u64,
+    ) -> StoreResult<Vec<LedgerEntryRow>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, entry_type, schema_ver, payload, created_ms FROM ledger_entry
+             WHERE session_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![
+            session_id.raw() as i64,
+            before_seq.unwrap_or(i64::MAX),
+            limit as i64
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(ledger_entry_map(row, session_id)?);
+        }
+        Ok(out)
+    }
+
     /// The newest ledger seq of the session (0 when the ledger is empty).
     pub fn ledger_max_seq(&self, session_id: SessionId) -> StoreResult<i64> {
         let conn = self.read()?;

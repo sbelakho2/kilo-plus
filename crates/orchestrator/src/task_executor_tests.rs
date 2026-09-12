@@ -3331,3 +3331,298 @@ async fn cancel_orchestrated_run_fans_cancel_to_live_children_only() {
         .expect_err("a fully settled run refuses a second cancel");
     assert!(matches!(err, ExecError::Conflict(_)), "{err}");
 }
+
+// ------------------------------------------------ multi-candidate tournaments
+
+/// The tournament flow end-to-end over REAL isolated candidate worktrees:
+/// N=2 implementation candidates start through the ONE task-start authority
+/// with the byte-identical goal+criteria, every candidate is driven to
+/// terminal, settlements rank deterministically (a FAILED verification can
+/// never win, even at zero cost), the loser's isolated worktree is removed
+/// (registry invariant stays clean), and a FRESH executor reconstructs the
+/// Decided tournament with the same winner from the durable ledger.
+#[tokio::test]
+async fn tournament_flow_ranks_deterministically_and_discards_losers_orphan_free() {
+    use crate::runtime::task_executor::TournamentStartRequest;
+    use crate::tournament::{CandidateState, ReviewRank, ReviewVerdict, TournamentState};
+    use faktor_core::id::VerificationRecordId;
+
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = (0..8)
+        .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
+        .collect();
+    let env = open_env(dir.path(), scripts);
+    let goal = "implement the same change two ways";
+    let criteria = vec!["cargo test".to_string()];
+
+    // Typed N refusals leave NOTHING durable behind.
+    let facts_before = env
+        .manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .memory_facts()
+        .unwrap()
+        .len();
+    for n in [1usize, 5] {
+        let err = env
+            .executor
+            .start_tournament(env.parent, goal, &criteria, n, None)
+            .expect_err("out-of-band N must refuse");
+        assert!(matches!(err, ExecError::InvalidPlan(_)), "{err}");
+    }
+    assert_eq!(
+        env.manager
+            .get_session(env.parent)
+            .unwrap()
+            .unwrap()
+            .memory_facts()
+            .unwrap()
+            .len(),
+        facts_before,
+        "refused tournament starts write nothing"
+    );
+
+    let receipt = env
+        .executor
+        .start_tournament_with(
+            env.parent,
+            TournamentStartRequest {
+                goal: goal.to_string(),
+                criteria: criteria.clone(),
+                n: 2,
+                isolated_root: env.isolated_root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("tournament start");
+    assert_eq!(
+        receipt.candidates,
+        vec!["child-0".to_string(), "child-1".to_string()]
+    );
+    // Every candidate really spawned as an ISOLATED child and settled.
+    wait_until(
+        || {
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &receipt.run_id)
+                .map(|rows| rows.len() == 2 && rows.iter().all(|c| c.state.is_terminal()))
+                .unwrap_or(false)
+        },
+        60,
+    )
+    .await;
+    let rows = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &receipt.run_id)
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let parent_ws = env
+        .manager
+        .get_session(env.parent)
+        .unwrap()
+        .unwrap()
+        .row()
+        .unwrap()
+        .workspace_id;
+    for c in &rows {
+        assert_eq!(c.state, crate::ChildState::Done);
+        assert_eq!(c.ownership, ChildOwnership::IsolatedWorktree);
+        assert_ne!(c.workspace_id, parent_ws.raw(), "candidate is isolated");
+    }
+
+    // The durable tournament reconstructs the identical candidate band +
+    // criteria from its ledger anchor.
+    let state = env
+        .executor
+        .tournament_state(env.parent, &receipt.tournament_id)
+        .unwrap();
+    assert_eq!(state.state, TournamentState::Open);
+    assert_eq!(state.candidates.len(), 2);
+    assert_eq!(state.criteria.len(), 1);
+    assert_eq!(state.criteria[0].spec, "cargo test");
+    assert!(state.candidates.iter().all(|c| !c.worktree.is_empty()));
+    let winner_wt = state.candidates[1].worktree.clone();
+    let loser_wt = state.candidates[0].worktree.clone();
+    assert!(std::path::Path::new(&winner_wt).is_dir());
+    assert!(std::path::Path::new(&loser_wt).is_dir());
+
+    // The losing candidate is FREE but failed verification; the winning
+    // candidate passed and is expensive. The failed one can never win.
+    let mut loser = env
+        .executor
+        .candidate_settlement(
+            env.parent,
+            &receipt.tournament_id,
+            "child-0",
+            "verification failed",
+        )
+        .unwrap();
+    assert_eq!(loser.state, CandidateState::Done);
+    loser.verification = Some(VerificationRecordId::new(1));
+    loser.verification_pass = Some(false);
+    loser.review = Some(ReviewVerdict {
+        rank: ReviewRank::Clean,
+        reviewer: "review-0".into(),
+    });
+    loser.cost_micro = 0;
+    env.executor
+        .settle_tournament_candidate(env.parent, &receipt.tournament_id, loser)
+        .unwrap();
+
+    let mut winner = env
+        .executor
+        .candidate_settlement(
+            env.parent,
+            &receipt.tournament_id,
+            "child-1",
+            "verified complete",
+        )
+        .unwrap();
+    winner.verification = Some(VerificationRecordId::new(2));
+    winner.verification_pass = Some(true);
+    winner.review = Some(ReviewVerdict {
+        rank: ReviewRank::Clean,
+        reviewer: "review-0".into(),
+    });
+    winner.cost_micro = 1_000_000;
+    env.executor
+        .settle_tournament_candidate(env.parent, &receipt.tournament_id, winner)
+        .unwrap();
+
+    let decision = env
+        .executor
+        .decide_tournament(env.parent, &receipt.tournament_id)
+        .expect("deterministic decision");
+    assert_eq!(decision.winner.child_id, "child-1");
+    // No automatic integration: the winner's worktree is only PROPOSED and
+    // still holds the candidate content (nothing was merged anywhere).
+    assert!(std::path::Path::new(&winner_wt).is_dir());
+    // The loser's worktree is gone and the zero-orphan registry invariant
+    // holds after cleanup.
+    assert!(
+        !std::path::Path::new(&loser_wt).exists(),
+        "loser worktree removed"
+    );
+    assert!(OrchestratorRuntime::registry_violations(
+        env.manager.clone(),
+        env.parent,
+        &receipt.run_id
+    )
+    .is_empty());
+    assert!(
+        OrchestratorRuntime::orphan_children_scan(env.manager.clone())
+            .issues
+            .is_empty()
+    );
+
+    // A FRESH executor over the same durable store reconstructs the very
+    // same Decided tournament (winner + candidate evidence).
+    let executor2 = TaskExecutor::new(
+        &env.orchestrator,
+        env.manager.clone(),
+        env.agent.clone(),
+        None,
+    );
+    let reopened = executor2
+        .tournament_state(env.parent, &receipt.tournament_id)
+        .unwrap();
+    assert_eq!(reopened.state, TournamentState::Decided);
+    assert_eq!(reopened.winner.as_deref(), Some("child-1"));
+    assert_eq!(
+        reopened
+            .candidates
+            .iter()
+            .find(|c| c.child_id == "child-1")
+            .unwrap()
+            .verification_pass,
+        Some(true)
+    );
+    assert_eq!(
+        reopened
+            .candidates
+            .iter()
+            .find(|c| c.child_id == "child-0")
+            .unwrap()
+            .state,
+        CandidateState::Discarded
+    );
+}
+
+/// The abort path discards EVERY candidate: the terminal ledger row is
+/// `Aborted` with no winner, every registry row settles terminal, every
+/// isolated worktree directory + row is removed, and a reopen reconstructs
+/// the same Aborted tournament.
+#[tokio::test]
+async fn tournament_abort_discards_all_candidates_and_is_durable() {
+    use crate::runtime::task_executor::TournamentStartRequest;
+    use crate::tournament::{CandidateState, TournamentState};
+
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let scripts: Vec<Vec<ScriptedResponse>> = (0..4)
+        .map(|_| vec![ScriptedResponse::Text("done".into()), ScriptedResponse::End])
+        .collect();
+    let env = open_env(dir.path(), scripts);
+    let receipt = env
+        .executor
+        .start_tournament_with(
+            env.parent,
+            TournamentStartRequest {
+                goal: "abort me".to_string(),
+                criteria: vec!["cargo test".to_string()],
+                n: 2,
+                isolated_root: env.isolated_root.clone(),
+                ..Default::default()
+            },
+        )
+        .expect("tournament start");
+    wait_until(
+        || {
+            OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, &receipt.run_id)
+                .map(|rows| rows.len() == 2 && rows.iter().all(|c| c.state.is_terminal()))
+                .unwrap_or(false)
+        },
+        60,
+    )
+    .await;
+    let state = env
+        .executor
+        .tournament_state(env.parent, &receipt.tournament_id)
+        .unwrap();
+    let worktrees: Vec<String> = state
+        .candidates
+        .iter()
+        .map(|c| c.worktree.clone())
+        .collect();
+    assert!(worktrees.iter().all(|w| std::path::Path::new(w).is_dir()));
+
+    let aborted = env
+        .executor
+        .abort_tournament(env.parent, &receipt.tournament_id, "operator aborted")
+        .expect("abort");
+    assert_eq!(aborted.state, TournamentState::Aborted);
+    assert!(aborted.winner.is_none());
+    assert!(aborted
+        .candidates
+        .iter()
+        .all(|c| c.state == CandidateState::Discarded));
+    for w in &worktrees {
+        assert!(!std::path::Path::new(w).exists(), "worktree {w} removed");
+    }
+    assert!(OrchestratorRuntime::registry_violations(
+        env.manager.clone(),
+        env.parent,
+        &receipt.run_id
+    )
+    .is_empty());
+    // Reopen: the same Aborted tournament, no winner ever proposed.
+    let executor2 = TaskExecutor::new(
+        &env.orchestrator,
+        env.manager.clone(),
+        env.agent.clone(),
+        None,
+    );
+    let reopened = executor2
+        .tournament_state(env.parent, &receipt.tournament_id)
+        .unwrap();
+    assert_eq!(reopened.state, TournamentState::Aborted);
+    assert!(reopened.winner.is_none());
+}

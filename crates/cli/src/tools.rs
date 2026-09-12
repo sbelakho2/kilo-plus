@@ -14,10 +14,13 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use faktor_agent::{FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRunCtx};
+use faktor_agent::{
+    BoardToolGateway, FilePostcondition, RecoveryHint, Tool, ToolOutcome, ToolRunCtx,
+};
 use faktor_core::capability::{Capability, PermissionDecision};
 use faktor_core::error::{Error, ErrorKind};
 use faktor_core::hash::FileHash;
+use faktor_core::id::SessionId;
 use faktor_core::op::EffectStatus;
 use faktor_core::resource::ResourceClass;
 use faktor_edit::{EditOp, EditRequest, RepairMode};
@@ -1066,6 +1069,61 @@ pub fn run_command_tool() -> Tool {
                 })
             })
         }),
+    }
+}
+
+// --------------------------------------------------------------------------
+// Coordination-board tool gateway (additive). The board tools live in
+// `faktor-agent` (bounded schemas + typed arg errors); the DURABLE board
+// authority lives in `faktor-session`, so the daemon injects this thin
+// gateway: it resolves the calling session and delegates to the session
+// board API. Every bound, family-scope check, terminal-child refusal and
+// reset-CAS conflict stays in the session layer; the gateway only maps the
+// typed result to JSON for the tool text.
+// --------------------------------------------------------------------------
+
+/// Injected board authority for the `board_post`/`board_read` tools.
+pub struct SessionBoardGateway {
+    sessions: Arc<faktor_session::SessionManager>,
+}
+
+impl SessionBoardGateway {
+    pub fn new(sessions: Arc<faktor_session::SessionManager>) -> Self {
+        Self { sessions }
+    }
+
+    fn handle(&self, session: SessionId) -> Result<faktor_session::SessionHandle, Error> {
+        self.sessions
+            .get_session(session)?
+            .ok_or_else(|| Error::not_found(format!("board session {session}")))
+    }
+}
+
+impl BoardToolGateway for SessionBoardGateway {
+    fn board_post(
+        &self,
+        session: SessionId,
+        subject: &str,
+        body: &str,
+        refs: &[String],
+    ) -> Result<serde_json::Value, Error> {
+        let post = self.handle(session)?.board_post(subject, body, refs)?;
+        serde_json::to_value(post)
+            .map_err(|e| Error::internal(format!("board post serialization: {e}")))
+    }
+
+    fn board_read(
+        &self,
+        session: SessionId,
+        since_revision: Option<u64>,
+        limit: usize,
+        exclude_self: bool,
+    ) -> Result<serde_json::Value, Error> {
+        let page =
+            self.handle(session)?
+                .board_read_posts(None, since_revision, limit, exclude_self)?;
+        serde_json::to_value(page)
+            .map_err(|e| Error::internal(format!("board page serialization: {e}")))
     }
 }
 
