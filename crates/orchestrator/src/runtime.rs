@@ -3064,7 +3064,11 @@ pub fn validate_attachment_files(files: &[String]) -> Result<(), ExecError> {
             && f.as_bytes()
                 .get(2)
                 .is_some_and(|b| *b == b'/' || *b == b'\\');
-        if path.is_absolute() || drive_prefixed {
+        // `Path::is_absolute` is false on Windows for a leading `/` (no
+        // prefix), so a Unix-absolute hostile path slipped through there;
+        // any leading separator is root-relative and rejected everywhere.
+        let root_relative = f.starts_with('/') || f.starts_with('\\');
+        if path.is_absolute() || drive_prefixed || root_relative {
             return Err(ExecError::Malformed(format!(
                 "attached file path {f:?} is absolute; attached files are workspace-relative"
             )));

@@ -735,7 +735,6 @@ pub fn validate_pr_command(template: &str) -> Result<(), String> {
                 | '>'
                 | '`'
                 | '$'
-                | '\\'
                 | '"'
                 | '\''
                 | '*'
