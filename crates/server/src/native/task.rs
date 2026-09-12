@@ -167,6 +167,12 @@ pub(crate) struct StartTaskRunRequest {
     max_cost_micro: Option<u64>,
     mutation_mode: Option<faktor_orchestrator::runtime::task_executor::MutationMode>,
     routing_mode: Option<faktor_core::model::RoutingMode>,
+    /// Attached file paths (the same ordinary-prompt vocabulary the SDK
+    /// `PromptRequest.files` carries): additive so IDE clients can attach
+    /// files to an explicit task start. Absent/empty leaves the run
+    /// attachment-free; the daemon never reads the filesystem at THIS
+    /// boundary (the drive's own permission requester gates every tool).
+    files: Option<Vec<String>>,
 }
 
 /// One wire work item of [`StartTaskRunRequest`]. `kind` speaks the
@@ -227,7 +233,7 @@ pub(crate) async fn native_task_run_start(
     // Strict native DTO: every body rejection (syntax AND data errors —
     // unknown fields, typos, bad enum values, missing fields) is a plain
     // 400, never a 422.
-    let Json(req) = match body {
+    let Json(mut req) = match body {
         Ok(b) => b,
         Err(_) => {
             return wire_status(ApiError {
@@ -273,6 +279,7 @@ pub(crate) async fn native_task_run_start(
         return api_err(&e);
     }
     let prompts = PromptExecutionService::from_state(&state);
+    let files = req.files.take().unwrap_or_default();
     let receipt = match req.work_items {
         Some(items) => {
             let mut work_items: Vec<faktor_orchestrator::WorkItem> = items
@@ -304,6 +311,7 @@ pub(crate) async fn native_task_run_start(
                 max_cost_micro: req.max_cost_micro,
                 criteria: req.criteria.unwrap_or_default(),
                 mutation_mode: req.mutation_mode,
+                files,
                 parent_caps: native_run_parent_caps(),
                 ..Default::default()
             };
@@ -317,10 +325,10 @@ pub(crate) async fn native_task_run_start(
             // through the SAME PromptExecutionService (shadow by default).
             let request = PromptRequest {
                 prompt: req.goal,
+                files,
                 model: req.model,
                 criteria: req.criteria.unwrap_or_default(),
                 mutation_mode: req.mutation_mode,
-                ..Default::default()
             };
             let prompt_receipt = match prompts.prompt(sid, request).await {
                 Ok(r) => r,

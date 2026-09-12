@@ -19,8 +19,12 @@ package dev.faktor.frontend
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeAgent
+import dev.faktor.shared.NativeMessage
+import dev.faktor.shared.NativeModelInfo
+import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativeTaskRun
+import dev.faktor.shared.NativeTournament
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.FlowLayout
@@ -36,6 +40,7 @@ import javax.swing.JLabel
 import javax.swing.JOptionPane
 import javax.swing.JPanel
 import javax.swing.JScrollPane
+import javax.swing.JSplitPane
 import javax.swing.JTabbedPane
 import javax.swing.JTextArea
 import javax.swing.JTextField
@@ -45,6 +50,7 @@ import javax.swing.WindowConstants
 private const val MAX_TRANSCRIPT_LINES = 4000
 private const val MAX_TRANSCRIPT_CHARS = 400_000
 private const val MAX_EVIDENCE_PREVIEW_CHARS = 4000
+private const val MAX_CHILD_USAGE_FETCHES = 12
 
 class FaktorChatPanel(private val service: FaktorFrontendService) :
     JPanel(BorderLayout()), FaktorFrontendService.Listener {
@@ -99,6 +105,8 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private val criteriaField = JTextField(24)
 
+    private val attachments = AttachmentsPanel()
+
     private val startTaskButton = JButton("Start task")
 
     private val runsModel = DefaultComboBoxModel<NativeTaskRun>()
@@ -115,13 +123,25 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     private val agentsArea = JTextArea(5, 32)
 
-    private val evidenceIdField = JTextField(8)
+    private val treePanel = TaskTreePanel()
 
-    private val retrieveEvidenceButton = JButton("Retrieve")
+    private val blockersPanel = BlockersPanel()
 
-    private val evidenceArea = JTextArea(8, 32)
+    private val tournamentPanel = TournamentPanel()
+
+    private val navigator = EvidenceNavigatorPanel()
+
+    private val tabs = JTabbedPane()
 
     private var renderedSeq: Long = 0
+
+    private var currentTree: TaskTreeModel? = null
+
+    private var trackedTournamentId: String? = null
+
+    private var pendingPermissions: List<NativePermissionEntry> = emptyList()
+
+    private val transcriptOffsets = LinkedHashMap<Long, Pair<Int, Int>>()
 
     init {
         service.setListener(this)
@@ -161,11 +181,14 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         inputRow.add(buttons, BorderLayout.SOUTH)
         chat.add(inputRow, BorderLayout.SOUTH)
 
-        val tabs = JTabbedPane()
+        val tabs = this.tabs
+        tabs.removeAll()
         tabs.addTab("Status", buildStatusTab())
         tabs.addTab("Task", buildTaskTab())
+        tabs.addTab("Task Tree", buildTaskTreeTab())
         tabs.addTab("Agents", buildAgentsTab())
-        tabs.addTab("Evidence", buildEvidenceTab())
+        tabs.addTab("Tournament", tournamentPanel)
+        tabs.addTab("Evidence", navigator)
         tabs.preferredSize = Dimension(430, 600)
 
         add(toolbar, BorderLayout.NORTH)
@@ -196,6 +219,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         form.add(goalField)
         form.add(JLabel("criteria (comma separated, optional)"))
         form.add(criteriaField)
+        form.add(titledSection("attachments (submitted as files)", attachments))
         val startRow = JPanel(FlowLayout(FlowLayout.LEFT))
         startRow.add(startTaskButton)
         form.add(startRow)
@@ -207,6 +231,15 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         taskArea.isEditable = false
         form.add(JScrollPane(taskArea))
         panel.add(form, BorderLayout.NORTH)
+        return panel
+    }
+
+    private fun buildTaskTreeTab(): JPanel {
+        val split = JSplitPane(JSplitPane.VERTICAL_SPLIT, treePanel, JScrollPane(blockersPanel))
+        split.resizeWeight = 0.62
+        split.isContinuousLayout = true
+        val panel = JPanel(BorderLayout())
+        panel.add(split, BorderLayout.CENTER)
         return panel
     }
 
@@ -249,19 +282,6 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         agentsArea.isEditable = false
         form.add(JScrollPane(agentsArea))
         panel.add(form, BorderLayout.NORTH)
-        return panel
-    }
-
-    private fun buildEvidenceTab(): JPanel {
-        val panel = JPanel(GridLayout(0, 1, 4, 4))
-        panel.border = BorderFactory.createEmptyBorder(8, 8, 8, 8)
-        val row = JPanel(FlowLayout(FlowLayout.LEFT))
-        row.add(JLabel("evidence id"))
-        row.add(evidenceIdField)
-        row.add(retrieveEvidenceButton)
-        panel.add(row)
-        evidenceArea.isEditable = false
-        panel.add(JScrollPane(evidenceArea))
         return panel
     }
 
@@ -324,12 +344,19 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
             val criteria = criteriaField.text.split(',')
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
+            val files = attachments.files()
             runAsync("start task") {
                 val started = service.startTaskRun(
                     goal,
-                    if (criteria.isEmpty()) null else criteria
+                    if (criteria.isEmpty()) null else criteria,
+                    files = if (files.isEmpty()) null else files
                 )
-                onEdt { appendSystem("task run ${started.runId} started (${started.state})") }
+                onEdt {
+                    appendSystem(
+                        "task run ${started.runId} started (${started.state})" +
+                            if (files.isEmpty()) "" else " with ${files.size} attachment(s)"
+                    )
+                }
                 refreshTaskRunsBlocking()
             }
         }
@@ -345,28 +372,90 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 refreshTaskRunsBlocking()
             }
         }
-        retrieveEvidenceButton.addActionListener {
-            val id = evidenceIdField.text.trim().toLongOrNull()
-            if (id == null) {
-                appendSystem("evidence id must be an integer")
-                return@addActionListener
-            }
-            runAsync("evidence $id") {
-                val meta = service.evidence(id)
-                val retrieval = service.retrieveEvidence(
-                    id, dev.faktor.shared.NativeRequests.evidenceSelectorAll()
-                )
-                val preview = String(retrieval.bytes, Charsets.UTF_8)
-                    .take(MAX_EVIDENCE_PREVIEW_CHARS)
-                onEdt {
-                    evidenceArea.text =
-                        "id=${meta.id} retained=${meta.backingRetained} " +
-                            "backingLen=${meta.backingLen ?: 0} bytes=${retrieval.byteLen} " +
-                            "truncated=${retrieval.truncatedByPolicy}\n" + preview
-                    appendSystem("evidence ${meta.id}: ${retrieval.byteLen} bytes retrieved")
+        treePanel.setListener(object : TaskTreePanel.Listener {
+            override fun onEvidenceSelected(ref: EvidenceRef) {
+                onEdt { tabs.selectedComponent = navigator }
+                runAsync("evidence ${ref.id}") {
+                    navigator.selectEvidence(ref)
+                    if (ref.id != null) retrieveEvidenceIntoNavigator(ref.id, navigator.selectorJson())
                 }
             }
-        }
+
+            override fun onChildSelected(child: ChildNode) {
+                loadChildTranscript(child)
+            }
+        })
+        blockersPanel.setListener(object : BlockersPanel.Listener {
+            override fun onBlockerAction(row: BlockerRow, action: BlockerAction) {
+                runAsync("blocker ${action.label} ${row.childId}") {
+                    when (action) {
+                        BlockerAction.RESUME -> service.resumeAgent(row.childId)
+                        BlockerAction.RETRY -> service.retryAgent(row.childId)
+                        BlockerAction.CANCEL -> service.cancelAgent(row.childId)
+                        BlockerAction.PERMISSION_ALLOW,
+                        BlockerAction.PERMISSION_DENY -> {
+                            val decision = if (action == BlockerAction.PERMISSION_ALLOW) "allow" else "deny"
+                            val permission = permissionForChild(row.childId)
+                            if (permission == null) {
+                                onEdt {
+                                    appendSystem(
+                                        "no pending permission request for ${row.childId}; " +
+                                            "resume the child or reply from the pending permissions list"
+                                    )
+                                }
+                            } else {
+                                service.replyPermission(permission.id, decision)
+                                onEdt { appendSystem("permission ${permission.id}: $decision") }
+                            }
+                        }
+                    }
+                    refreshTaskTreeBlocking()
+                    refreshAgentsBlocking()
+                }
+            }
+
+            override fun onPermissionReply(permission: NativePermissionEntry, decision: String) {
+                runAsync("permission ${permission.id} $decision") {
+                    service.replyPermission(permission.id, decision)
+                    onEdt { appendSystem("permission ${permission.id}: $decision") }
+                    refreshTaskTreeBlocking()
+                }
+            }
+        })
+        tournamentPanel.setListener(object : TournamentPanel.Listener {
+            override fun onLoadTournament(tournamentId: String) {
+                runAsync("load tournament") {
+                    val tournament = service.tournamentState(tournamentId)
+                    trackedTournamentId = tournament.id
+                    onEdt { applyTournament(tournament) }
+                }
+            }
+
+            override fun onStartTournament(goal: String, criteria: List<String>, n: Int) {
+                runAsync("start tournament") {
+                    val started = service.startTournament(goal, criteria, n)
+                    trackedTournamentId = started.tournamentId
+                    onEdt {
+                        appendSystem(
+                            "tournament ${started.tournamentId} started (${started.state}) " +
+                                "candidates=${started.candidates.size}"
+                        )
+                    }
+                    refreshTaskTreeBlocking()
+                }
+            }
+        })
+        navigator.setListener(object : EvidenceNavigatorPanel.Listener {
+            override fun onRetrieve(evidenceId: Long, selectorJson: String) {
+                runAsync("evidence $evidenceId") {
+                    retrieveEvidenceIntoNavigator(evidenceId, selectorJson)
+                }
+            }
+
+            override fun onMessageSelected(seq: Long) {
+                onEdt { jumpToTranscript(seq) }
+            }
+        })
     }
 
     /** Starts the daemon off the EDT (public so the app entry point can call it). */
@@ -418,6 +507,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         refreshAgentsBlocking()
         refreshUsageBlocking()
         refreshVerificationBlocking()
+        refreshTaskTreeBlocking()
     }
 
     private fun refreshStatusBlocking() {
@@ -428,10 +518,11 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     private fun refreshMessagesBlocking() {
         val page = service.messages(limit = 50)
         onEdt {
+            navigator.setMessages(page.messages)
             val fresh = page.messages.filter { it.seq > renderedSeq }.sortedBy { it.seq }
             for (message in fresh) {
                 renderedSeq = maxOf(renderedSeq, message.seq)
-                appendSystem("${message.role}: ${message.text}")
+                appendMessage(message)
             }
         }
     }
@@ -514,6 +605,164 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         }
     }
 
+    // ---------------------------------------------------------------- tree
+
+    private fun refreshTaskTreeBlocking() {
+        val projection = service.projection()
+        val task = try {
+            service.taskViews().firstOrNull()
+        } catch (e: Exception) {
+            null
+        }
+        val agents = service.agents()
+        val graph = service.orchestratorGraph()
+        val catalogNow = try {
+            service.modelCatalog()
+        } catch (e: Exception) {
+            emptyList<NativeModelInfo>()
+        }
+        val verification = try {
+            service.verification()
+        } catch (e: Exception) {
+            null
+        }
+        val runs = try {
+            service.taskRuns()
+        } catch (e: Exception) {
+            emptyList<NativeTaskRun>()
+        }
+        val taskVerification = if (runs.isEmpty()) {
+            null
+        } else {
+            try {
+                service.taskVerification(runs[0].taskId.toString())
+            } catch (e: Exception) {
+                null
+            }
+        }
+        val sessionUsage = try {
+            service.sessionUsage()
+        } catch (e: Exception) {
+            null
+        }
+        val childUsage = HashMap<String, dev.faktor.shared.NativeSessionUsage>()
+        for (child in agents.filter { it.kind == "child" }.take(MAX_CHILD_USAGE_FETCHES)) {
+            try {
+                childUsage[child.sessionId.toString()] = service.sessionUsageFor(child.sessionId.toString())
+            } catch (e: Exception) {
+                // A child session without usage simply has no spend envelope.
+            }
+        }
+        val tournament = try {
+            trackedTournamentId?.let { service.tournamentState(it) }
+        } catch (e: Exception) {
+            null
+        }
+        val permissions = try {
+            service.permissions()
+        } catch (e: Exception) {
+            emptyList<NativePermissionEntry>()
+        }
+        pendingPermissions = permissions
+        val model = TaskTree.build(
+            projection = projection,
+            task = task,
+            agents = agents,
+            graph = graph,
+            catalog = catalogNow,
+            verification = verification,
+            taskVerification = taskVerification,
+            usage = sessionUsage,
+            childUsage = childUsage,
+            tournament = tournament
+        )
+        onEdt {
+            currentTree = model
+            treePanel.update(model)
+            blockersPanel.update(model.blockers, permissions, model.taskBlockers)
+            tournamentPanel.setTournament(model.tournament)
+            navigator.setEvidence(model.evidence)
+        }
+    }
+
+    private fun applyTournament(tournament: NativeTournament) {
+        tournamentPanel.setTournament(TaskTree.tournamentView(tournament))
+        appendSystem("tournament ${tournament.id} [${tournament.state}] winner=${tournament.winner ?: "-"}")
+    }
+
+    private fun retrieveEvidenceIntoNavigator(evidenceId: Long, selectorJson: String?) {
+        val selector = selectorJson
+            ?: dev.faktor.shared.NativeRequests.evidenceSelectorAll()
+        try {
+            val meta = service.evidence(evidenceId)
+            val retrieval = service.retrieveEvidence(evidenceId, selector)
+            val preview = String(retrieval.bytes, Charsets.UTF_8).take(MAX_EVIDENCE_PREVIEW_CHARS)
+            onEdt {
+                navigator.showRetrieval(
+                    evidenceId,
+                    "id=${meta.id} retained=${meta.backingRetained} " +
+                        "backingLen=${meta.backingLen ?: 0} " +
+                        "selector=${retrieval.selectorJson} " +
+                        "truncated=${retrieval.truncatedByPolicy}\n" + preview,
+                    retrieval.byteLen,
+                    retrieval.truncatedByPolicy
+                )
+                appendSystem("evidence ${meta.id}: ${retrieval.byteLen} bytes retrieved")
+            }
+        } catch (e: Exception) {
+            val message = e.message ?: e.javaClass.simpleName
+            onEdt {
+                navigator.showError(evidenceId, message)
+                appendSystem("evidence $evidenceId error: $message")
+            }
+        }
+    }
+
+    private fun permissionForChild(childId: String): NativePermissionEntry? {
+        val child = currentTree?.children?.firstOrNull { it.childId == childId } ?: return null
+        return pendingPermissions.firstOrNull { it.sessionId == child.sessionId.toString() }
+    }
+
+    private fun loadChildTranscript(child: ChildNode) {
+        runAsync("child transcript ${child.childId}") {
+            val page = service.messagesFor(child.sessionId.toString(), limit = 50)
+            val text = page.messages.joinToString("\n") {
+                "#${it.seq} ${it.role}: ${it.text}"
+            }
+            onEdt {
+                navigator.showTranscriptSlice(
+                    "child ${child.childId} (session ${child.sessionId})",
+                    text.ifEmpty { "(no messages in the child transcript window)" }
+                )
+                tabs.selectedComponent = navigator
+            }
+        }
+    }
+
+    private fun appendMessage(message: NativeMessage) {
+        val start = transcript.text.length
+        transcript.append("${message.role}: ${message.text}\n")
+        transcriptOffsets[message.seq] = Pair(start, transcript.text.length)
+        trimTranscript()
+    }
+
+    private fun jumpToTranscript(seq: Long) {
+        val range = transcriptOffsets[seq]
+        if (range == null) {
+            appendSystem("message #$seq is outside the retained transcript window")
+            return
+        }
+        try {
+            transcript.requestFocusInWindow()
+            transcript.select(range.first, range.second)
+            transcript.caretPosition = range.second
+            val view = transcript.modelToView(range.first)
+            if (view != null) transcript.scrollRectToVisible(view)
+        } catch (e: Exception) {
+            appendSystem("message #$seq cannot be focused: ${e.message}")
+        }
+    }
+
     private fun applyProjection(projection: NativeProjection) {
         stateLabel.text = "state: ${projection.machine} (${projection.label})"
         val active = projection.activeModel
@@ -571,6 +820,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 if (service.isRunning() && service.currentSessionId() != null) {
                     refreshStatusBlocking()
                     refreshMessagesBlocking()
+                    refreshTaskTreeBlocking()
                 }
             } catch (e: Exception) {
                 // The stream may race a shutdown; errors surface via onError.
@@ -596,7 +846,6 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         abortButton.isEnabled = running
         startTaskButton.isEnabled = running
         cancelRunButton.isEnabled = running
-        retrieveEvidenceButton.isEnabled = running
     }
 
     private fun runAsync(label: String, work: () -> Unit) {
@@ -629,6 +878,9 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         val kept = text.split('\n').takeLast(MAX_TRANSCRIPT_LINES).joinToString("\n")
         transcript.text = kept.takeLast(MAX_TRANSCRIPT_CHARS)
         transcript.caretPosition = transcript.text.length
+        // Offsets no longer map onto the rebuilt text; message navigation
+        // falls back to a loud "outside the retained window" notice.
+        transcriptOffsets.clear()
     }
 
     private fun onEdt(block: () -> Unit) {

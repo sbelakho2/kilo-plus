@@ -16,17 +16,38 @@ BACKEND_SRC="$JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/BackendProces
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeClient.kt
 $JETBRAINS/backend/src/main/kotlin/dev/faktor/backend/NativeEventStream.kt"
 TEST_SRC="$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/BackendProcessManagerTest.kt
-$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt"
+$JETBRAINS/backend/src/test/kotlin/dev/faktor/backend/NativeClientTest.kt
+$JETBRAINS/frontend/src/test/kotlin/dev/faktor/frontend/FrontendSmoke.kt"
 FRONTEND_SRC="$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorFrontendService.kt
-$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt"
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/FaktorChatPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PanelSupport.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreeModel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TaskTreePanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/BlockersPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/TournamentPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/EvidenceNavigatorPanel.kt
+$JETBRAINS/frontend/src/main/kotlin/dev/faktor/frontend/AttachmentsPanel.kt"
 
 BIN="${FAKTOR_CLI_BIN:-$ROOT/target/debug/faktor-cli}"
 
 echo "[compile-and-smoke] repo root: $ROOT"
 
 # ---- 1. the CLI binary -----------------------------------------------------
-if [ ! -x "$BIN" ]; then
-  echo "[compile-and-smoke] building faktor-cli (missing: $BIN)"
+# Rebuild when the binary is missing OR any Rust source/Cargo manifest is
+# newer than it: the smoke exercises additive native protocol fields (task-run
+# `files`), so a stale binary would reject the current tree's requests.
+needs_cli_rebuild() {
+  [ ! -x "$BIN" ] && return 0
+  local newer
+  newer="$(find "$ROOT/crates" "$ROOT/Cargo.toml" "$ROOT/Cargo.lock" \
+    -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \) \
+    -newer "$BIN" -print -quit 2>/dev/null)"
+  [ -n "$newer" ]
+}
+
+if needs_cli_rebuild; then
+  echo "[compile-and-smoke] building faktor-cli (missing or stale: $BIN)"
   (cd "$ROOT" && cargo build -p faktor-cli) || {
     echo "FAIL: cargo build -p faktor-cli" >&2
     exit 1
@@ -183,5 +204,8 @@ echo "[compile-and-smoke] running BackendSmoke (v7.5.6 wire) against $BIN"
 run_smoke BackendSmoke dev.faktor.backend.BackendSmoke || exit $?
 
 echo "[compile-and-smoke] running NativeBridgeSmoke (native protocol v1) against $BIN"
-run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke
+run_smoke NativeBridgeSmoke dev.faktor.backend.NativeBridgeSmoke || exit $?
+
+echo "[compile-and-smoke] running FrontendSmoke (panels + canned native JSON + real daemon) against $BIN"
+run_smoke FrontendSmoke dev.faktor.frontend.FrontendSmoke
 exit $?

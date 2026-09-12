@@ -23,6 +23,9 @@ import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativeHealth
 import dev.faktor.shared.NativeModelInfo
+import dev.faktor.shared.NativeOrchestratorGraph
+import dev.faktor.shared.NativePermissionAck
+import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativePromptReceipt
 import dev.faktor.shared.NativeSessionCreated
@@ -33,6 +36,8 @@ import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
+import dev.faktor.shared.NativeTournament
+import dev.faktor.shared.NativeTournamentStarted
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import java.nio.file.Path
@@ -181,10 +186,23 @@ class FaktorFrontendService(
     fun messages(limit: Long = 50): dev.faktor.shared.NativeMessagePage =
         clientOrThrow().messages(requireSession(), null, limit)
 
+    /** The durable message page of ANY session id (child transcript slices). */
+    fun messagesFor(sessionId: String, limit: Long = 50): dev.faktor.shared.NativeMessagePage =
+        clientOrThrow().messages(sessionId, null, limit)
+
     fun events(after: Long, limit: Long = 256): dev.faktor.shared.NativeEventPage =
         clientOrThrow().events(requireSession(), after, limit)
 
     fun taskViews(): List<NativeTaskView> = clientOrThrow().taskViews(requireSession())
+
+    fun orchestratorGraph(): NativeOrchestratorGraph? = try {
+        clientOrThrow().orchestratorGraph(requireSession())
+    } catch (e: Exception) {
+        // The graph is best-effort: a session without a single orchestration
+        // run (404) or holding several (409) has no unambiguous graph; the
+        // tree degrades to task views and the agent listing.
+        null
+    }
 
     // ------------------------------------------------------------ task runs
 
@@ -196,13 +214,39 @@ class FaktorFrontendService(
         model: String? = null,
         maxTokens: Long? = null,
         maxCostMicro: Long? = null,
-        mutationMode: String? = null
+        mutationMode: String? = null,
+        files: List<String>? = null
     ): NativeTaskRunStarted = clientOrThrow().startTaskRun(
-        requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode
+        requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files
     )
 
     fun cancelTaskRun(runId: String): NativeTaskRunCancelled =
         clientOrThrow().cancelTaskRun(requireSession(), runId)
+
+    // ------------------------------------------------------------ tournaments
+
+    fun startTournament(
+        goal: String,
+        criteria: List<String>,
+        n: Int,
+        model: String? = null,
+        maxTokens: Long? = null,
+        maxCostMicro: Long? = null,
+        files: List<String>? = null
+    ): NativeTournamentStarted = clientOrThrow().startTournament(
+        requireSession(), goal, criteria, n, model, maxTokens, maxCostMicro, null, files
+    )
+
+    fun tournamentState(tournamentId: String): NativeTournament =
+        clientOrThrow().tournamentState(requireSession(), tournamentId)
+
+    // -------------------------------------------------------------- permissions
+
+    fun permissions(): List<NativePermissionEntry> =
+        clientOrThrow().permissions(requireSession())
+
+    fun replyPermission(permissionId: String, decision: String): NativePermissionAck =
+        clientOrThrow().replyPermission(permissionId, decision)
 
     // --------------------------------------------------------------- agents
 
@@ -237,6 +281,10 @@ class FaktorFrontendService(
     fun usage(): NativeUsageTotals = clientOrThrow().usage()
 
     fun sessionUsage(): NativeSessionUsage = clientOrThrow().sessionUsage(requireSession())
+
+    /** The durable usage of ANY session id (child session spend envelopes). */
+    fun sessionUsageFor(sessionId: String): NativeSessionUsage =
+        clientOrThrow().sessionUsage(sessionId)
 
     fun verification(): NativeVerificationView =
         clientOrThrow().verification(requireSession())

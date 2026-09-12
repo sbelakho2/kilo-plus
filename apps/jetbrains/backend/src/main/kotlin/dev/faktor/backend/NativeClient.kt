@@ -29,6 +29,9 @@ import dev.faktor.shared.NativeMessagePage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativePromptReceipt
+import dev.faktor.shared.NativeOrchestratorGraph
+import dev.faktor.shared.NativePermissionAck
+import dev.faktor.shared.NativePermissionEntry
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeReady
 import dev.faktor.shared.NativeRequests
@@ -40,6 +43,8 @@ import dev.faktor.shared.NativeTaskRunCancelled
 import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
+import dev.faktor.shared.NativeTournament
+import dev.faktor.shared.NativeTournamentStarted
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.parseNativeAbortAck
@@ -51,6 +56,9 @@ import dev.faktor.shared.parseNativeEvidenceRetrieval
 import dev.faktor.shared.parseNativeHealth
 import dev.faktor.shared.parseNativeMessagePage
 import dev.faktor.shared.parseNativeModelCatalog
+import dev.faktor.shared.parseNativeOrchestratorGraph
+import dev.faktor.shared.parseNativePermissionAck
+import dev.faktor.shared.parseNativePermissionList
 import dev.faktor.shared.parseNativeProjection
 import dev.faktor.shared.parseNativePromptReceipt
 import dev.faktor.shared.parseNativeReady
@@ -62,6 +70,8 @@ import dev.faktor.shared.parseNativeTaskRunStarted
 import dev.faktor.shared.parseNativeTaskRuns
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
+import dev.faktor.shared.parseNativeTournament
+import dev.faktor.shared.parseNativeTournamentStarted
 import dev.faktor.shared.parseNativeUsage
 import dev.faktor.shared.parseNativeVerificationView
 import java.io.ByteArrayOutputStream
@@ -201,12 +211,13 @@ class NativeClient(
         model: String? = null,
         maxTokens: Long? = null,
         maxCostMicro: Long? = null,
-        mutationMode: String? = null
+        mutationMode: String? = null,
+        files: List<String>? = null
     ): NativeTaskRunStarted = parseNativeTaskRunStarted(
         request(
             "POST", "/native/session/" + encode(sessionId) + "/task-runs", null,
             NativeRequests.startTaskRun(
-                goal, criteria, model, maxTokens, maxCostMicro, mutationMode
+                goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files
             )
         )
     )
@@ -222,6 +233,57 @@ class NativeClient(
     fun taskViews(sessionId: String): List<NativeTaskView> = parseNativeTaskViews(
         request("GET", "/native/session/" + encode(sessionId) + "/tasks")
     )
+
+    // ------------------------------------------------------------ tournaments
+
+    fun startTournament(
+        sessionId: String,
+        goal: String,
+        criteria: List<String>,
+        n: Int,
+        model: String? = null,
+        maxTokens: Long? = null,
+        maxCostMicro: Long? = null,
+        mutationMode: String? = null,
+        files: List<String>? = null
+    ): NativeTournamentStarted = parseNativeTournamentStarted(
+        request(
+            "POST", "/native/session/" + encode(sessionId) + "/tournament", null,
+            NativeRequests.startTournament(
+                goal, criteria, n, model, maxTokens, maxCostMicro, mutationMode, files
+            )
+        )
+    )
+
+    fun tournamentState(sessionId: String, tournamentId: String): NativeTournament =
+        parseNativeTournament(
+            request(
+                "GET",
+                "/native/session/" + encode(sessionId) + "/tournament/" + encode(tournamentId)
+            )
+        )
+
+    // ------------------------------------------------------- orchestrator graph
+
+    fun orchestratorGraph(sessionId: String): NativeOrchestratorGraph =
+        parseNativeOrchestratorGraph(
+            request("GET", "/native/orchestrator/graph", query("session" to sessionId))
+        )
+
+    // ------------------------------------------------- permissions (reply path)
+
+    fun permissions(sessionId: String): List<NativePermissionEntry> =
+        parseNativePermissionList(
+            request("GET", "/permission/list", query("session_id" to sessionId))
+        )
+
+    fun replyPermission(permissionId: String, decision: String): NativePermissionAck =
+        parseNativePermissionAck(
+            request(
+                "POST", "/permission/reply", null,
+                NativeRequests.permissionReply(permissionId, decision)
+            )
+        )
 
     // --------------------------------------------------------------- agents
 

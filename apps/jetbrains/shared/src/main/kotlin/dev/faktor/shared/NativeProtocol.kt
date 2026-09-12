@@ -440,6 +440,45 @@ data class NativeTaskBudget(
 
 data class NativeMilestones(val completed: List<String>, val open: List<String>)
 
+/** One explicit plan step (additive task-view field; `depends_on` is the DAG edge). */
+data class NativePlanStep(
+    val id: String,
+    val summary: String,
+    val state: String,
+    val dependsOn: List<String>
+)
+
+/** The durable child blocker of the native agent listing (`blocker` field). */
+data class NativeBlocker(
+    val kind: String,
+    val reason: String,
+    val dependency: String?,
+    val resolution: String?,
+    val lastProgressMs: Long?
+)
+
+/** The bounded live progress record of one agent (`progress` field). */
+data class NativeAgentProgress(
+    val lastOutputAt: Long?,
+    val lastProgressAt: Long?,
+    val lastOpCompletedAt: Long?,
+    val inFlightOp: String?,
+    val silenceMs: Long?,
+    val stallThresholdMs: Long?,
+    val stalled: Boolean
+)
+
+/** The latest durable merge envelope of one child (`result.merge`). */
+data class NativeChildMerge(
+    val changeSetId: String?,
+    val merged: Long?,
+    val rejected: Long?,
+    val conflicts: Long?
+)
+
+/** The durable latest-result summary of one child (`result` field). */
+data class NativeChildResult(val summary: String, val merge: NativeChildMerge?)
+
 data class NativeTaskView(
     val goal: String,
     val state: String,
@@ -447,7 +486,13 @@ data class NativeTaskView(
     val changedFiles: List<String>,
     val testsRun: List<String>,
     val testsFailed: List<String>,
-    val budget: NativeTaskBudget?
+    val budget: NativeTaskBudget?,
+    val acceptanceCriteria: List<String> = emptyList(),
+    val plan: List<NativePlanStep> = emptyList(),
+    val blockers: List<String> = emptyList(),
+    val evidenceRefs: List<String> = emptyList(),
+    val phase: String? = null,
+    val progress: NativeAgentProgress? = null
 )
 
 data class NativeTaskRun(
@@ -475,7 +520,13 @@ data class NativeAgent(
     val model: String?,
     val budget: Long?,
     val ownership: String,
-    val itemIds: List<String>
+    val itemIds: List<String>,
+    val itemId: String? = null,
+    val itemKind: String? = null,
+    val blocker: NativeBlocker? = null,
+    val capabilities: List<String> = emptyList(),
+    val progress: NativeAgentProgress? = null,
+    val result: NativeChildResult? = null
 )
 
 data class NativeAgentControlAck(val queuedSeq: Long?, val applied: Boolean?)
@@ -497,13 +548,22 @@ data class NativeSessionUsage(
     val tasks: List<NativeSessionTaskUsage>
 )
 
+/** One durable criterion verdict of a verification record. */
+data class NativeCriterionVerdict(
+    val criterionKey: String,
+    val passed: Boolean,
+    val evidence: String?
+)
+
 data class NativeVerificationRecord(
     val recordId: String,
     val status: String,
     val criteriaPassed: Int,
     val criteriaTotal: Int,
     val checks: List<String>,
-    val changedFiles: List<String>
+    val changedFiles: List<String>,
+    val criteria: List<NativeCriterionVerdict> = emptyList(),
+    val checkSummaries: List<String> = emptyList()
 )
 
 data class NativeTaskVerification(
@@ -511,6 +571,79 @@ data class NativeTaskVerification(
     val taskId: String,
     val records: List<NativeVerificationRecord>
 )
+
+// ------------------------------------------------ orchestrator graph (native)
+
+data class NativeGraphWorkItem(val itemId: String, val kind: String, val state: String)
+
+data class NativeGraphChild(
+    val childId: String,
+    val sessionId: Long,
+    val operationId: Long,
+    val worktreeId: Long,
+    val ownership: String,
+    val state: String,
+    val blocker: NativeBlocker?,
+    val budget: Long?,
+    val planStepIndex: Int?,
+    val merge: NativeChildMerge?
+)
+
+data class NativeOrchestratorGraph(
+    val planId: String,
+    val goal: String,
+    val state: String,
+    val workItems: List<NativeGraphWorkItem>,
+    val children: List<NativeGraphChild>
+)
+
+// ------------------------------------------------- tournament (native, v1)
+
+data class NativeTournamentCriterion(val id: String, val spec: String)
+
+/** One tournament candidate: identity, location, verification and review verdicts, measured axes. */
+data class NativeTournamentCandidate(
+    val childId: String,
+    val worktree: String,
+    val baseRevision: String,
+    val state: String,
+    val verification: Long?,
+    val verificationPass: Boolean?,
+    val reviewRank: String?,
+    val reviewer: String?,
+    val costMicro: Long,
+    val wallMs: Long
+)
+
+data class NativeTournament(
+    val id: String,
+    val runFamily: String,
+    val goal: String,
+    val criteria: List<NativeTournamentCriterion>,
+    val candidates: List<NativeTournamentCandidate>,
+    val winner: String?,
+    val state: String
+)
+
+/** The start receipt of a tournament (`POST /native/session/{id}/tournament`). */
+data class NativeTournamentStarted(
+    val tournamentId: String,
+    val runId: String,
+    val candidates: List<String>,
+    val state: String,
+    val winner: String?
+)
+
+// ------------------------------------------------- permissions (SDK reply path)
+
+data class NativePermissionEntry(
+    val id: String,
+    val sessionId: String,
+    val capability: String,
+    val detail: String
+)
+
+data class NativePermissionAck(val ok: Boolean)
 
 data class NativeEvidence(
     val id: Long,
@@ -688,12 +821,90 @@ private fun parseBudget(v: JsonView): NativeTaskBudget = NativeTaskBudget(
     openReservedMicro = v.field("openReservedMicro").long()
 )
 
+private fun parseBlocker(v: JsonView): NativeBlocker = NativeBlocker(
+    kind = v.field("kind").string(),
+    reason = v.field("reason").string(),
+    dependency = v.optionalField("dependency")?.string(),
+    resolution = v.optionalField("resolution")?.string(),
+    lastProgressMs = v.optionalField("last_progress_ms")?.long()
+)
+
+private fun parseAgentProgress(v: JsonView): NativeAgentProgress = NativeAgentProgress(
+    lastOutputAt = v.optionalField("lastOutputAt")?.long(),
+    lastProgressAt = v.optionalField("lastProgressAt")?.long(),
+    lastOpCompletedAt = v.optionalField("lastOpCompletedAt")?.long(),
+    inFlightOp = v.optionalField("inFlightOp")?.string(),
+    silenceMs = v.optionalField("silenceMs")?.long(),
+    stallThresholdMs = v.optionalField("stallThresholdMs")?.long(),
+    stalled = v.optionalField("stalled")?.bool() ?: false
+)
+
+/** The bounded text of a JSON value: strings verbatim, other shapes as JSON. */
+private fun jsonText(v: JsonView): String? {
+    val value = v.value
+    return if (value is JsonValue.Str) value.value else v.rawJson()
+}
+
+private fun parseChildMerge(v: JsonView): NativeChildMerge = NativeChildMerge(
+    changeSetId = v.optionalField("change_set_id")?.string(),
+    merged = v.optionalField("merged")?.long(),
+    rejected = v.optionalField("rejected")?.long(),
+    conflicts = v.optionalField("conflicts")?.long()
+)
+
+private fun parseChildResult(v: JsonView): NativeChildResult = NativeChildResult(
+    summary = v.optionalField("summary")?.string() ?: "",
+    merge = v.optionalField("merge")?.let { parseChildMerge(it) }
+)
+
+/** First present key wins (additive-field convention: camelCase or snake_case). */
+private fun optionalAny(v: JsonView, vararg keys: String): JsonView? {
+    for (key in keys) {
+        val found = v.optionalField(key)
+        if (found != null) return found
+    }
+    return null
+}
+
+private fun optionalStrings(v: JsonView, vararg keys: String): List<String> =
+    optionalAny(v, *keys)?.stringArray() ?: emptyList()
+
+private fun parsePlanSteps(v: JsonView): List<NativePlanStep> {
+    val plan = optionalAny(v, "plan", "plan_steps", "planSteps") ?: return emptyList()
+    return plan.array().map { step ->
+        val rawId = step.optionalField("id") ?: step.fail("missing required field \"id\"")
+        val id = when (val value = rawId.value) {
+            is JsonValue.Str -> value.value
+            is JsonValue.Int64 -> value.value.toString()
+            else -> rawId.fail("expected a non-empty string or integer id")
+        }
+        NativePlanStep(
+            id = id,
+            summary = optionalAny(step, "summary", "title")?.string() ?: "",
+            state = optionalAny(step, "state", "status")?.string() ?: "pending",
+            dependsOn = optionalStrings(step, "depends_on", "dependsOn")
+        )
+    }
+}
+
+private fun parseTaskBlockers(v: JsonView): List<String> =
+    optionalAny(v, "blockers", "blocked_on")?.array()?.map { entry ->
+        if (entry.value is JsonValue.Str) {
+            entry.string()
+        } else {
+            val detail = optionalAny(entry, "detail", "message", "summary", "reason")
+                ?.let { jsonText(it) }
+            detail ?: entry.fail("expected a non-empty blocker detail")
+        }
+    } ?: emptyList()
+
 fun parseNativeTaskViews(json: String): List<NativeTaskView> {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/tasks")
     return v.array().map {
         val milestones = it.field("milestones")
         val tests = it.field("tests")
         val budget = it.optionalField("budget")
+        val progress = it.optionalField("progress")
         NativeTaskView(
             goal = it.field("goal").string(),
             state = it.field("state").string(),
@@ -704,7 +915,13 @@ fun parseNativeTaskViews(json: String): List<NativeTaskView> {
             changedFiles = it.field("changedFiles").stringArray(),
             testsRun = tests.field("run").stringArray(),
             testsFailed = tests.field("failed").stringArray(),
-            budget = if (budget == null) null else parseBudget(budget)
+            budget = if (budget == null) null else parseBudget(budget),
+            acceptanceCriteria = optionalStrings(it, "acceptanceCriteria", "acceptance_criteria"),
+            plan = parsePlanSteps(it),
+            blockers = parseTaskBlockers(it),
+            evidenceRefs = optionalStrings(it, "evidenceRefs", "evidence_refs"),
+            phase = it.optionalField("phase")?.string(),
+            progress = progress?.let { p -> parseAgentProgress(p) }
         )
     }
 }
@@ -744,6 +961,11 @@ fun parseNativeTaskRunCancelled(json: String): NativeTaskRunCancelled {
 fun parseNativeAgents(json: String): List<NativeAgent> {
     val v = JsonCodec.parse(json).view("GET /native/agents")
     return v.array().map {
+        val blocker = it.optionalField("blocker")
+        val capabilities = it.optionalField("capabilities")?.array()
+            ?.map { entry -> entry.rawJson() } ?: emptyList()
+        val progress = it.optionalField("progress")
+        val result = it.optionalField("result")
         NativeAgent(
             agentId = it.field("agent_id").string(),
             kind = it.field("kind").string(),
@@ -755,7 +977,13 @@ fun parseNativeAgents(json: String): List<NativeAgent> {
             model = it.optionalField("model")?.string(),
             budget = it.optionalField("budget")?.long(),
             ownership = it.field("ownership").string(),
-            itemIds = it.optionalField("item_ids")?.stringArray() ?: emptyList()
+            itemIds = it.optionalField("item_ids")?.stringArray() ?: emptyList(),
+            itemId = it.optionalField("item_id")?.string(),
+            itemKind = it.optionalField("item_kind")?.string(),
+            blocker = blocker?.let { b -> parseBlocker(b) },
+            capabilities = capabilities,
+            progress = progress?.let { p -> parseAgentProgress(p) },
+            result = result?.let { r -> parseChildResult(r) }
         )
     }
 }
@@ -824,11 +1052,116 @@ fun parseNativeTaskVerification(json: String): NativeTaskVerification {
                 },
                 changedFiles = record.field("changedFiles").array().map {
                     it.field("path").string()
-                }
+                },
+                criteria = criteria.map { criterion ->
+                    NativeCriterionVerdict(
+                        criterionKey = criterion.field("criterionKey").string(),
+                        passed = criterion.field("passed").bool(),
+                        evidence = criterion.optionalField("evidence")?.let { e -> jsonText(e) }
+                    )
+                },
+                checkSummaries = record.field("checks").array()
+                    .mapNotNull { check -> check.optionalField("summary")?.let { s -> jsonText(s) } }
             )
         }
     )
 }
+
+// ---------------------------------------------------- orchestrator graph parse
+
+fun parseNativeOrchestratorGraph(json: String): NativeOrchestratorGraph {
+    val v = JsonCodec.parse(json).view("GET /native/orchestrator/graph")
+    return NativeOrchestratorGraph(
+        planId = v.field("plan_id").string(),
+        goal = v.field("goal").string(),
+        state = v.field("state").string(),
+        workItems = v.field("work_items").array().map {
+            NativeGraphWorkItem(
+                itemId = it.field("item_id").string(),
+                kind = it.field("kind").string(),
+                state = it.field("state").string()
+            )
+        },
+        children = v.field("children").array().map {
+            val blocker = it.optionalField("blocker")
+            val merge = it.optionalField("merge")
+            NativeGraphChild(
+                childId = it.field("child_id").string(),
+                sessionId = it.field("session_id").long(),
+                operationId = it.field("operation_id").long(),
+                worktreeId = it.field("worktree_id").long(),
+                ownership = it.field("ownership").string(),
+                state = it.field("state").string(),
+                blocker = blocker?.let { b -> parseBlocker(b) },
+                budget = it.optionalField("budget")?.long(),
+                planStepIndex = it.optionalField("plan_step_index")?.int(),
+                merge = if (merge == null) null else parseChildMerge(merge)
+            )
+        }
+    )
+}
+
+// ----------------------------------------------------------- tournament parse
+
+fun parseNativeTournament(json: String): NativeTournament {
+    val v = JsonCodec.parse(json).view("GET /native/session/{id}/tournament/{tournament_id}")
+    return NativeTournament(
+        id = v.field("id").string(),
+        runFamily = v.field("run_family").string(),
+        goal = v.field("goal").string(),
+        criteria = v.field("criteria").array().map {
+            NativeTournamentCriterion(
+                id = it.field("id").string(),
+                spec = it.field("spec").string()
+            )
+        },
+        candidates = v.field("candidates").array().map { candidate ->
+            val review = candidate.optionalField("review")
+            NativeTournamentCandidate(
+                childId = candidate.field("child_id").string(),
+                worktree = candidate.field("worktree").string(),
+                baseRevision = candidate.field("base_revision").string(),
+                state = candidate.field("state").string(),
+                verification = candidate.optionalField("verification")?.long(),
+                verificationPass = candidate.optionalField("verification_pass")?.bool(),
+                reviewRank = review?.field("rank")?.string(),
+                reviewer = review?.field("reviewer")?.string(),
+                costMicro = candidate.field("cost_micro").long(),
+                wallMs = candidate.field("wall_ms").long()
+            )
+        },
+        winner = v.optionalField("winner")?.string(),
+        state = v.field("state").string()
+    )
+}
+
+fun parseNativeTournamentStarted(json: String): NativeTournamentStarted {
+    val v = JsonCodec.parse(json).view("POST /native/session/{id}/tournament")
+    return NativeTournamentStarted(
+        tournamentId = v.field("tournament_id").string(),
+        runId = v.field("run_id").string(),
+        candidates = v.field("candidates").stringArray(),
+        state = v.field("state").string(),
+        winner = v.optionalField("winner")?.string()
+    )
+}
+
+// ----------------------------------------------------------- permission parse
+
+fun parseNativePermissionList(json: String): List<NativePermissionEntry> {
+    val v = JsonCodec.parse(json).view("GET /permission/list")
+    return v.field("permissions").array().map {
+        NativePermissionEntry(
+            id = it.field("id").string(),
+            sessionId = it.field("session_id").string(),
+            capability = it.field("capability").string(),
+            detail = it.optionalField("detail")?.let { d -> jsonText(d) } ?: ""
+        )
+    }
+}
+
+fun parseNativePermissionAck(json: String): NativePermissionAck =
+    NativePermissionAck(JsonCodec.parse(json).view("POST /permission/reply").field("ok").bool())
 
 fun parseNativeEvidence(json: String): NativeEvidence {
     val v = JsonCodec.parse(json).view("GET /native/evidence/{id}")
@@ -949,7 +1282,8 @@ object NativeRequests {
         model: String? = null,
         maxTokens: Long? = null,
         maxCostMicro: Long? = null,
-        mutationMode: String? = null
+        mutationMode: String? = null,
+        files: List<String>? = null
     ): String = JsonObjectBuilder()
         .put("goal", goal)
         .putStrings("criteria", criteria)
@@ -957,6 +1291,27 @@ object NativeRequests {
         .put("max_tokens", maxTokens)
         .put("max_cost_micro", maxCostMicro)
         .put("mutation_mode", mutationMode)
+        .putStrings("files", if (files.isNullOrEmpty()) null else files)
+        .toJson()
+
+    fun startTournament(
+        goal: String,
+        criteria: List<String>,
+        n: Int,
+        model: String? = null,
+        maxTokens: Long? = null,
+        maxCostMicro: Long? = null,
+        mutationMode: String? = null,
+        files: List<String>? = null
+    ): String = JsonObjectBuilder()
+        .put("goal", goal)
+        .putStrings("criteria", criteria)
+        .put("n", n.toLong())
+        .put("model", model)
+        .put("max_tokens", maxTokens)
+        .put("max_cost_micro", maxCostMicro)
+        .put("mutation_mode", mutationMode)
+        .putStrings("files", if (files.isNullOrEmpty()) null else files)
         .toJson()
 
     fun steer(text: String): String = JsonObjectBuilder().put("text", text).toJson()
@@ -979,10 +1334,23 @@ object NativeRequests {
             .put("end", end)
             .toJson()
 
+    fun evidenceSelectorLines(start: Long, end: Long): String =
+        JsonObjectBuilder()
+            .put("selector", "line_range")
+            .put("start", start)
+            .put("end", end)
+            .toJson()
+
     fun evidenceSelectorSearch(query: String, maxHits: Long): String =
         JsonObjectBuilder()
             .put("selector", "search")
             .put("query", query)
             .put("max_hits", maxHits)
+            .toJson()
+
+    fun permissionReply(permissionId: String, decision: String): String =
+        JsonObjectBuilder()
+            .put("permission_id", permissionId)
+            .put("decision", decision)
             .toJson()
 }
