@@ -7201,13 +7201,17 @@ mod tests {
         assert_eq!(entries[0]["goal"], "Ship the analysis");
         assert!(entries[1]["item_id"] == "a" || entries[2]["item_id"] == "a");
         // Children carry real session ids, worktree identity, live model
-        // and progress while their drives are in flight.
+        // and progress while their drives are in flight. The provider is the
+        // child session's OWN durable row (the catalog join key), so it must
+        // match the run's provider even when another provider serves the same
+        // model id.
         for e in entries.iter().filter(|e| e["kind"] == "child") {
             assert_eq!(e["run_id"], "run-http");
             assert_ne!(e["session_id"].as_u64().unwrap_or(0), 0);
             assert_eq!(e["ownership"], "read_only_shared");
             assert_eq!(e["state"], "Running");
             assert_eq!(e["model"], "m");
+            assert_eq!(e["provider"], "fake");
         }
 
         // Mid-flight budget change: applied synchronously and durably

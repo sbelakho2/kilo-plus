@@ -6,8 +6,7 @@
     "errors": []
   },
   "render": {
-    "status": "passed",
-    "tool": "file:///tmp/kilo-build/pw/node_modules/playwright/index.js",
-    "states": 9
+    "status": "skipped",
+    "reason": "headless render disabled by --no-headless"
   }
 }

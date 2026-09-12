@@ -59,6 +59,32 @@ export interface CockpitSpendView {
   readonly openReservedMicro: number;
 }
 
+/** One tournament candidate (mirrors the durable native candidate rows). */
+export interface CockpitTournamentCandidateView {
+  readonly childId: string;
+  readonly state: string;
+  readonly verification: number | null;
+  readonly verificationPass: boolean | null;
+  readonly reviewRank: string | null;
+  readonly reviewer: string | null;
+  readonly costMicro: number;
+  readonly wallMs: number;
+  readonly winner: boolean;
+}
+
+/** The durable tournament as the cockpit renders it (never auto-integrates). */
+export interface CockpitTournamentView {
+  readonly id: string;
+  readonly state: string;
+  /** The engine can still act: open | deciding. */
+  readonly open: boolean;
+  /** Decide waits until every candidate settled (the engine's rule). */
+  readonly canDecide: boolean;
+  readonly winner: string | null;
+  readonly criteria: readonly string[];
+  readonly candidates: readonly CockpitTournamentCandidateView[];
+}
+
 export interface CockpitView {
   readonly goal: string;
   readonly state: string;
@@ -70,6 +96,14 @@ export interface CockpitView {
   readonly verification: CockpitVerificationView;
   readonly evidence: readonly CockpitEvidenceRef[];
   readonly spend: CockpitSpendView | null;
+  readonly tournament: CockpitTournamentView | null;
+}
+
+/** One state-gated control a cockpit section renders. */
+export interface CockpitAction {
+  readonly key: 'decide' | 'abort';
+  readonly label: string;
+  readonly enabled: boolean;
 }
 
 export interface CockpitSection {
@@ -78,6 +112,60 @@ export interface CockpitSection {
   readonly present: boolean;
   readonly lines: readonly string[];
   readonly evidence: readonly CockpitEvidenceRef[];
+  /** State-gated controls (tournament decide/abort), when the section owns any. */
+  readonly actions?: readonly CockpitAction[];
+}
+
+/** Minimal structural view of the durable native tournament payload. */
+export interface CockpitNativeTournament {
+  readonly id: string;
+  readonly state: string;
+  readonly winner: string | null;
+  readonly criteria: readonly { readonly id: string; readonly spec: string }[];
+  readonly candidates: readonly {
+    readonly childId: string;
+    readonly state: string;
+    readonly verification: number | null;
+    readonly verificationPass: boolean | null;
+    readonly reviewRank: string | null;
+    readonly reviewer: string | null;
+    readonly costMicro: number;
+    readonly wallMs: number;
+  }[];
+}
+
+/**
+ * Pure tournament projection: `open` while the engine can still act and
+ * `canDecide` only once every candidate has settled (the engine's own rule).
+ * Integration is never automatic — a winner is a proposal.
+ */
+export function tournamentViewOf(
+  tournament: CockpitNativeTournament | null,
+): CockpitTournamentView | null {
+  if (tournament === null) {
+    return null;
+  }
+  const open = tournament.state === 'open' || tournament.state === 'deciding';
+  const candidates = tournament.candidates.map((candidate) => ({
+    childId: candidate.childId,
+    state: candidate.state,
+    verification: candidate.verification,
+    verificationPass: candidate.verificationPass,
+    reviewRank: candidate.reviewRank,
+    reviewer: candidate.reviewer,
+    costMicro: candidate.costMicro,
+    wallMs: candidate.wallMs,
+    winner: tournament.winner !== null && candidate.childId === tournament.winner,
+  }));
+  return {
+    id: tournament.id,
+    state: tournament.state,
+    open,
+    canDecide: open && candidates.length > 0 && candidates.every((c) => c.state !== 'running'),
+    winner: tournament.winner,
+    criteria: tournament.criteria.map((criterion) => criterion.spec),
+    candidates,
+  };
 }
 
 /** Minimal structural view of the task-verification wire payload. */
@@ -95,6 +183,8 @@ export interface CockpitInput {
   readonly verification: VerificationSummary | null;
   readonly usage: UsageSummary | null;
   readonly taskVerification: CockpitTaskVerification | null;
+  /** The durable tournament of the session, when one exists. */
+  readonly tournament?: CockpitTournamentView | null;
 }
 
 const MAX_LINES = 64;
@@ -177,13 +267,14 @@ function boundedJson(value: unknown): string | null {
 
 export function buildCockpit(input: CockpitInput): CockpitView | null {
   const { task, agents, verification, usage, taskVerification } = input;
+  const tournament = input.tournament ?? null;
   // Background children are TUCKED: they render after the foreground ones
   // (the durable presentation field decides; never the state heuristics).
   const allChildren = agents.filter((agent) => agent.kind === 'child');
   const children = allChildren.filter((child) => child.presentation !== 'background').concat(
     allChildren.filter((child) => child.presentation === 'background'),
   );
-  if (task === null && children.length === 0 && verification === null) {
+  if (task === null && children.length === 0 && verification === null && tournament === null) {
     return null;
   }
 
@@ -356,6 +447,7 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     verification: verificationView,
     evidence,
     spend,
+    tournament,
   };
 }
 
@@ -409,6 +501,45 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
           })
         : ['none'],
     evidence: [],
+  });
+  sections.push({
+    key: 'tournament',
+    title: 'Tournament',
+    present: view.tournament !== null,
+    lines:
+      view.tournament === null
+        ? ['none']
+        : [
+            `tournament ${view.tournament.id} [${view.tournament.state}] winner ${
+              view.tournament.winner ?? '—'
+            }`,
+            `criteria ${view.tournament.criteria.length}: ${
+              view.tournament.criteria.join('; ') || '—'
+            }`,
+            ...view.tournament.candidates.map((candidate) => {
+              const verdict =
+                candidate.verification === null
+                  ? 'unverified'
+                  : candidate.verificationPass === true
+                    ? 'pass'
+                    : 'fail';
+              const review =
+                candidate.reviewRank === null
+                  ? 'no review'
+                  : `${candidate.reviewRank}${
+                      candidate.reviewer !== null ? ` (${candidate.reviewer})` : ''
+                    }`;
+              return `${candidate.winner ? '* ' : ''}${candidate.childId} [${candidate.state}] ${verdict} ${review} cost ${candidate.costMicro} wall ${candidate.wallMs}ms`;
+            }),
+          ],
+    evidence: [],
+    actions:
+      view.tournament === null
+        ? []
+        : [
+            { key: 'decide', label: 'Decide winner', enabled: view.tournament.canDecide },
+            { key: 'abort', label: 'Abort', enabled: view.tournament.open },
+          ],
   });
   sections.push({
     key: 'phase',

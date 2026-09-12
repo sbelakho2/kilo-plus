@@ -25,6 +25,8 @@ import {
   NativeTaskRun,
   NativeTaskVerification,
   NativeTaskView,
+  NativeTournament,
+  NativeTournamentSummary,
   NativeVerificationView,
   ResponseLike,
 } from './nativeClient';
@@ -49,7 +51,7 @@ import {
   summarizeAgents,
   transcriptFromMessages,
 } from './state';
-import { CockpitTaskVerification, buildCockpit, cockpitSections } from './cockpit';
+import { CockpitTaskVerification, buildCockpit, cockpitSections, tournamentViewOf } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
 import { StartFailure, StartTaskSettings, startTaskRun } from './taskStart';
 import {
@@ -76,6 +78,8 @@ interface ActiveSession {
   /** Reuse the last task-verification read while its inputs are unchanged. */
   taskVerificationKey: string | null;
   taskVerification: NativeTaskVerification | null;
+  /** The tournament the cockpit auto-loads (tracked id, else newest). */
+  tournamentId: string | null;
   /** Persistent deterministic pixel presence per ChildId. */
   pixelPresence: Map<string, PixelPresence>;
 }
@@ -90,6 +94,7 @@ const active: ActiveSession = {
   refreshTimer: null,
   taskVerificationKey: null,
   taskVerification: null,
+  tournamentId: null,
   pixelPresence: new Map(),
 };
 
@@ -243,6 +248,7 @@ function stopServer(): void {
   active.refreshing = false;
   active.taskVerificationKey = null;
   active.taskVerification = null;
+  active.tournamentId = null;
   active.pixelPresence = new Map();
   store.patch({
     daemon: 'stopped',
@@ -260,6 +266,7 @@ function stopServer(): void {
     usage: null,
     cockpit: null,
     cockpitSections: [],
+    tournament: null,
     transcript: [],
     streamStatus: 'stopped',
     lastError: null,
@@ -442,12 +449,17 @@ async function refresh(): Promise<void> {
     const taskVerification = cockpitTaskVerificationView(
       await taskVerificationFor(client, sessionId, runs, task, verification),
     );
+    // The durable tournament auto-load: the tracked id while it still exists,
+    // else the newest summary. A missing listing/state is a null block, never
+    // a fabricated tournament.
+    const tournament = tournamentViewOf(await tournamentFor(client, sessionId));
     const cockpit = buildCockpit({
       task,
       agents: agentSummaries,
       verification: verificationView,
       usage: usageView,
       taskVerification,
+      tournament,
     });
     store.patch({
       sessions,
@@ -462,6 +474,7 @@ async function refresh(): Promise<void> {
       busy: activeRunId !== null,
       cockpit,
       cockpitSections: cockpit === null ? [] : cockpitSections(cockpit),
+      tournament: cockpit?.tournament ?? null,
       lastError: null,
     });
     // Assistant/status/tool lines are durable message rows; re-render the
@@ -524,6 +537,42 @@ async function taskVerificationFor(
     return view;
   } catch {
     return active.taskVerification;
+  }
+}
+
+/**
+ * Auto-load the durable tournament the cockpit tracks: the tracked id while
+ * the listing still names it, else the newest summary. Any listing/read
+ * failure degrades to null (no tournament block), never an error patch.
+ */
+async function tournamentFor(
+  client: NativeClient,
+  sessionId: string,
+): Promise<NativeTournament | null> {
+  let summaries: NativeTournamentSummary[];
+  try {
+    summaries = await client.tournaments(sessionId);
+  } catch {
+    active.tournamentId = null;
+    return null;
+  }
+  const tracked = active.tournamentId;
+  const target =
+    tracked !== null && summaries.some((summary) => summary.id === tracked)
+      ? tracked
+      : summaries.length > 0
+        ? summaries[summaries.length - 1]!.id
+        : null;
+  if (target === null) {
+    active.tournamentId = null;
+    return null;
+  }
+  try {
+    const state = await client.tournamentState(sessionId, target);
+    active.tournamentId = state.id;
+    return state;
+  } catch {
+    return null;
   }
 }
 
@@ -687,6 +736,52 @@ async function cancelActiveRun(): Promise<void> {
     chatProvider?.postNotice('info', `run ${ack.run_id} cancel requested`);
     active.activeRunId = null;
     store.patch({ activeRunId: null, busy: false });
+    scheduleRefresh(0);
+  } catch (error) {
+    reportError(error);
+  }
+}
+
+/**
+ * Decide/abort of the tracked durable tournament, state-gated by the SAME
+ * cockpit rule the UI renders (`canDecide` / `open`). The server remains the
+ * authority: a non-open tournament or no eligible winner surfaces as a typed
+ * `NativeApiError`, never a silent no-op.
+ */
+async function controlTournament(message: ChatMessage): Promise<void> {
+  const client = active.client;
+  const sessionId = active.sessionId;
+  const tournamentId =
+    typeof message.tournamentId === 'string' ? message.tournamentId.trim() : '';
+  const action = typeof message.action === 'string' ? message.action : '';
+  if (!client || !sessionId || tournamentId.length === 0) {
+    return;
+  }
+  const view = store.snapshot().tournament;
+  if (view !== null && view.id === tournamentId) {
+    if (action === 'decide' && !view.canDecide) {
+      chatProvider?.postNotice('info', `tournament ${tournamentId} cannot decide yet`);
+      return;
+    }
+    if (action === 'abort' && !view.open) {
+      chatProvider?.postNotice('info', `tournament ${tournamentId} is no longer open`);
+      return;
+    }
+  }
+  try {
+    if (action === 'decide') {
+      const decision = await client.decideTournament(sessionId, tournamentId);
+      chatProvider?.postNotice(
+        'info',
+        `tournament ${decision.tournamentId}: winner ${decision.winner} proposed (integration stays the approved-merge path)`,
+      );
+    } else if (action === 'abort') {
+      const reason = typeof message.reason === 'string' ? message.reason.trim() : '';
+      await client.abortTournament(sessionId, tournamentId, reason.length > 0 ? reason : undefined);
+      chatProvider?.postNotice('info', `tournament ${tournamentId} aborted`);
+    } else {
+      return;
+    }
     scheduleRefresh(0);
   } catch (error) {
     reportError(error);
@@ -860,6 +955,9 @@ async function handleWebviewMessage(
       return;
     case 'agentControl':
       await controlAgent(message);
+      return;
+    case 'tournamentControl':
+      await controlTournament(message);
       return;
     case 'retrieveEvidence':
       await retrieveEvidence(message);

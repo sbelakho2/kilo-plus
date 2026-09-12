@@ -1,0 +1,21 @@
+{
+  "schema": "faktor.webview-overlay-manifest/1",
+  "upstream": {
+    "repository": "https://github.com/Kilo-Org/kilocode",
+    "tag": "v7.5.6",
+    "commit": "fa02955bfa17b60e57e0d7406d200a73337472ee"
+  },
+  "target": "dist/overlay",
+  "files": [
+    {
+      "path": "faktor-companion.js",
+      "sha256": "09db82c0dbac46eb446e9cdbe44ee5afc6384591e3fdd01dddaf7b0a9a8b8930",
+      "size": 23590
+    },
+    {
+      "path": "faktor-companion.css",
+      "sha256": "fbd1b159d74e5656687f1736172733bf9cdb19113ec3e6fef7c43f86119b26d0",
+      "size": 6806
+    }
+  ]
+}

@@ -29,6 +29,7 @@ import { join } from 'node:path';
 import {
   buildVendoredWebviewHtml,
   bridgeCommandToHostMessage,
+  faktorEvidenceExpandedMessage,
   ingestWebviewMessage,
   locateVendoredBundle,
   readyMessage,
@@ -129,8 +130,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Deliver the decoded bytes of one expanded evidence artifact. */
   postEvidence(id: number, text: string, truncated: boolean): void {
     if (this.vendored !== null) {
-      // The frozen UI has no evidence-expansion message; never fabricate one.
-      console.log(`[faktor-bridge] evidence ${id} retrieved (${text.length} chars, truncated=${truncated}); no vendored-UI mapping`);
+      // Additive Faktor mapping: the companion panel renders the expansion
+      // (the frozen Kilo UI keeps its own messages untouched).
+      this.post(
+        faktorEvidenceExpandedMessage(
+          this.snapshot?.session?.id ?? null,
+          id,
+          text,
+          truncated,
+        ),
+      );
       return;
     }
     this.post({ type: 'evidence', id, text, truncated });
@@ -181,7 +190,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       void this.host.handle(message);
       return;
     }
-    const result = ingestWebviewMessage(message);
+    const result = ingestWebviewMessage(message, {
+      workspaceDirectory: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null,
+    });
     if ('dropped' in result) {
       this.dropCount += 1;
       console.error(
@@ -191,6 +202,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postNotice('error', `frozen UI message dropped: ${result.reason}`);
       }
       return;
+    }
+    if (result.kind === 'sendMessage' && result.refusedAttachments.length > 0) {
+      // Per-entry refusals are loud but never discard the message (or the
+      // goal) itself; the accepted subset still maps to sendGoal.
+      const reasons = result.refusedAttachments
+        .slice(0, 5)
+        .map((refusal) => `#${refusal.index}: ${refusal.reason}`)
+        .join('; ');
+      console.error(
+        `[faktor-bridge] ${result.refusedAttachments.length} attachment(s) refused: ${reasons}`,
+      );
+      this.postNotice(
+        'error',
+        `${result.refusedAttachments.length} attachment(s) refused: ${reasons}`,
+      );
     }
     if (result.kind === 'openExternal') {
       void vscode.env.openExternal(vscode.Uri.parse(result.url));
@@ -259,6 +285,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       title: 'Faktor',
       sidebar: '',
       topBar: false,
+      // The additive companion overlay loads only when the staged bundle
+      // shipped it; without it the shell is the frozen bootstrap.
+      ...(ui.companion !== null
+        ? {
+            companionScriptUri: resource(ui.companion.script),
+            companionStyleUri: resource(ui.companion.style),
+          }
+        : {}),
     });
   }
 

@@ -26,11 +26,13 @@ import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import composerPolicy from '../media/composer-state.js';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { bridgeTests } from './bridge-selftest.mjs';
+import { stageBundle, verifyOverlay } from './prepare-vendored-webview.mjs';
 
 // `--packaged <extension-dir>` additionally asserts the extracted VSIX layout
 // (out/ + media/ + the pinned vendored webview closure) without a daemon.
@@ -233,6 +235,7 @@ const agentsJson = [
     goal: 'implement main',
     state: 'Running',
     model: 'm',
+    provider: 'fake',
     budget: 1000,
     ownership: 'orchestrator',
     capabilities: ['ReadWorkspace'],
@@ -244,6 +247,55 @@ const agentsJson = [
 ];
 const controlAckJson = { queuedSeq: 3, applied: null };
 const presentationAckJson = { child_id: 'c1', presentation: 'background', changed: true };
+const tournamentJson = {
+  id: 't-1',
+  run_family: 'run-7',
+  goal: 'pick winner',
+  criteria: [{ id: 'c-1', spec: 'tests pass' }],
+  candidates: [
+    {
+      child_id: 'child-0',
+      worktree: '/tmp/w0',
+      base_revision: 'abc',
+      state: 'done',
+      verification: 12,
+      verification_pass: true,
+      review: { rank: 'clean', reviewer: 'rev-1' },
+      cost_micro: 100,
+      wall_ms: 1000,
+    },
+    {
+      child_id: 'child-1',
+      worktree: '/tmp/w1',
+      base_revision: 'abc',
+      state: 'running',
+      verification: null,
+      verification_pass: null,
+      review: null,
+      cost_micro: 50,
+      wall_ms: 900,
+    },
+  ],
+  winner: null,
+  state: 'open',
+};
+const tournamentStartedJson = {
+  tournament_id: 't-1',
+  run_id: 'run-7',
+  candidates: ['child-0', 'child-1'],
+  state: 'open',
+  winner: null,
+};
+const tournamentSummariesJson = [
+  { id: 't-1', state: 'open', candidate_count: 2, winner: null, decided_ms: null },
+  { id: 't-0', state: 'decided', candidate_count: 2, winner: 'child-0', decided_ms: 123 },
+];
+const tournamentDecisionJson = {
+  tournament_id: 't-1',
+  winner: 'child-0',
+  rationale: 'winner child-0 (verification=pass)',
+  discarded: [{ child_id: 'child-1', reason: 'candidate ended failed' }],
+};
 const messagePageJson = {
   sessionId: '7',
   messages: [
@@ -456,6 +508,18 @@ async function validatorAccepts() {
     assertEqual(nc.validateAgents(presented)[1].presentation, 'background');
     assertEqual(nc.validateAgentControlAck(clone(controlAckJson), 'test').queuedSeq, 3);
     assertEqual(nc.validateAgentPresentationAck(clone(presentationAckJson), 'test').presentation, 'background');
+    assertEqual(nc.validateAgents(clone(agentsJson))[1].provider, 'fake');
+    assertEqual(nc.validateAgents(clone(agentsJson))[0].provider, null, 'self entries carry no provider');
+    assertEqual(nc.validateTournament(clone(tournamentJson)).candidates[0].reviewRank, 'clean');
+    assertEqual(nc.validateTournament(clone(tournamentJson)).candidates[0].verificationPass, true);
+    assertEqual(nc.validateTournament(clone(tournamentJson)).candidates[1].reviewRank, null);
+    assertEqual(nc.validateTournamentStarted(clone(tournamentStartedJson)).candidates.length, 2);
+    assertEqual(nc.validateTournamentSummaries(clone(tournamentSummariesJson)).length, 2);
+    assertEqual(nc.validateTournamentDecision(clone(tournamentDecisionJson)).winner, 'child-0');
+    // v1 additive: a pre-provider daemon entry validates with provider null.
+    const legacyAgent = clone(agentsJson[1]);
+    delete legacyAgent.provider;
+    assertEqual(nc.validateAgents([legacyAgent])[0].provider, null);
     assertEqual(nc.validateMessagePage(clone(messagePageJson)).messages[0].parts[0].kind, 'text');
     assertEqual(nc.validateEventPage(clone(eventPageJson)).events[0].seq, 1);
     assertEqual(nc.validateSessionUsage(clone(sessionUsageJson)).tasks[0].taskId, 't1');
@@ -511,6 +575,22 @@ async function validatorRejects() {
       'expected "foreground" or "background"',
     );
     assertProtocol(
+      () => nc.validateAgents([{ ...clone(agentsJson[1]), provider: 7 }]),
+      'expected a string or null',
+    );
+    assertProtocol(
+      () =>
+        nc.validateTournament({
+          ...clone(tournamentJson),
+          candidates: [{ ...tournamentJson.candidates[0], cost_micro: '100' }],
+        }),
+      'expected a finite number',
+    );
+    assertProtocol(
+      () => nc.validateTournamentDecision({ tournament_id: 't', winner: 'c' }),
+      'missing required field rationale',
+    );
+    assertProtocol(
       () => nc.validateAgentPresentationAck({ child_id: 'c1', presentation: null, changed: true }, 'test'),
       'expected "foreground" or "background"',
     );
@@ -553,6 +633,12 @@ async function clientAccepts() {
       'POST /native/agents/c1/model': () => jsonResponse(controlAckJson),
       'POST /native/agents/c1/budget': () => jsonResponse(controlAckJson),
       'POST /native/session/7/agents/c1/presentation': () => jsonResponse(presentationAckJson),
+      'GET /native/session/7/tournaments': () => jsonResponse(tournamentSummariesJson),
+      'GET /native/session/7/tournament/t-1': () => jsonResponse(tournamentJson),
+      'POST /native/session/7/tournament': () => jsonResponse(tournamentStartedJson),
+      'POST /native/session/7/tournaments/t-1/decide': () => jsonResponse(tournamentDecisionJson),
+      'POST /native/session/7/tournaments/t-1/abort': () =>
+        jsonResponse({ ...clone(tournamentJson), state: 'aborted' }),
       'GET /native/messages': () => jsonResponse(messagePageJson),
       'GET /native/events': () => jsonResponse(eventPageJson),
       'GET /native/usage': () => jsonResponse(usageTotalsJson),
@@ -594,6 +680,14 @@ async function clientAccepts() {
       (await client.setAgentPresentation('7', 'c1', 'background')).presentation,
       'background',
     );
+    assertEqual((await client.tournaments('7'))[0].id, 't-1');
+    assertEqual((await client.tournamentState('7', 't-1')).candidates.length, 2);
+    assertEqual(
+      (await client.startTournament('7', { goal: 'pick', criteria: ['tests pass'], n: 2 })).state,
+      'open',
+    );
+    assertEqual((await client.decideTournament('7', 't-1')).winner, 'child-0');
+    assertEqual((await client.abortTournament('7', 't-1', 'smoke reason')).state, 'aborted');
     assertEqual((await client.messages('7', { before: 9, limit: 2 })).messages[0].id, 2);
     assertEqual((await client.events('7', { after: 7, limit: 3 })).events[0].seq, 1);
     assertEqual((await client.usage()).sessions, 1);
@@ -630,6 +724,15 @@ async function clientAccepts() {
     assertDeepEqual(findCall(calls, 'POST', '/native/agents/c1/budget').body, { max_tokens: 1000 });
     assertDeepEqual(findCall(calls, 'POST', '/native/session/7/agents/c1/presentation').body, {
       state: 'background',
+    });
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/tournament').body, {
+      goal: 'pick',
+      criteria: ['tests pass'],
+      n: 2,
+    });
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/tournaments/t-1/decide').body, {});
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/tournaments/t-1/abort').body, {
+      reason: 'smoke reason',
     });
     assertDeepEqual(findCall(calls, 'POST', '/native/evidence/41/retrieve').body, {
       selector: 'all',
@@ -1236,6 +1339,32 @@ async function childInspectionTests() {
     assertEqual(self.provider, null);
   });
 
+  await test('same model two providers: the catalog join is (provider, model), never model alone', () => {
+    const catalog = [
+      { provider: 'alpha', model: 'm', reasoning: true, thinking: false, tools: true },
+      { provider: 'beta', model: 'm', reasoning: false, thinking: true, tools: false },
+    ];
+    const frame = (agentId, provider) => ({
+      ...clone(agentsJson[1]),
+      agent_id: agentId,
+      provider,
+    });
+    const summaries = st.summarizeAgents([frame('a', 'alpha'), frame('b', 'beta')], catalog);
+    assertEqual(summaries[0].provider, 'alpha');
+    assertEqual(summaries[0].reasoning, true, 'alpha child keeps alpha reasoning');
+    assertEqual(summaries[0].thinking, false);
+    assertEqual(summaries[1].provider, 'beta');
+    assertEqual(summaries[1].reasoning, false, 'beta child must never inherit alpha metadata');
+    assertEqual(summaries[1].thinking, true);
+    // A provider-less entry never guesses metadata by model alone.
+    const bare = clone(agentsJson[1]);
+    delete bare.provider;
+    const [legacy] = st.summarizeAgents([bare], catalog);
+    assertEqual(legacy.provider, null);
+    assertEqual(legacy.reasoning, null);
+    assertEqual(legacy.thinking, null);
+  });
+
   await test('background presentation survives the summary and defaults to foreground', () => {
     const [background] = st.summarizeAgents([
       { ...clone(agentsJson[1]), presentation: 'background' },
@@ -1468,7 +1597,7 @@ async function cockpitTests() {
     const sections = cp.cockpitSections(view);
     assertDeepEqual(
       sections.map((section) => section.key),
-      ['acceptance', 'plan', 'children', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
+      ['acceptance', 'plan', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
     );
     const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
     assert(byKey.acceptance.present && byKey.acceptance.lines.some((line) => line.includes('build passes')));
@@ -1520,6 +1649,79 @@ async function cockpitTests() {
     assert(
       children.lines[1].includes('background (dimmed)'),
       JSON.stringify(children.lines),
+    );
+  });
+
+  await test('cockpit tournament block is state-gated: decide waits, abort is open-only', () => {
+    const candidate = (childId, state) => ({
+      childId,
+      state,
+      verification: state === 'done' ? 12 : null,
+      verificationPass: state === 'done' ? true : null,
+      reviewRank: state === 'done' ? 'clean' : null,
+      reviewer: null,
+      costMicro: 1,
+      wallMs: 2,
+    });
+    const native = (state, winner, candidates) => ({
+      id: 't-1',
+      state,
+      winner,
+      criteria: [{ id: 'c-1', spec: 'tests pass' }],
+      candidates,
+    });
+    const running = cp.tournamentViewOf(
+      native('open', null, [candidate('child-0', 'done'), candidate('child-1', 'running')]),
+    );
+    assertEqual(running.open, true);
+    assertEqual(running.canDecide, false, 'decide waits until every candidate settled');
+    const settled = cp.tournamentViewOf(
+      native('open', null, [candidate('child-0', 'done'), candidate('child-1', 'done')]),
+    );
+    assertEqual(settled.canDecide, true);
+    const decided = cp.tournamentViewOf(
+      native('decided', 'child-0', [candidate('child-0', 'done'), candidate('child-1', 'discarded')]),
+    );
+    assertEqual(decided.open, false);
+    assertEqual(decided.canDecide, false, 'a decided tournament exposes no controls');
+
+    // A tournament ALONE builds a cockpit and carries its section + actions.
+    const view = cp.buildCockpit({
+      task: null,
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+      tournament: running,
+    });
+    assert(view, 'a tournament alone must build a cockpit');
+    assert(view.tournament, 'the cockpit must carry the tournament block');
+    const section = cp.cockpitSections(view).find((entry) => entry.key === 'tournament');
+    assert(section.present, 'the tournament section is present');
+    assert(
+      section.lines.some((line) => line.includes('t-1') && line.includes('[open]')),
+      JSON.stringify(section.lines),
+    );
+    const decide = section.actions.find((action) => action.key === 'decide');
+    const abort = section.actions.find((action) => action.key === 'abort');
+    assertEqual(decide.enabled, false, 'decide action is disabled while running');
+    assertEqual(abort.enabled, true, 'abort action stays available while open');
+    // The decided view's gating survives the section projection.
+    const decidedView = cp.buildCockpit({
+      task: null,
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+      tournament: decided,
+    });
+    const decidedSection = cp.cockpitSections(decidedView).find(
+      (entry) => entry.key === 'tournament',
+    );
+    assertEqual(
+      decidedSection.actions.every((action) => action.enabled === false),
+      true,
+      'terminal tournaments expose only disabled controls',
     );
   });
 }
@@ -1629,6 +1831,7 @@ function webviewSnapshot(agents) {
     usage: null,
     cockpit: null,
     cockpitSections: [],
+    tournament: null,
     transcript: [],
     streamStatus: 'open',
     lastError: null,
@@ -1720,6 +1923,140 @@ async function presentationWebviewTests() {
   });
 }
 
+// ----------------------------------- tournament cockpit + reduced motion
+
+function tournamentCockpitSnapshot(tournament) {
+  const cockpit = cp.buildCockpit({
+    task: null,
+    agents: [],
+    verification: null,
+    usage: null,
+    taskVerification: null,
+    tournament,
+  });
+  const snapshot = webviewSnapshot([]);
+  snapshot.cockpit = cockpit;
+  snapshot.cockpitSections = cp.cockpitSections(cockpit);
+  snapshot.tournament = tournament;
+  return snapshot;
+}
+
+async function tournamentWebviewTests() {
+  await test('cockpit Decide/Abort are state-gated and post only when enabled', () => {
+    const candidate = (childId, state) => ({
+      childId,
+      state,
+      verification: null,
+      verificationPass: null,
+      reviewRank: null,
+      reviewer: null,
+      costMicro: 0,
+      wallMs: 0,
+    });
+    const wire = {
+      id: 't-1',
+      state: 'open',
+      winner: null,
+      criteria: [{ id: 'c-1', spec: 'tests pass' }],
+      candidates: [candidate('child-0', 'done'), candidate('child-1', 'running')],
+    };
+    const running = cp.tournamentViewOf(wire);
+    const first = runChatWebview(tournamentCockpitSnapshot(running));
+    const cockpit = first.dom.document.getElementById('cockpit');
+    const decide = findFake(
+      cockpit,
+      (node) => node.tagName === 'button' && node.textContent === 'Decide winner',
+    );
+    const abort = findFake(cockpit, (node) => node.tagName === 'button' && node.textContent === 'Abort');
+    assert(decide && abort, 'the tournament section must render Decide/Abort controls');
+    assertEqual(decide.disabled, true, 'decide is disabled until every candidate settles');
+    assertEqual(abort.disabled, false, 'abort is enabled while the tournament is open');
+    const before = first.posted.length;
+    decide.click();
+    assertEqual(first.posted.length, before, 'a disabled Decide must never post');
+    abort.click();
+    assertDeepEqual(first.posted[first.posted.length - 1], {
+      type: 'tournamentControl',
+      tournamentId: 't-1',
+      action: 'abort',
+    });
+
+    // Every candidate settled: decide enables and posts the exact control.
+    const settled = cp.tournamentViewOf({
+      ...wire,
+      candidates: [candidate('child-0', 'done'), candidate('child-1', 'done')],
+    });
+    const second = runChatWebview(tournamentCockpitSnapshot(settled));
+    const secondCockpit = second.dom.document.getElementById('cockpit');
+    const decideNow = findFake(
+      secondCockpit,
+      (node) => node.tagName === 'button' && node.textContent === 'Decide winner',
+    );
+    assertEqual(decideNow.disabled, false, 'decide enables once all candidates settle');
+    decideNow.click();
+    assertDeepEqual(second.posted[second.posted.length - 1], {
+      type: 'tournamentControl',
+      tournamentId: 't-1',
+      action: 'decide',
+    });
+
+    // A terminal tournament renders disabled controls only.
+    const decided = cp.tournamentViewOf({
+      ...wire,
+      state: 'decided',
+      winner: 'child-0',
+      candidates: [candidate('child-0', 'done'), candidate('child-1', 'discarded')],
+    });
+    const third = runChatWebview(tournamentCockpitSnapshot(decided));
+    const thirdCockpit = third.dom.document.getElementById('cockpit');
+    const buttons = [];
+    walkFake(thirdCockpit, (node) => {
+      if (node.tagName === 'button' && (node.textContent === 'Abort' || node.textContent === 'Decide winner')) {
+        buttons.push(node);
+      }
+    });
+    assertEqual(buttons.length, 2, 'terminal tournaments still render both controls');
+    assertEqual(
+      buttons.every((button) => button.disabled === true),
+      true,
+      'terminal tournament controls are all disabled',
+    );
+  });
+}
+
+async function reducedMotionTests() {
+  await test('prefers-reduced-motion disables every .pixel-* animation with static cues', () => {
+    const css = readFileSync(new URL('../media/chat.css', import.meta.url), 'utf8');
+    const match = /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{([\s\S]*?)\n\}/.exec(css);
+    assert(match, 'chat.css must carry a prefers-reduced-motion block');
+    const block = match[1];
+    const pixelClasses = [
+      'pixel',
+      'pixel-running',
+      'pixel-paused',
+      'pixel-waiting',
+      'pixel-blocked',
+      'pixel-done',
+      'pixel-failed',
+      'pixel-cancelled',
+    ];
+    for (const cls of pixelClasses) {
+      assert(
+        new RegExp(`\\.${cls}(?![\\w-])`).test(block),
+        `reduced-motion block must cover .${cls}`,
+      );
+    }
+    assert(/animation:\s*none/.test(block), 'reduced motion must disable animations');
+    assert(/transform:\s*none/.test(block), 'reduced motion must disable transforms');
+    for (const cls of pixelClasses.filter((entry) => entry !== 'pixel')) {
+      assert(
+        new RegExp(`\\.${cls}(?![\\w-])\\s*\\{[^}]*opacity:`).test(block),
+        `reduced motion must keep a static opacity cue for .${cls}`,
+      );
+    }
+  });
+}
+
 
 // ------------------------------------------- vendored webview packaging (P0)
 
@@ -1807,6 +2144,467 @@ async function packagedLayoutTests(dir) {
       verified === (manifest.vendored ?? []).length && verified > 0,
       `expected the full pinned closure, verified ${verified}`,
     );
+
+    // Additive Faktor overlay in the packaged layout: pinned by the overlay
+    // manifest, recorded in the staged build manifest, markers intact.
+    const packagedOverlayManifest = fileURLToPath(
+      new URL('../../../ui/kilo-v756-webview/dist/toolchain/overlay/overlay-manifest.json', import.meta.url),
+    );
+    assert(existsSync(packagedOverlayManifest), 'the overlay manifest must exist for packaged verification');
+    const overlayManifest = JSON.parse(readFileSync(packagedOverlayManifest, 'utf8'));
+    let overlayVerified = 0;
+    for (const file of overlayManifest.files ?? []) {
+      const packaged = join(webviewRoot, 'dist', 'overlay', ...file.path.split('/'));
+      assert(existsSync(packaged), `packaged overlay file missing: ${file.path}`);
+      const stat = statSync(packaged);
+      assert(
+        stat.size === file.size && sha256File(packaged) === file.sha256,
+        `packaged overlay file diverges: ${file.path}`,
+      );
+      overlayVerified += 1;
+    }
+    assert(
+      overlayVerified === (overlayManifest.files ?? []).length && overlayVerified > 0,
+      `expected both overlay files, verified ${overlayVerified}`,
+    );
+    const stagedManifestPath = join(webviewRoot, 'dist', 'build-manifest.json');
+    assert(existsSync(stagedManifestPath), 'the staged build manifest must ship with the bundle');
+    const stagedManifest = JSON.parse(readFileSync(stagedManifestPath, 'utf8'));
+    assertEqual(
+      (stagedManifest.faktorOverlay?.files ?? []).length,
+      (overlayManifest.files ?? []).length,
+      'the staged manifest must record every merged overlay hash',
+    );
+    assertDeepEqual(
+      stagedManifest.vendored,
+      manifest.vendored,
+      'the packaged pinned vendored list must stay byte-identical',
+    );
+    const panel = readFileSync(
+      join(webviewRoot, 'dist', 'overlay', 'faktor-companion.js'),
+      'utf8',
+    );
+    for (const marker of [
+      'faktorTaskState',
+      'faktorAgents',
+      'faktorCockpit',
+      'faktorTournament',
+      'faktorEvidence',
+      'faktorBoardState',
+      'faktorAgentAction',
+      'faktorTournamentAction',
+      'faktorEvidenceExpand',
+      'faktorBoardAction',
+    ]) {
+      assert(panel.includes(marker), `packaged companion panel must consume/host ${marker}`);
+    }
+  });
+}
+
+// ------------------------------------------ Faktor companion overlay build
+
+const OVERLAY_DIR = fileURLToPath(
+  new URL('../../../ui/kilo-v756-webview/dist/toolchain/overlay', import.meta.url),
+);
+const OVERLAY_MANIFEST_PATH = join(OVERLAY_DIR, 'overlay-manifest.json');
+const WEBVIEW_BUILD_MANIFEST = fileURLToPath(
+  new URL('../../../ui/kilo-v756-webview/dist/build-manifest.json', import.meta.url),
+);
+const UPSTREAM_MANIFEST = fileURLToPath(new URL('../../../ui/upstream.json', import.meta.url));
+
+async function overlayBuildTests() {
+  await test('overlay manifest verifies clean and refuses tampered/extra files', () => {
+    const clean = verifyOverlay();
+    assert(clean.ok, `clean overlay must verify: ${clean.errors.join('; ')}`);
+    assertEqual(clean.checked, 2, 'both panel files must be pinned');
+    const dir = mkdtempSync(join(tmpdir(), 'faktor-overlay-tamper-'));
+    try {
+      cpSync(OVERLAY_DIR, dir, { recursive: true });
+      writeFileSync(join(dir, 'faktor-companion.js'), '// tampered panel');
+      const tampered = verifyOverlay(dir);
+      assert(!tampered.ok, 'tampering must fail the overlay verification');
+      assert(
+        tampered.errors.some((error) => error.includes('hash mismatch')),
+        `expected a hash mismatch: ${tampered.errors.join('; ')}`,
+      );
+      writeFileSync(join(dir, 'intruder.js'), '// extra');
+      const extra = verifyOverlay(dir);
+      assert(
+        extra.errors.some((error) => error.includes('unexpected overlay file: intruder.js')),
+        `expected an unexpected-file error: ${extra.errors.join('; ')}`,
+      );
+      rmSync(join(dir, 'intruder.js'));
+      rmSync(join(dir, 'faktor-companion.js'));
+      const missing = verifyOverlay(dir);
+      assert(!missing.ok && missing.errors.some((error) => error.includes('missing')), 'missing file must fail');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test('staging merges the companion panel and keeps upstream bytes pinned', async () => {
+    const manifestBefore = sha256File(WEBVIEW_BUILD_MANIFEST);
+    const pinned = JSON.parse(readFileSync(WEBVIEW_BUILD_MANIFEST, 'utf8'));
+    const overlay = JSON.parse(readFileSync(OVERLAY_MANIFEST_PATH, 'utf8'));
+    const tmp = mkdtempSync(join(tmpdir(), 'faktor-overlay-stage-'));
+    try {
+      const stats = await stageBundle(tmp);
+      assertEqual(stats.files, pinned.vendored.length, 'every pinned file must be staged');
+      assertEqual(stats.overlayFiles, overlay.files.length, 'every overlay file must be merged');
+      let verified = 0;
+      for (const file of pinned.vendored) {
+        const staged = join(tmp, ...file.path.split('/'));
+        assert(existsSync(staged), `staged pinned file missing: ${file.path}`);
+        const stat = statSync(staged);
+        assert(
+          stat.size === file.size && sha256File(staged) === file.sha256,
+          `staged upstream file diverges byte-for-byte: ${file.path}`,
+        );
+        verified += 1;
+      }
+      assert(verified > 0, 'the pinned closure must not be empty');
+      for (const file of overlay.files) {
+        const staged = join(tmp, 'dist', 'overlay', ...file.path.split('/'));
+        assert(existsSync(staged), `staged overlay file missing: ${file.path}`);
+        const stat = statSync(staged);
+        assert(
+          stat.size === file.size && sha256File(staged) === file.sha256,
+          `staged overlay file diverges: ${file.path}`,
+        );
+      }
+      const stagedManifest = JSON.parse(readFileSync(join(tmp, 'dist', 'build-manifest.json'), 'utf8'));
+      assertEqual(stagedManifest.faktorOverlay.files.length, overlay.files.length);
+      assertDeepEqual(
+        stagedManifest.vendored,
+        pinned.vendored,
+        'the staged manifest must keep the pinned vendored list byte-identical',
+      );
+      for (const entry of stagedManifest.faktorOverlay.files) {
+        assert(
+          entry.path.startsWith('dist/overlay/'),
+          `merged overlay must land under dist/overlay: ${entry.path}`,
+        );
+      }
+      assertEqual(
+        sha256File(WEBVIEW_BUILD_MANIFEST),
+        manifestBefore,
+        'staging must never mutate the pinned source manifest',
+      );
+      const upstream = JSON.parse(readFileSync(UPSTREAM_MANIFEST, 'utf8'));
+      const upstreamPaths = Object.keys(upstream.file_hashes ?? {});
+      assert(
+        upstreamPaths.every((path) => !path.includes('overlay/faktor-companion')),
+        'the overlay must never enter the upstream pin',
+      );
+      const panel = readFileSync(join(OVERLAY_DIR, 'faktor-companion.js'), 'utf8');
+      for (const marker of [
+        'faktorTaskState',
+        'faktorAgents',
+        'faktorCockpit',
+        'faktorTournament',
+        'faktorEvidence',
+        'faktorBoardState',
+        'faktor-companion',
+      ]) {
+        assert(panel.includes(marker), `companion panel must consume/host ${marker}`);
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+}
+
+// --------------------------------------- companion panel (vm + fake DOM)
+
+function makePanelDom() {
+  function makeNode(tagName) {
+    const node = {
+      tagName,
+      id: '',
+      className: '',
+      textContent: '',
+      value: '',
+      rows: 0,
+      maxLength: 0,
+      type: '',
+      placeholder: '',
+      disabled: false,
+      style: {},
+      children: [],
+      parentNode: null,
+      attributes: {},
+      listeners: {},
+    };
+    node.appendChild = (child) => {
+      node.children.push(child);
+      child.parentNode = node;
+      return child;
+    };
+    node.removeChild = (child) => {
+      const index = node.children.indexOf(child);
+      if (index >= 0) node.children.splice(index, 1);
+      return child;
+    };
+    node.insertBefore = (child, reference) => {
+      const index = node.children.indexOf(reference);
+      if (index < 0) node.children.push(child);
+      else node.children.splice(index, 0, child);
+      child.parentNode = node;
+      return child;
+    };
+    node.setAttribute = (key, value) => {
+      node.attributes[key] = String(value);
+    };
+    node.getAttribute = (key) => (key in node.attributes ? node.attributes[key] : null);
+    node.addEventListener = (type, callback) => {
+      if (!node.listeners[type]) node.listeners[type] = [];
+      node.listeners[type].push(callback);
+    };
+    node.dispatch = (type, event) => {
+      for (const callback of node.listeners[type] || []) {
+        callback(event || { preventDefault() {} });
+      }
+    };
+    node.click = () => node.dispatch('click', {});
+    Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
+    return node;
+  }
+  function walk(root, visit) {
+    visit(root);
+    for (const child of root.children || []) walk(child, visit);
+  }
+  const root = makeNode('div');
+  root.id = 'root';
+  const body = makeNode('body');
+  body.appendChild(root);
+  const document = {
+    readyState: 'complete',
+    body,
+    getElementById(id) {
+      let found = null;
+      walk(body, (node) => {
+        if (found === null && node.id === id) found = node;
+      });
+      return found;
+    },
+    createElement: makeNode,
+    createElementNS: (_namespace, tagName) => makeNode(tagName),
+    addEventListener() {},
+    querySelectorAll: () => [],
+  };
+  return { document, body, walk };
+}
+
+function runCompanionPanel() {
+  const source = readFileSync(join(OVERLAY_DIR, 'faktor-companion.js'), 'utf8');
+  const posted = [];
+  const dom = makePanelDom();
+  const sandbox = {
+    document: dom.document,
+    window: {
+      addEventListener(type, callback) {
+        if (type === 'message') sandbox._message = callback;
+      },
+      __faktorVsCodeApi: () => ({ postMessage: (message) => posted.push(message) }),
+    },
+    console,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  const companion = sandbox.window.__faktorCompanion;
+  assert(companion, 'the panel must expose __faktorCompanion for the webview host');
+  assert(sandbox._message, 'the panel must register a window message listener');
+  const panel = dom.document.getElementById('faktor-companion');
+  assert(panel, 'the panel must mount as #faktor-companion next to #root');
+  return { posted, dom, panel, companion };
+}
+
+function findAll(root, predicate, walk) {
+  const out = [];
+  walk(root, (node) => {
+    if (predicate(node)) out.push(node);
+  });
+  return out;
+}
+
+async function companionPanelTests() {
+  await test('companion panel renders Faktor frames and posts state-gated actions', () => {
+    const { posted, dom, panel, companion } = runCompanionPanel();
+    const { walk } = dom;
+
+    companion.handle({
+      type: 'faktorTaskState',
+      present: true,
+      goal: 'ship the cockpit',
+      state: 'running',
+      phase: 'implementation',
+      acceptanceCriteria: ['build passes'],
+      milestones: { completed: [], open: ['main'] },
+      tests: { run: [], failed: ['cargo test'] },
+      blockers: ['waiting on analysis'],
+      verification: { status: 'pending', criteriaPassed: 0, criteriaTotal: 1, checksFailed: 0, owed: 1, failedChecks: 1 },
+      budget: null,
+    });
+    const taskText = findAll(panel, (node) => node.textContent === 'ship the cockpit', walk);
+    assert(taskText.length === 1, 'the task goal must render');
+    assert(
+      findAll(panel, (node) => node.textContent === '! waiting on analysis', walk).length === 1,
+      'blockers must render',
+    );
+
+    companion.handle({
+      type: 'faktorAgents',
+      agents: [
+        {
+          agentId: 'c1',
+          kind: 'child',
+          state: 'Failed',
+          goal: 'implement main',
+          model: 'm',
+          provider: 'p',
+          presentation: 'background',
+          blockers: ['dependency x'],
+          pixel: {
+            childId: 'c1',
+            state: 'failed',
+            animation: 'pixel-failed',
+            avatar: { pixels: new Array(25).fill(1), color: 'red', accent: 'pink', hash: 1, version: 1 },
+          },
+        },
+        {
+          agentId: 'c2',
+          kind: 'child',
+          state: 'Running',
+          goal: 'verify',
+          presentation: 'foreground',
+        },
+      ],
+    });
+    const cards = findAll(panel, (node) => node.tagName === 'article' && node.className === 'faktor-agent', walk);
+    assertEqual(cards.length, 2, 'both agent cards must render');
+    assertEqual(cards[0].getAttribute('data-presentation'), 'background');
+    assertEqual(
+      findAll(cards[0], (node) => String(node.className).includes('faktor-pixel-bit'), walk).length,
+      25,
+      'the 5x5 pixel identity must render',
+    );
+    const retry = findAll(cards[0], (node) => node.tagName === 'button' && node.textContent === 'Retry', walk)[0];
+    assert(retry, 'a failed child must offer Retry');
+    retry.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'faktorAgentAction',
+      agentId: 'c1',
+      action: 'retry',
+    });
+    const pause = findAll(cards[1], (node) => node.tagName === 'button' && node.textContent === 'Pause', walk)[0];
+    assert(pause, 'a running child must offer Pause');
+    pause.click();
+    assertEqual(posted[posted.length - 1].action, 'pause');
+    const toggle = findAll(
+      cards[0],
+      (node) => node.tagName === 'button' && node.textContent === 'Foreground',
+      walk,
+    )[0];
+    toggle.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'faktorAgentAction',
+      agentId: 'c1',
+      action: 'presentation',
+      state: 'foreground',
+    });
+
+    // Tournament: Decide gates on canDecide; Abort gates on open.
+    const tournament = (canDecide, open, id = 't-1') => ({
+      type: 'faktorTournament',
+      present: true,
+      tournament: { id, state: open ? 'open' : 'decided', open, canDecide, winner: null, criteria: ['tests pass'], candidates: [] },
+    });
+    companion.handle(tournament(false, true));
+    let decide = findAll(
+      panel,
+      (node) => node.tagName === 'button' && node.textContent === 'Decide winner',
+      walk,
+    )[0];
+    assert(decide && decide.disabled === true, 'decide must be disabled until every candidate settled');
+    companion.handle(tournament(true, true));
+    decide = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'Decide winner', walk)[0];
+    assert(decide && decide.disabled === false, 'decide must enable when canDecide');
+    decide.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'faktorTournamentAction',
+      tournamentId: 't-1',
+      action: 'decide',
+    });
+    companion.handle(tournament(true, false));
+    const abort = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'Abort', walk)[0];
+    assert(abort && abort.disabled === true, 'abort must be disabled on a terminal tournament');
+
+    // Evidence: refs open an expansion; the expansion renders as text.
+    companion.handle({ type: 'faktorEvidence', mode: 'refs', refs: [{ id: 41, label: 'evidence:41' }] });
+    const ref = findAll(panel, (node) => node.tagName === 'button' && node.textContent === 'evidence:41', walk)[0];
+    assert(ref, 'an evidence ref must be a button');
+    ref.click();
+    assertDeepEqual(posted[posted.length - 1], { type: 'faktorEvidenceExpand', evidenceId: 41 });
+    companion.handle({
+      type: 'faktorEvidence',
+      mode: 'expanded',
+      evidence: { id: 41, text: 'artifact text', truncated: false },
+    });
+    const pre = findAll(panel, (node) => node.tagName === 'pre', walk)[0];
+    assert(pre && pre.textContent === 'artifact text', 'the expanded artifact must render as text');
+
+    // Board: explicit unavailable, then posts + composer.
+    companion.handle({
+      type: 'faktorBoardState',
+      available: false,
+      source: 'none',
+      revision: null,
+      unread: null,
+      posts: [],
+      reason: 'no board route',
+    });
+    assert(
+      findAll(panel, (node) => node.textContent === 'no board route', walk).length === 1,
+      'an unavailable board must render its explicit reason',
+    );
+    companion.handle({
+      type: 'faktorBoardState',
+      available: true,
+      source: 'transcript',
+      revision: 3,
+      unread: 2,
+      posts: [{ id: 'p1', author: 'parent', subject: 'handoff', body: 'ready', refs: [] }],
+      reason: null,
+    });
+    assert(
+      findAll(panel, (node) => node.textContent === '2 unread', walk).length === 1,
+      'unread count must render',
+    );
+    const subject = findAll(
+      panel,
+      (node) => node.tagName === 'input' && node.getAttribute('aria-label') === 'board subject',
+      walk,
+    )[0];
+    const body = findAll(
+      panel,
+      (node) => node.tagName === 'textarea' && node.getAttribute('aria-label') === 'board body',
+      walk,
+    )[0];
+    assert(subject && body, 'the board composer must render when available');
+    subject.value = 'status';
+    body.value = 'all green';
+    const postButton = findAll(
+      panel,
+      (node) => node.tagName === 'button' && node.textContent === 'Post',
+      walk,
+    )[0];
+    postButton.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'faktorBoardAction',
+      action: 'post',
+      subject: 'status',
+      body: 'all green',
+    });
   });
 }
 
@@ -1828,6 +2626,10 @@ async function main() {
   await pixelAgentTests();
   await cockpitTests();
   await presentationWebviewTests();
+  await tournamentWebviewTests();
+  await reducedMotionTests();
+  await overlayBuildTests();
+  await companionPanelTests();
   await vendoredResolutionTests();
   if (packagedDir !== null && packagedDir !== undefined) {
     await packagedLayoutTests(packagedDir);

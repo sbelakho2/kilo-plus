@@ -9,8 +9,10 @@ import {
   bridgeCommandToHostMessage,
   buildVendoredWebviewHtml,
   connectionStateMessage,
+  faktorEvidenceExpandedMessage,
   ingestWebviewMessage,
   locateVendoredBundle,
+  mapKiloFiles,
   messageFromEntry,
   messagesLoadedMessage,
   nativeEventToWebviewMessages,
@@ -67,6 +69,10 @@ function makeSnapshot(overrides = {}) {
     task: null,
     verification: null,
     usage: null,
+    cockpit: null,
+    cockpitSections: [],
+    tournament: null,
+    board: null,
     transcript: [],
     streamStatus: 'open',
     lastError: null,
@@ -109,6 +115,52 @@ export const bridgeTests = [
       if (noLimit.limit !== BRIDGE_LIMITS.defaultMessagesLimit || noLimit.mode !== 'replace') {
         throw new Error('loadMessages defaults wrong');
       }
+      // Tournament decide/abort ride the same bridge (Faktor companion
+      // vocabulary): decide takes no operator input, abort may carry a
+      // bounded reason, and both map onto the host tournament control.
+      const decide = ingestWebviewMessage({
+        type: 'faktorTournamentAction',
+        tournamentId: 't-1',
+        action: 'decide',
+      });
+      if (decide.kind !== 'tournamentDecide' || decide.tournamentId !== 't-1') {
+        throw new Error(`tournament decide mapped wrong: ${JSON.stringify(decide)}`);
+      }
+      const decideHost = bridgeCommandToHostMessage(decide);
+      if (
+        decideHost === null ||
+        decideHost.type !== 'tournamentControl' ||
+        decideHost.action !== 'decide' ||
+        decideHost.tournamentId !== 't-1'
+      ) {
+        throw new Error(`tournament decide host mapping wrong: ${JSON.stringify(decideHost)}`);
+      }
+      const abortTournament = ingestWebviewMessage({
+        type: 'faktorTournamentAction',
+        tournamentId: 't-1',
+        action: 'abort',
+        reason: 'operator abort',
+      });
+      if (abortTournament.kind !== 'tournamentAbort' || abortTournament.reason !== 'operator abort') {
+        throw new Error(`tournament abort mapped wrong: ${JSON.stringify(abortTournament)}`);
+      }
+      const abortHost = bridgeCommandToHostMessage(abortTournament);
+      if (
+        abortHost === null ||
+        abortHost.type !== 'tournamentControl' ||
+        abortHost.action !== 'abort' ||
+        abortHost.reason !== 'operator abort'
+      ) {
+        throw new Error(`tournament abort host mapping wrong: ${JSON.stringify(abortHost)}`);
+      }
+      const bareAbort = ingestWebviewMessage({
+        type: 'faktorTournamentAction',
+        tournamentId: 't-1',
+        action: 'abort',
+      });
+      if (bareAbort.kind !== 'tournamentAbort' || bareAbort.reason !== null) {
+        throw new Error('an absent abort reason must stay null');
+      }
     },
   },
   {
@@ -124,10 +176,57 @@ export const bridgeTests = [
       assertDrop(ingestWebviewMessage({ type: 'sendMessage', text: '   ' }), 'non-empty string', 'blank text');
       assertDrop(ingestWebviewMessage({ type: 'sendMessage', text: 42 }), 'non-empty string', 'non-string text');
       assertDrop(ingestWebviewMessage({ type: 'abort' }), 'abort.sessionID', 'missing abort session');
+      // Malformed attachment payloads are dropped; well-formed ones map to
+      // bounded references (never inline bytes) on the command.
       assertDrop(
-        ingestWebviewMessage({ type: 'sendMessage', text: 'hi', files: [{ mime: 'text/plain', url: 'data:,' }] }),
-        'file attachments',
-        'attachments refused',
+        ingestWebviewMessage({ type: 'sendMessage', text: 'hi', files: 'nope' }),
+        'files must be an array',
+        'non-array files',
+      );
+      const attached = ingestWebviewMessage({
+        type: 'sendMessage',
+        text: 'hi',
+        files: [{ mime: 'text/plain', url: 'data:,' }],
+      });
+      if (attached.kind !== 'sendMessage' || attached.attachments.length !== 1) {
+        throw new Error(`well-formed attachment must map to a bounded ref: ${JSON.stringify(attached)}`);
+      }
+      if (!attached.attachments[0].ref.startsWith('faktor-attachment:sha256:')) {
+        throw new Error(`attachment ref must be content-addressed: ${attached.attachments[0].ref}`);
+      }
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorTournamentAction', action: 'decide' }),
+        'tournamentId',
+        'tournament without id',
+      );
+      assertDrop(
+        ingestWebviewMessage({
+          type: 'faktorTournamentAction',
+          tournamentId: 't-1',
+          action: 'delete',
+        }),
+        'must be "decide" or "abort"',
+        'unknown tournament action',
+      );
+      assertDrop(
+        ingestWebviewMessage({
+          type: 'faktorTournamentAction',
+          tournamentId: 't-1',
+          action: 'decide',
+          reason: 'not allowed',
+        }),
+        'decide takes no reason',
+        'decide with reason',
+      );
+      assertDrop(
+        ingestWebviewMessage({
+          type: 'faktorTournamentAction',
+          tournamentId: 't-1',
+          action: 'abort',
+          reason: 'x'.repeat(513),
+        }),
+        'reason exceeds',
+        'oversized abort reason',
       );
     },
   },
@@ -161,7 +260,17 @@ export const bridgeTests = [
     fn: () => {
       const cases = [
         [{ kind: 'ready' }, { type: 'ready' }],
-        [{ kind: 'sendMessage', text: 'go', sessionId: null }, { type: 'sendGoal', goal: 'go' }],
+        [
+          {
+            kind: 'sendMessage',
+            text: 'go',
+            sessionId: null,
+            files: [],
+            attachments: [],
+            refusedAttachments: [],
+          },
+          { type: 'sendGoal', goal: 'go' },
+        ],
         [{ kind: 'abort', sessionId: '7' }, { type: 'cancelRun' }],
         [{ kind: 'createSession' }, { type: 'refresh' }],
         [{ kind: 'loadSessions' }, { type: 'refresh' }],
@@ -206,11 +315,35 @@ export const bridgeTests = [
         testsFailed: [],
         changedFiles: [],
         budget: null,
+        acceptanceCriteria: [],
+        plan: [],
+        blockers: [],
+        evidenceRefs: [],
+        phase: null,
+        progress: null,
       };
       const messages = snapshotToWebviewMessages(makeSnapshot({ transcript: [entry], task }));
       const types = messages.map((message) => message.type);
-      if (types.join(',') !== 'connectionState,sessionsLoaded,sessionStatus,messagesLoaded,todoUpdated') {
-        throw new Error(`unexpected message order: ${types.join(',')}`);
+      // The frozen Kilo prefix is byte-identical and order-stable; the
+      // additive Faktor panel tail is appended after it.
+      const frozen = 'connectionState,sessionsLoaded,sessionStatus,messagesLoaded,todoUpdated';
+      if (types.slice(0, 5).join(',') !== frozen) {
+        throw new Error(`frozen message order changed: ${types.join(',')}`);
+      }
+      const additive =
+        'faktorTaskState,faktorAgents,faktorCockpit,faktorTournament,faktorEvidence,faktorBoardState';
+      if (types.slice(5).join(',') !== additive) {
+        throw new Error(`additive Faktor tail wrong: ${types.join(',')}`);
+      }
+      const taskState = messages[5];
+      if (taskState.present !== true || taskState.goal !== 'ship it') {
+        throw new Error(`faktorTaskState payload wrong: ${JSON.stringify(taskState)}`);
+      }
+      if (messages[8].present !== false || messages[8].tournament !== null) {
+        throw new Error('an absent tournament must be an explicit empty frame');
+      }
+      if (messages[10].available !== false || !String(messages[10].reason).includes('board')) {
+        throw new Error('an absent board must be an explicit unavailable frame');
       }
       const loaded = messages[3];
       if (loaded.sessionID !== '7' || loaded.messages.length !== 1) {
@@ -230,6 +363,441 @@ export const bridgeTests = [
       const errored = snapshotToWebviewMessages(makeSnapshot({ daemon: "error", daemonDetail: "boom", lastError: "bad" }));
       if (errored[0].state !== 'error' || errored[0].error !== 'boom') {
         throw new Error('daemon error mapping wrong');
+      }
+    },
+  },
+  {
+    label: 'bridge accepts Faktor panel actions and maps them to the host vocabulary',
+    fn: () => {
+      const retry = ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'retry' });
+      if (retry.kind !== 'faktorAgentAction' || retry.action !== 'retry' || retry.state !== null) {
+        throw new Error(`agent retry mapped wrong: ${JSON.stringify(retry)}`);
+      }
+      const retryHost = bridgeCommandToHostMessage(retry);
+      if (JSON.stringify(retryHost) !== JSON.stringify({ type: 'agentControl', agentId: 'c1', action: 'retry' })) {
+        throw new Error(`agent retry host mapping wrong: ${JSON.stringify(retryHost)}`);
+      }
+      const presentation = ingestWebviewMessage({
+        type: 'faktorAgentAction',
+        agentId: 'c1',
+        action: 'presentation',
+        state: 'background',
+      });
+      if (presentation.kind !== 'faktorAgentAction' || presentation.state !== 'background') {
+        throw new Error(`presentation mapped wrong: ${JSON.stringify(presentation)}`);
+      }
+      const steer = ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer', text: 'focus' });
+      if (steer.kind !== 'faktorAgentAction') throw new Error('steer not accepted');
+      if (ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'model' }).kind !== 'faktorAgentAction') {
+        throw new Error('model action requires no inline value (the host prompts)');
+      }
+      if (
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'budget', maxTokens: 1000 }).kind !==
+        'faktorAgentAction'
+      ) {
+        throw new Error('budget action not accepted');
+      }
+
+      const evidence = ingestWebviewMessage({ type: 'faktorEvidenceExpand', evidenceId: 41 });
+      if (evidence.kind !== 'faktorEvidenceExpand' || evidence.evidenceId !== 41) {
+        throw new Error(`evidence expand mapped wrong: ${JSON.stringify(evidence)}`);
+      }
+      const evidenceHost = bridgeCommandToHostMessage(evidence);
+      if (JSON.stringify(evidenceHost) !== JSON.stringify({ type: 'retrieveEvidence', evidenceId: 41 })) {
+        throw new Error(`evidence host mapping wrong: ${JSON.stringify(evidenceHost)}`);
+      }
+      const expanded = faktorEvidenceExpandedMessage('7', 41, 'hello', false);
+      if (expanded.mode !== 'expanded' || expanded.evidence.id !== 41 || expanded.evidence.text !== 'hello') {
+        throw new Error(`expanded evidence frame wrong: ${JSON.stringify(expanded)}`);
+      }
+
+      const read = ingestWebviewMessage({ type: 'faktorBoardAction', action: 'read', since: 3, limit: 10 });
+      if (read.kind !== 'faktorBoardAction' || read.limit !== 10 || read.since !== 3) {
+        throw new Error(`board read mapped wrong: ${JSON.stringify(read)}`);
+      }
+      if (JSON.stringify(bridgeCommandToHostMessage(read)) !== JSON.stringify({ type: 'boardRead', since: 3, limit: 10 })) {
+        throw new Error('board read host mapping wrong');
+      }
+      const post = ingestWebviewMessage({
+        type: 'faktorBoardAction',
+        action: 'post',
+        subject: 's',
+        body: 'b',
+        refs: ['evidence:41'],
+      });
+      if (post.kind !== 'faktorBoardAction' || post.subject !== 's') {
+        throw new Error(`board post mapped wrong: ${JSON.stringify(post)}`);
+      }
+      if (
+        JSON.stringify(bridgeCommandToHostMessage(post)) !==
+        JSON.stringify({ type: 'boardPost', subject: 's', body: 'b', refs: ['evidence:41'] })
+      ) {
+        throw new Error('board post host mapping wrong');
+      }
+    },
+  },
+  {
+    label: 'bridge drops hostile Faktor panel actions with reasons',
+    fn: () => {
+      assertDrop(ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1' }), 'action must be one', 'missing action');
+      assertDrop(ingestWebviewMessage({ type: 'faktorAgentAction', action: 'retry' }), 'agentId', 'missing agent id');
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'presentation', state: 'hidden' }),
+        'foreground',
+        'bad presentation state',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer' }),
+        'non-empty string for steer',
+        'steer without text',
+      );
+      assertDrop(
+        ingestWebviewMessage({
+          type: 'faktorAgentAction',
+          agentId: 'c1',
+          action: 'steer',
+          text: 'x'.repeat(BRIDGE_LIMITS.maxSteerChars + 1),
+        }),
+        'character bound',
+        'oversized steer',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'retry', state: 'background' }),
+        'not valid for action',
+        'state smuggled onto a non-presentation action',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'budget', maxTokens: 0 }),
+        'positive integer',
+        'zero budget',
+      );
+      assertDrop(ingestWebviewMessage({ type: 'faktorEvidenceExpand' }), 'positive integer', 'missing evidence id');
+      assertDrop(ingestWebviewMessage({ type: 'faktorEvidenceExpand', evidenceId: 0 }), 'positive integer', 'zero evidence id');
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorEvidenceExpand', evidenceId: 1.5 }),
+        'positive integer',
+        'fractional evidence id',
+      );
+      assertDrop(ingestWebviewMessage({ type: 'faktorBoardAction', action: 'delete' }), 'read', 'unknown board action');
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorBoardAction', action: 'read', limit: 0 }),
+        '1..',
+        'zero board limit',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorBoardAction', action: 'read', since: -1 }),
+        'non-negative',
+        'negative board cursor',
+      );
+      assertDrop(ingestWebviewMessage({ type: 'faktorBoardAction', action: 'post' }), 'subject', 'post without subject');
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorBoardAction', action: 'post', subject: 's', refs: 'nope' }),
+        'array of strings',
+        'non-array refs',
+      );
+      const tooManyRefs = [];
+      for (let i = 0; i < BRIDGE_LIMITS.maxBoardRefs + 1; i += 1) tooManyRefs.push(`ref-${i}`);
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorBoardAction', action: 'post', subject: 's', refs: tooManyRefs }),
+        'exceeds',
+        'ref count bound',
+      );
+      assertDrop(
+        ingestWebviewMessage({
+          type: 'faktorBoardAction',
+          action: 'post',
+          subject: 's',
+          refs: ['r'.repeat(BRIDGE_LIMITS.maxBoardRefBytes + 1)],
+        }),
+        'bytes',
+        'oversized ref',
+      );
+    },
+  },
+  {
+    label: 'bridge maps Kilo file attachments to bounded paths and binary references',
+    fn: () => {
+      const png = `data:image/png;base64,${Buffer.from([137, 80, 78, 71]).toString('base64')}`;
+      const mapping = mapKiloFiles(
+        [
+          { mime: 'text/plain', url: 'file:///w/src/a.ts' },
+          { url: 'src/b.ts' },
+          { url: 'file:///w/src/c.ts', source: { path: '/w/src/c.ts' } },
+          { url: png, mime: 'image/png', filename: 'shot.png' },
+          null,
+          { url: 'https://evil.example/x' },
+          { url: '/etc/passwd' },
+          { url: '../../outside' },
+          { url: `src/${'x'.repeat(4096)}.ts` },
+          { url: 'src/ctrl\u0001.ts' },
+        ],
+        '/w',
+      );
+      if (JSON.stringify(mapping.files) !== JSON.stringify(['src/a.ts', 'src/b.ts', 'src/c.ts'])) {
+        throw new Error(`path mapping wrong: ${JSON.stringify(mapping.files)}`);
+      }
+      if (
+        mapping.attachments.length !== 1 ||
+        !mapping.attachments[0].ref.startsWith('faktor-attachment:sha256:') ||
+        mapping.attachments[0].mime !== 'image/png' ||
+        mapping.attachments[0].filename !== 'shot.png' ||
+        mapping.attachments[0].bytes !== 4
+      ) {
+        throw new Error(`binary reference wrong: ${JSON.stringify(mapping.attachments)}`);
+      }
+      if (mapping.refused.length !== 6) {
+        throw new Error(`mixed list refusals wrong: ${JSON.stringify(mapping.refused)}`);
+      }
+      for (const refusal of mapping.refused) {
+        if (typeof refusal.reason !== 'string' || refusal.reason.length === 0) {
+          throw new Error(`a refusal must carry a reason: ${JSON.stringify(refusal)}`);
+        }
+      }
+
+      // The literal required mapping: sendGoal with the bounded file paths.
+      const command = ingestWebviewMessage(
+        { type: 'sendMessage', text: 'goal', files: [{ url: 'file:///w/src/a.ts' }] },
+        { workspaceDirectory: '/w' },
+      );
+      const host = bridgeCommandToHostMessage(command);
+      if (JSON.stringify(host) !== JSON.stringify({ type: 'sendGoal', goal: 'goal', files: ['src/a.ts'] })) {
+        throw new Error(`sendGoal mapping wrong: ${JSON.stringify(host)}`);
+      }
+
+      // A data URL only ever travels as a content-addressed reference: the
+      // prompt text is untouched and no payload reaches `files`.
+      const dataCommand = ingestWebviewMessage(
+        { type: 'sendMessage', text: 'see image', files: [{ url: png, mime: 'image/png' }] },
+        { workspaceDirectory: '/w' },
+      );
+      const dataHost = bridgeCommandToHostMessage(dataCommand);
+      if (dataHost.files !== undefined || dataHost.attachments.length !== 1) {
+        throw new Error(`data URL mapping wrong: ${JSON.stringify(dataHost)}`);
+      }
+      if (String(dataHost.goal).includes('base64')) {
+        throw new Error('binary bytes must never enter the prompt text');
+      }
+
+      const many = [];
+      for (let i = 0; i < BRIDGE_LIMITS.maxFilesPerPrompt + 3; i += 1) many.push({ url: `src/f${i}.ts` });
+      const capped = mapKiloFiles(many, '/w');
+      if (capped.files.length !== BRIDGE_LIMITS.maxFilesPerPrompt || capped.refused.length !== 3) {
+        throw new Error(`file count bound wrong: ${capped.files.length}/${capped.refused.length}`);
+      }
+
+      const noWorkspace = mapKiloFiles([{ url: '/w/a.ts' }, { url: 'rel/a.ts' }], null);
+      if (JSON.stringify(noWorkspace.files) !== JSON.stringify(['rel/a.ts'])) {
+        throw new Error(`workspace-relative mapping wrong: ${JSON.stringify(noWorkspace)}`);
+      }
+      if (!noWorkspace.refused[0].reason.includes('workspace')) {
+        throw new Error('an absolute path without a workspace root must be refused');
+      }
+
+      const badBase64 = mapKiloFiles([{ url: 'data:image/png;base64,@@@@' }], '/w');
+      if (badBase64.refused.length !== 1 || !badBase64.refused[0].reason.includes('base64')) {
+        throw new Error(`malformed base64 must be refused: ${JSON.stringify(badBase64)}`);
+      }
+    },
+  },
+  {
+    label: 'vendored shell mounts the companion overlay only when staged',
+    fn: () => {
+      const nonce = 'companionnonce';
+      const base = {
+        cspSource: 'vscode-webview://x',
+        nonce,
+        scriptUri: 'vscode-webview://x/dist/webview.js',
+        styleUri: 'vscode-webview://x/dist/webview.css',
+        iconsBaseUri: 'vscode-webview://x/assets/icons',
+        workerUri: 'vscode-webview://x/dist/shiki-worker.js',
+        title: 'Faktor',
+      };
+      const plain = buildVendoredWebviewHtml(base);
+      if ((plain.match(new RegExp(`nonce="${nonce}"`, 'g')) ?? []).length !== 2) {
+        throw new Error('the frozen shell must keep exactly two nonce scripts');
+      }
+      if (plain.includes('faktor-companion')) {
+        throw new Error('no companion overlay may be referenced without staged URIs');
+      }
+      const html = buildVendoredWebviewHtml({
+        ...base,
+        companionScriptUri: 'vscode-webview://x/dist/overlay/faktor-companion.js',
+        companionStyleUri: 'vscode-webview://x/dist/overlay/faktor-companion.css',
+      });
+      if ((html.match(new RegExp(`nonce="${nonce}"`, 'g')) ?? []).length !== 3) {
+        throw new Error('the companion shell must add exactly one nonce script');
+      }
+      if (!html.includes('faktor-companion.js') || !html.includes('faktor-companion.css')) {
+        throw new Error('the companion URIs must be referenced');
+      }
+      if (!html.includes('__faktorVsCodeApi')) {
+        throw new Error('the single acquireVsCodeApi handle must be captured for the panel');
+      }
+      const bundleScriptAt = html.indexOf(base.scriptUri);
+      const bootstrapAt = html.indexOf('__faktorVsCodeApi');
+      const companionAt = html.indexOf('faktor-companion.js');
+      if (!(bootstrapAt < bundleScriptAt && bundleScriptAt < companionAt)) {
+        throw new Error('boot order must be: capture handle, frozen bundle, companion panel');
+      }
+
+      const dir = mkdtempSync(join(tmpdir(), 'faktor-bridge-companion-'));
+      try {
+        const dist = join(dir, 'dist');
+        mkdirSync(join(dist, 'overlay'), { recursive: true });
+        writeFileSync(join(dist, 'webview.js'), '// entry');
+        writeFileSync(join(dist, 'webview.css'), '/* entry */');
+        const noOverlay = locateVendoredBundle(dir);
+        if (noOverlay === null || noOverlay.companion !== null) {
+          throw new Error('a plain bundle must not fabricate a companion overlay');
+        }
+        writeFileSync(join(dist, 'overlay', 'faktor-companion.js'), '// panel');
+        const halfOverlay = locateVendoredBundle(dir);
+        if (halfOverlay === null || halfOverlay.companion !== null) {
+          throw new Error('half an overlay must not be served');
+        }
+        writeFileSync(join(dist, 'overlay', 'faktor-companion.css'), '/* panel */');
+        const bundle = locateVendoredBundle(dir);
+        if (
+          bundle === null ||
+          bundle.companion === null ||
+          !bundle.companion.script.endsWith('faktor-companion.js') ||
+          !bundle.companion.style.endsWith('faktor-companion.css')
+        ) {
+          throw new Error('a staged overlay must be discovered');
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    label: 'bridge bounds every additive Faktor frame',
+    fn: () => {
+      const long = 'x'.repeat(5000);
+      const agents = [];
+      for (let i = 0; i < BRIDGE_LIMITS.maxFaktorAgents + 20; i += 1) {
+        agents.push({
+          agentId: `c${i}`,
+          kind: 'child',
+          state: 'Running',
+          goal: long,
+          model: 'm',
+          provider: 'p',
+          reasoning: true,
+          thinking: false,
+          itemId: null,
+          itemKind: null,
+          itemIds: [],
+          sessionId: i,
+          worktreeId: null,
+          ownership: 'orchestrator',
+          capabilities: [],
+          progress: null,
+          result: null,
+          budget: null,
+          blockers: [],
+          presentation: 'foreground',
+          pixel: {
+            childId: `c${i}`,
+            state: 'running',
+            animation: 'pixel-running',
+            avatar: { hash: i, color: 'red', accent: 'pink', pixels: new Array(25).fill(1), version: 1 },
+          },
+        });
+      }
+      const sections = [];
+      for (let i = 0; i < 40; i += 1) {
+        sections.push({
+          key: `s${i}`,
+          title: long,
+          present: true,
+          lines: [long, long],
+          evidence: [],
+        });
+      }
+      const posts = [];
+      for (let i = 0; i < BRIDGE_LIMITS.maxPageEntries + 20; i += 1) {
+        posts.push({
+          id: `p${i}`,
+          author: 'a',
+          subject: long,
+          body: long,
+          refs: [],
+          revision: i,
+          createdMs: i,
+        });
+      }
+      const snapshot = makeSnapshot({
+        agents,
+        cockpitSections: sections,
+        board: {
+          available: true,
+          source: 'transcript',
+          revision: 1,
+          unread: 3,
+          posts,
+          reason: null,
+        },
+        tournament: {
+          id: long,
+          state: 'open',
+          open: true,
+          canDecide: true,
+          winner: null,
+          criteria: [long],
+          candidates: new Array(80).fill({
+            childId: 'c1',
+            state: 'done',
+            verification: 1,
+            verificationPass: true,
+            reviewRank: 'clean',
+            reviewer: 'r',
+            costMicro: 1,
+            wallMs: 1,
+            winner: false,
+          }),
+        },
+      });
+      const frames = {};
+      for (const message of snapshotToWebviewMessages(snapshot)) {
+        if (typeof message.type === 'string' && message.type.startsWith('faktor')) {
+          frames[message.type] = message;
+        }
+      }
+      const expected = [
+        'faktorTaskState',
+        'faktorAgents',
+        'faktorCockpit',
+        'faktorTournament',
+        'faktorEvidence',
+        'faktorBoardState',
+      ];
+      for (const type of expected) {
+        if (frames[type] === undefined) throw new Error(`missing additive frame ${type}`);
+      }
+      if (frames.faktorAgents.agents.length !== BRIDGE_LIMITS.maxFaktorAgents) {
+        throw new Error(`agent frame must cap at ${BRIDGE_LIMITS.maxFaktorAgents}`);
+      }
+      if (frames.faktorAgents.agents[0].goal.length > 600) {
+        throw new Error('agent strings must be clamped');
+      }
+      if (frames.faktorCockpit.sections.length > 16) {
+        throw new Error('cockpit sections must be capped');
+      }
+      if (frames.faktorBoardState.posts.length > BRIDGE_LIMITS.maxPageEntries) {
+        throw new Error('board posts must be capped');
+      }
+      if (frames.faktorTournament.tournament.candidates.length > 8) {
+        throw new Error('tournament candidates must be capped');
+      }
+      if (frames.faktorTournament.tournament.id.length > 200) {
+        throw new Error('tournament strings must be clamped');
+      }
+      for (const type of expected) {
+        const bytes = Buffer.byteLength(JSON.stringify(frames[type]), 'utf8');
+        if (bytes > BRIDGE_LIMITS.maxInboundBytes) {
+          throw new Error(`${type} frame exceeds the inbound byte bound: ${bytes}`);
+        }
       }
     },
   },

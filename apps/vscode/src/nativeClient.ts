@@ -437,6 +437,10 @@ export interface NativeAgentEntry {
   readonly goal: string;
   readonly state: string;
   readonly model: string | null;
+  /** The child session's durable provider (children only; null when a
+   * pre-provider daemon serves the entry). The (provider, model) pair is the
+   * ONLY safe catalog join key — two providers may expose one model id. */
+  readonly provider: string | null;
   readonly budget: number | null;
   readonly ownership: string;
   readonly capabilities: Json[];
@@ -463,6 +467,79 @@ export interface NativeAgentPresentationAck {
 export interface NativeAgentControlAck {
   readonly queuedSeq: number | null;
   readonly applied: boolean | null;
+}
+
+// ------------------------------------------------- durable tournaments (v1)
+
+/** One acceptance criterion fanned out byte-identically to every candidate. */
+export interface NativeTournamentCriterion {
+  readonly id: string;
+  readonly spec: string;
+}
+
+/** One candidate of a durable tournament. */
+export interface NativeTournamentCandidate {
+  readonly childId: string;
+  readonly worktree: string;
+  readonly baseRevision: string;
+  readonly state: string;
+  readonly verification: number | null;
+  readonly verificationPass: boolean | null;
+  readonly reviewRank: string | null;
+  readonly reviewer: string | null;
+  readonly costMicro: number;
+  readonly wallMs: number;
+}
+
+/** The durable state of ONE tournament, reconstructed from its ledger rows. */
+export interface NativeTournament {
+  readonly id: string;
+  readonly runFamily: string;
+  readonly goal: string;
+  readonly criteria: readonly NativeTournamentCriterion[];
+  readonly candidates: readonly NativeTournamentCandidate[];
+  readonly winner: string | null;
+  readonly state: string;
+}
+
+/** The start receipt (`POST /native/session/{id}/tournament`). */
+export interface NativeTournamentStarted {
+  readonly tournamentId: string;
+  readonly runId: string;
+  readonly candidates: readonly string[];
+  readonly state: string;
+  readonly winner: string | null;
+}
+
+/** One listing summary of the durable tournaments of a session. */
+export interface NativeTournamentSummary {
+  readonly id: string;
+  readonly state: string;
+  readonly candidateCount: number;
+  readonly winner: string | null;
+  readonly decidedMs: number | null;
+}
+
+export interface NativeTournamentDiscarded {
+  readonly childId: string;
+  readonly reason: string;
+}
+
+/** The deterministic decision ack (`POST .../tournaments/{id}/decide`). */
+export interface NativeTournamentDecision {
+  readonly tournamentId: string;
+  readonly winner: string;
+  readonly rationale: string;
+  readonly discarded: readonly NativeTournamentDiscarded[];
+}
+
+/** Start one tournament: goal + criteria, N in 2..=4, optional attachments. */
+export interface StartTournamentRequest {
+  readonly goal: string;
+  readonly criteria: readonly string[];
+  readonly n: number;
+  readonly files?: readonly string[];
+  readonly model?: string;
 }
 
 export interface NativeMessagePart {
@@ -1260,6 +1337,7 @@ export function validateAgents(json: Json): NativeAgentEntry[] {
       goal: fString(object, 'goal', itemPath),
       state: fString(object, 'state', itemPath),
       model: fNullableString(object, 'model', itemPath),
+      provider: 'provider' in object ? fNullableString(object, 'provider', itemPath) : null,
       budget: budget === null ? null : (budget as number),
       ownership: fString(object, 'ownership', itemPath),
       capabilities: fArray(object, 'capabilities', itemPath),
@@ -1297,6 +1375,132 @@ export function validateAgentControlAck(json: Json, path: string): NativeAgentCo
     fail(`${path}.applied`, `expected a boolean or null, got ${describe(applied)}`);
   }
   return { queuedSeq: queued === null ? null : (queued as number), applied };
+}
+
+function validateTournamentCandidate(
+  object: JsonObject,
+  path: string,
+): NativeTournamentCandidate {
+  checkResponseKeys(object, path, [
+    'child_id',
+    'worktree',
+    'base_revision',
+    'state',
+    'verification',
+    'verification_pass',
+    'review',
+    'cost_micro',
+    'wall_ms',
+  ]);
+  const review = fNullableObject(object, 'review', path);
+  let reviewRank: string | null = null;
+  let reviewer: string | null = null;
+  if (review !== null) {
+    checkResponseKeys(review, `${path}.review`, ['rank', 'reviewer']);
+    reviewRank = fString(review, 'rank', `${path}.review`);
+    reviewer = fString(review, 'reviewer', `${path}.review`);
+  }
+  return {
+    childId: fString(object, 'child_id', path),
+    worktree: fString(object, 'worktree', path),
+    baseRevision: fString(object, 'base_revision', path),
+    state: fString(object, 'state', path),
+    verification: fNullableInt(object, 'verification', path),
+    verificationPass:
+      field(object, 'verification_pass', path) === null
+        ? null
+        : fBool(object, 'verification_pass', path),
+    reviewRank,
+    reviewer,
+    costMicro: fInt(object, 'cost_micro', path),
+    wallMs: fInt(object, 'wall_ms', path),
+  };
+}
+
+export function validateTournament(json: Json): NativeTournament {
+  const path = 'GET /native/session/{id}/tournament/{tournament_id}';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, [
+    'id',
+    'run_family',
+    'goal',
+    'criteria',
+    'candidates',
+    'winner',
+    'state',
+  ]);
+  return {
+    id: fString(object, 'id', path),
+    runFamily: fString(object, 'run_family', path),
+    goal: fString(object, 'goal', path),
+    criteria: fObjectArray(object, 'criteria', path).map((entry, index) => {
+      const itemPath = `${path}.criteria[${index}]`;
+      checkResponseKeys(entry, itemPath, ['id', 'spec']);
+      return { id: fString(entry, 'id', itemPath), spec: fString(entry, 'spec', itemPath) };
+    }),
+    candidates: fObjectArray(object, 'candidates', path).map((entry, index) =>
+      validateTournamentCandidate(entry, `${path}.candidates[${index}]`),
+    ),
+    winner: fNullableString(object, 'winner', path),
+    state: fString(object, 'state', path),
+  };
+}
+
+export function validateTournamentStarted(json: Json): NativeTournamentStarted {
+  const path = 'POST /native/session/{id}/tournament';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['tournament_id', 'run_id', 'candidates', 'state', 'winner']);
+  return {
+    tournamentId: fString(object, 'tournament_id', path),
+    runId: fString(object, 'run_id', path),
+    candidates: fStringArray(object, 'candidates', path),
+    state: fString(object, 'state', path),
+    winner: fNullableString(object, 'winner', path),
+  };
+}
+
+export function validateTournamentSummaries(json: Json): NativeTournamentSummary[] {
+  const path = 'GET /native/session/{id}/tournaments';
+  if (!Array.isArray(json)) {
+    fail(path, `expected an array, got ${describe(json)}`);
+  }
+  return json.map((entry, index) => {
+    const itemPath = `${path}[${index}]`;
+    const object = asObject(entry, itemPath);
+    checkResponseKeys(object, itemPath, [
+      'id',
+      'state',
+      'candidate_count',
+      'winner',
+      'decided_ms',
+    ]);
+    return {
+      id: fString(object, 'id', itemPath),
+      state: fString(object, 'state', itemPath),
+      candidateCount: fInt(object, 'candidate_count', itemPath),
+      winner: fNullableString(object, 'winner', itemPath),
+      decidedMs: fNullableInt(object, 'decided_ms', itemPath),
+    };
+  });
+}
+
+export function validateTournamentDecision(json: Json): NativeTournamentDecision {
+  const path = 'POST /native/session/{id}/tournaments/{tournament_id}/decide';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['tournament_id', 'winner', 'rationale', 'discarded']);
+  return {
+    tournamentId: fString(object, 'tournament_id', path),
+    winner: fString(object, 'winner', path),
+    rationale: fString(object, 'rationale', path),
+    discarded: fObjectArray(object, 'discarded', path).map((entry, index) => {
+      const itemPath = `${path}.discarded[${index}]`;
+      checkResponseKeys(entry, itemPath, ['child_id', 'reason']);
+      return {
+        childId: fString(entry, 'child_id', itemPath),
+        reason: fString(entry, 'reason', itemPath),
+      };
+    }),
+  };
 }
 
 export function validateMessagePage(json: Json): NativeMessagePage {
@@ -1956,6 +2160,59 @@ export class NativeClient {
     return this.request('POST', `/native/agents/${encodeURIComponent(childId)}/${action}`, {
       validate: (json, path) => validateAgentControlAck(json, path),
     });
+  }
+
+  /** The durable state of ONE tournament (`GET .../tournament/{id}`). */
+  tournamentState(sessionId: string, tournamentId: string): Promise<NativeTournament> {
+    return this.request(
+      'GET',
+      `/native/session/${encodeURIComponent(sessionId)}/tournament/${encodeURIComponent(tournamentId)}`,
+      { validate: validateTournament },
+    );
+  }
+
+  /** The durable tournament listing (`GET .../tournaments`), newest last. */
+  tournaments(sessionId: string): Promise<NativeTournamentSummary[]> {
+    return this.request('GET', `/native/session/${encodeURIComponent(sessionId)}/tournaments`, {
+      validate: validateTournamentSummaries,
+    });
+  }
+
+  startTournament(
+    sessionId: string,
+    request: StartTournamentRequest,
+  ): Promise<NativeTournamentStarted> {
+    return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/tournament`, {
+      body: request as unknown as Json,
+      validate: validateTournamentStarted,
+    });
+  }
+
+  /**
+   * The deterministic comparison of ONE open tournament. The server is the
+   * guard: a non-open tournament or no eligible winner is a typed 409
+   * (`NativeApiError`), never silently applied.
+   */
+  decideTournament(sessionId: string, tournamentId: string): Promise<NativeTournamentDecision> {
+    return this.request(
+      'POST',
+      `/native/session/${encodeURIComponent(sessionId)}/tournaments/${encodeURIComponent(tournamentId)}/decide`,
+      { body: {}, validate: validateTournamentDecision },
+    );
+  }
+
+  /** Abort ONE open tournament; the reconstructed durable state is returned. */
+  abortTournament(
+    sessionId: string,
+    tournamentId: string,
+    reason?: string,
+  ): Promise<NativeTournament> {
+    const body: Json = reason === undefined || reason.length === 0 ? {} : { reason };
+    return this.request(
+      'POST',
+      `/native/session/${encodeURIComponent(sessionId)}/tournaments/${encodeURIComponent(tournamentId)}/abort`,
+      { body, validate: validateTournament },
+    );
   }
 
   messages(

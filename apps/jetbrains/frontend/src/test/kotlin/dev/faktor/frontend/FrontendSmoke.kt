@@ -41,7 +41,8 @@ private const val AGENTS_JSON = "[" +
     "\"progress\":null,\"result\":null}," +
     "{\"agent_id\":\"child-1\",\"kind\":\"child\",\"run_id\":\"run-1\"," +
     "\"session_id\":9,\"worktree_id\":2,\"goal\":\"drive main step\",\"state\":\"Blocked\"," +
-    "\"model\":\"m\",\"budget\":1000,\"ownership\":\"Mutating\",\"item_id\":\"main\"," +
+    "\"model\":\"m\",\"provider\":\"fake\",\"budget\":1000,\"ownership\":\"Mutating\"," +
+    "\"item_id\":\"main\"," +
     "\"item_kind\":\"Implementation\"," +
     "\"blocker\":{\"kind\":\"permission\",\"reason\":\"shell call needs approval\"," +
     "\"dependency\":null,\"resolution\":\"allow the shell tool\"," +
@@ -100,6 +101,18 @@ private const val MODELS_JSON = "[" +
     "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
     "\"streaming\":true,\"source\":\"conservativeDefault\"}" +
     "]"
+
+// Two providers exposing the SAME model id with different capability sets:
+// the (provider, model) pair is the only safe catalog join key.
+private const val DUAL_MODELS_JSON = "[" +
+    "{\"provider\":\"alpha\",\"model\":\"m\",\"context\":1000,\"maxOutput\":100," +
+    "\"tools\":true,\"parallelTools\":false,\"reasoning\":true,\"thinking\":false," +
+    "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
+    "\"streaming\":true,\"source\":\"conservativeDefault\"}," +
+    "{\"provider\":\"beta\",\"model\":\"m\",\"context\":2000,\"maxOutput\":200," +
+    "\"tools\":false,\"parallelTools\":false,\"reasoning\":false,\"thinking\":true," +
+    "\"vision\":false,\"structuredOutput\":false,\"embeddings\":false," +
+    "\"streaming\":true,\"source\":\"conservativeDefault\"}]"
 
 private const val GRAPH_JSON = "{" +
     "\"plan_id\":\"run-1\",\"goal\":\"graph goal\",\"state\":\"Running\"," +
@@ -347,9 +360,72 @@ object FrontendSmoke {
             )
             assertEquals(true, PixelAgents.frame(PixelState.BLOCKED, 0).alert)
             assertTrue(
-                PixelAgents.frame(PixelState.FAILED, 0).alpha != PixelAgents.frame(PixelState.FAILED, 2).alpha,
-                "failed must flicker"
+                PixelAgents.frame(PixelState.FAILED, 0).alpha != PixelAgents.frame(PixelState.FAILED, 1).alpha,
+                "failed must flicker during its bounded transition"
             )
+            // Terminal states end static: the bounded transition is over at
+            // TERMINAL_TRANSITION_TICKS and the frame never changes again.
+            assertEquals(false, PixelAgents.isStatic(PixelState.DONE, 0), "done may transition briefly")
+            assertEquals(
+                true,
+                PixelAgents.isStatic(PixelState.DONE, PixelAgents.TERMINAL_TRANSITION_TICKS),
+                "done must settle static"
+            )
+            val settledDone = PixelAgents.frame(PixelState.DONE, PixelAgents.TERMINAL_TRANSITION_TICKS)
+            assertEquals(
+                settledDone,
+                PixelAgents.frame(PixelState.DONE, PixelAgents.TERMINAL_TRANSITION_TICKS + 1),
+                "done frame index must be stable across ticks"
+            )
+            assertEquals(
+                settledDone,
+                PixelAgents.frame(PixelState.DONE, 1000),
+                "done frame index must be stable forever"
+            )
+            val settledFailed = PixelAgents.frame(PixelState.FAILED, PixelAgents.TERMINAL_TRANSITION_TICKS)
+            assertEquals(
+                settledFailed,
+                PixelAgents.frame(PixelState.FAILED, 1000),
+                "failed frame index must be stable after its transition"
+            )
+            assertEquals(
+                true,
+                PixelAgents.isStatic(PixelState.CANCELLED, 0),
+                "cancelled is static (slash) from its first frame"
+            )
+            // The owning sprite timer stops at the settle boundary: DONE
+            // runs a bounded transition and then stops animating.
+            val sprite = PixelSprite("child-1", "Running")
+            sprite.setState("Done")
+            var guard = 0
+            while (sprite.animationRunning() && guard < 10) {
+                sprite.advance()
+                guard++
+            }
+            assertEquals(false, sprite.animationRunning(), "Done must stop the sprite timer")
+            assertEquals(true, sprite.settled(), "Done must end on a settled frame")
+            assertEquals(
+                PixelAgents.TERMINAL_TRANSITION_TICKS,
+                sprite.tick(),
+                "the terminal transition is bounded"
+            )
+            // Reduced motion (platform setting, or explicit override): no
+            // timer ever starts and terminal states stay static.
+            PixelMotion.override = true
+            try {
+                val reduced = PixelSprite("child-1", "Running")
+                reduced.syncTimer()
+                assertEquals(false, reduced.animationRunning(), "reduced motion must not animate")
+                val reducedDone = PixelSprite("child-1", "Waiting")
+                reducedDone.setState("Done")
+                assertEquals(
+                    false,
+                    reducedDone.animationRunning(),
+                    "reduced motion keeps a Done sprite static"
+                )
+            } finally {
+                PixelMotion.override = null
+            }
             assertEquals(
                 PixelState.CANCELLED,
                 PixelAgents.fold(
@@ -426,6 +502,32 @@ object FrontendSmoke {
             assertEquals("child-0", model.tournament?.winner)
             assertEquals(true, model.tournament?.candidates?.get(0)?.winner)
             assertEquals(false, model.tournament?.candidates?.get(1)?.winner)
+        }
+
+        step("same model two providers: each child joins its OWN provider metadata") {
+            val catalog = parseNativeModelCatalog(DUAL_MODELS_JSON)
+            assertEquals(2, catalog.size)
+            assertEquals("m", catalog[0].model)
+            assertEquals("m", catalog[1].model)
+            val child = parseNativeAgents(AGENTS_JSON)[1]
+            val alpha = child.copy(agentId = "child-alpha", provider = "alpha")
+            val beta = child.copy(agentId = "child-beta", provider = "beta")
+            val model = TaskTree.build(agents = listOf(alpha, beta), catalog = catalog)
+            assertEquals(2, model.children.size)
+            assertEquals("alpha", model.children[0].provider)
+            assertEquals(true, model.children[0].reasoning)
+            assertEquals(true, model.children[0].tools)
+            assertEquals("beta", model.children[1].provider)
+            assertEquals(false, model.children[1].reasoning)
+            assertEquals(false, model.children[1].tools)
+            // A provider-less child never guesses metadata by model alone.
+            val bare = TaskTree.build(
+                agents = listOf(child.copy(provider = null)),
+                catalog = catalog
+            ).children[0]
+            assertEquals(null, bare.provider)
+            assertEquals(null, bare.reasoning)
+            assertEquals(null, bare.tools)
         }
 
         step("every new UI section is constructible from the mock payload") {
@@ -534,11 +636,11 @@ object FrontendSmoke {
                 }
                 val sid = sessionId
                 if (sid != null) {
-                    step("task-run accepts `files` (attachments path)") {
+                    step("task-run accepts `files` (workspace-relative attachments path)") {
                         val started = client.startTaskRun(
                             sid,
                             "frontend smoke attachment",
-                            files = listOf("/tmp/faktor-frontend-smoke-attachment.txt")
+                            files = listOf("seed.txt")
                         )
                         if (started.runId.isEmpty()) fail("no run id")
                         println("  run=${started.runId} state=${started.state}")

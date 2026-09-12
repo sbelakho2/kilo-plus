@@ -33,9 +33,33 @@ const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const APP_ROOT = resolve(SCRIPT_DIR, '..');
 const REPO_ROOT = resolve(APP_ROOT, '..', '..');
 const BUILD_MANIFEST = join(REPO_ROOT, 'ui', 'kilo-v756-webview', 'dist', 'build-manifest.json');
+const OVERLAY_MANIFEST = join(
+  REPO_ROOT,
+  'ui',
+  'kilo-v756-webview',
+  'dist',
+  'toolchain',
+  'overlay',
+  'overlay-manifest.json',
+);
 const APP_MANIFEST = join(APP_ROOT, 'package.json');
 const WEBVIEW_PREFIX = 'extension/media/kilo-v756-webview/';
+const OVERLAY_PREFIX = `${WEBVIEW_PREFIX}dist/overlay/`;
 const DEFAULT_MIN_WEBVIEW_FILES = 25;
+
+/** Additive panel markers: the panel is useless if any of these vanished. */
+const COMPANION_MARKERS = [
+  'faktorTaskState',
+  'faktorAgents',
+  'faktorCockpit',
+  'faktorTournament',
+  'faktorEvidence',
+  'faktorBoardState',
+  'faktorAgentAction',
+  'faktorTournamentAction',
+  'faktorEvidenceExpand',
+  'faktorBoardAction',
+];
 
 let passed = 0;
 let failed = 0;
@@ -87,6 +111,14 @@ function archiveChecks(vsix, minWebviewFiles) {
     names.has(`${WEBVIEW_PREFIX}dist/shiki-worker.js`),
     'VSIX contains the vendored shiki worker',
   );
+  check(
+    names.has(`${OVERLAY_PREFIX}faktor-companion.js`),
+    'VSIX contains the Faktor companion panel (dist/overlay/faktor-companion.js)',
+  );
+  check(
+    names.has(`${OVERLAY_PREFIX}faktor-companion.css`),
+    'VSIX contains the Faktor companion styles (dist/overlay/faktor-companion.css)',
+  );
   const webviewFiles = entries.filter((entry) => entry.name.startsWith(WEBVIEW_PREFIX));
   check(
     webviewFiles.length >= minWebviewFiles,
@@ -107,6 +139,9 @@ function extractedChecks(extensionDir) {
     'media/kilo-v756-webview/dist/webview.js',
     'media/kilo-v756-webview/dist/webview.css',
     'media/kilo-v756-webview/dist/shiki-worker.js',
+    'media/kilo-v756-webview/dist/overlay/faktor-companion.js',
+    'media/kilo-v756-webview/dist/overlay/faktor-companion.css',
+    'media/kilo-v756-webview/dist/build-manifest.json',
   ];
   for (const relative of required) {
     check(existsSync(join(extensionDir, relative)), `packaged extension has ${relative}`);
@@ -152,6 +187,88 @@ function extractedChecks(extensionDir) {
     verified === (manifest.vendored ?? []).length && verified > 0,
     `all ${verified}/${(manifest.vendored ?? []).length} packaged vendored files match the pinned manifest`,
   );
+
+  // Additive Faktor overlay: pinned by its own manifest and recorded in the
+  // staged build manifest (`faktorOverlay`); the pinned `vendored` list is
+  // untouched, so the upstream closure stays byte-identical.
+  const overlayRoot = join(extensionDir, 'media', 'kilo-v756-webview', 'dist', 'overlay');
+  if (!existsSync(OVERLAY_MANIFEST)) {
+    check(false, `pinned ${OVERLAY_MANIFEST} is present for overlay verification`);
+  } else {
+    const overlayManifest = JSON.parse(readFileSync(OVERLAY_MANIFEST, 'utf8'));
+    let overlayVerified = 0;
+    for (const file of overlayManifest.files ?? []) {
+      const packaged = join(overlayRoot, ...file.path.split('/'));
+      if (!existsSync(packaged)) {
+        check(false, `packaged overlay file missing: ${file.path}`);
+        continue;
+      }
+      const stat = statSync(packaged);
+      const sha = sha256File(packaged);
+      if (stat.size !== file.size || sha !== file.sha256) {
+        check(
+          false,
+          `packaged overlay file diverges: ${file.path} (expected ${file.sha256}/${file.size}, got ${sha}/${stat.size})`,
+        );
+        continue;
+      }
+      overlayVerified += 1;
+    }
+    check(
+      overlayVerified === (overlayManifest.files ?? []).length && overlayVerified > 0,
+      `all ${overlayVerified}/${(overlayManifest.files ?? []).length} packaged overlay files match the pinned overlay manifest`,
+    );
+
+    const stagedPath = join(
+      extensionDir,
+      'media',
+      'kilo-v756-webview',
+      'dist',
+      'build-manifest.json',
+    );
+    if (!existsSync(stagedPath)) {
+      check(false, 'packaged dist/build-manifest.json records the merged overlay hashes');
+    } else {
+      const staged = JSON.parse(readFileSync(stagedPath, 'utf8'));
+      const merged = staged.faktorOverlay?.files ?? [];
+      let mergedVerified = 0;
+      for (const entry of merged) {
+        const packaged = join(extensionDir, 'media', 'kilo-v756-webview', ...entry.path.split('/'));
+        if (!existsSync(packaged)) {
+          check(false, `staged manifest names a missing overlay file: ${entry.path}`);
+          continue;
+        }
+        const stat = statSync(packaged);
+        const sha = sha256File(packaged);
+        if (stat.size !== entry.size || sha !== entry.sha256) {
+          check(false, `staged overlay hash diverges: ${entry.path}`);
+          continue;
+        }
+        mergedVerified += 1;
+      }
+      check(
+        mergedVerified === (overlayManifest.files ?? []).length &&
+          merged.length === (overlayManifest.files ?? []).length,
+        `staged build manifest records all ${mergedVerified} merged overlay hashes`,
+      );
+      check(
+        JSON.stringify(staged.vendored) === JSON.stringify(manifest.vendored),
+        'staged build manifest keeps the pinned vendored list byte-identical',
+      );
+    }
+  }
+
+  const companion = join(overlayRoot, 'faktor-companion.js');
+  if (existsSync(companion)) {
+    const source = readFileSync(companion, 'utf8');
+    const missing = COMPANION_MARKERS.filter((marker) => !source.includes(marker));
+    check(
+      missing.length === 0,
+      `companion panel consumes the additive messages and actions (missing: ${missing.join(', ') || 'none'})`,
+    );
+  } else {
+    check(false, 'companion panel source is present for marker verification');
+  }
 }
 
 function writeIdeRecord(record) {

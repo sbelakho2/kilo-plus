@@ -704,6 +704,12 @@ pub(crate) fn native_child_entry(
         }
         Err(e) => return Err(faktor_protocol::error::from_core(&e)),
     };
+    // The child session's own durable row is the authority for its provider:
+    // the same (provider, model) pair the catalog join at the UI needs, so
+    // two providers exposing one model id can never be conflated.
+    let child_row = session
+        .row()
+        .map_err(|e| faktor_protocol::error::from_core(&e))?;
     let drive = session.orchestrator_drive_state_get().map_err(|e| {
         internal_graph_err(format!(
             "drive state of child {}: {}",
@@ -754,6 +760,7 @@ pub(crate) fn native_child_entry(
         "item_kind": row.kind,
         "state": state_tag,
         "blocker": blocker,
+        "provider": child_row.provider,
         "model": child_model(&drive, identity.as_ref(), &row, default_model),
         "budget": row.budget_max_tokens,
         "ownership": row.ownership,

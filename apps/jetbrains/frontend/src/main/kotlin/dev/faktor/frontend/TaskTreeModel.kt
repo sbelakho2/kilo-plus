@@ -254,7 +254,16 @@ object TaskTree {
         catalog: List<NativeModelInfo>,
         usage: NativeSessionUsage?
     ): ChildNode {
-        val info = if (agent.model == null) null else catalog.firstOrNull { it.model == agent.model }
+        // The child's provider rides the wire from its own durable session
+        // row; the (provider, model) pair is the ONLY safe catalog join key
+        // because two providers may expose the same model id with different
+        // capability sets. A provider-less entry never guesses by model.
+        val provider = agent.provider
+        val info = if (agent.model == null || provider == null) {
+            null
+        } else {
+            catalog.firstOrNull { it.provider == provider && it.model == agent.model }
+        }
         var spentTokens: Long? = null
         var spentCostMicro: Long? = null
         var maxCostMicro: Long? = null
@@ -296,7 +305,7 @@ object TaskTree {
             presence = PixelAgents.presence(agent.agentId, agent.state),
             blocker = agent.blocker,
             model = agent.model,
-            provider = info?.provider,
+            provider = provider,
             reasoning = info?.reasoning,
             tools = info?.tools,
             ownership = agent.ownership,

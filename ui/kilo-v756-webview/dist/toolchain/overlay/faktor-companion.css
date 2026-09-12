@@ -1,0 +1,355 @@
+/* Faktor companion panel styles (additive overlay; not upstream source).
+ *
+ * Merged into dist/overlay/ by prepare-vendored-webview.mjs. Uses only
+ * --vscode-* theme variables, contains no remote resources, and every
+ * animation is disabled under prefers-reduced-motion while static state
+ * cues (opacity/color/border/glyph) remain. */
+
+.faktor-shell {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+.faktor-shell > #root {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+}
+
+#faktor-companion {
+  flex: 0 0 300px;
+  width: 300px;
+  max-width: 45vw;
+  height: 100%;
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 6px 8px 24px 8px;
+  border-left: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+  color: var(--vscode-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.faktor-panel-title {
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.8;
+  padding: 2px 0 6px 0;
+  position: sticky;
+  top: 0;
+  background: inherit;
+  z-index: 1;
+}
+
+.faktor-section {
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  padding: 6px 0 8px 0;
+}
+
+.faktor-section-title {
+  margin: 0 0 4px 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.75;
+}
+
+.faktor-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 2px 0;
+}
+
+.faktor-strong {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.faktor-line {
+  margin: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.faktor-label {
+  margin: 4px 0 2px 0;
+  font-weight: 600;
+  opacity: 0.8;
+}
+
+.faktor-muted {
+  opacity: 0.65;
+}
+
+.faktor-done {
+  color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.faktor-failed {
+  color: var(--vscode-testing-iconFailed, #f85149);
+}
+
+.faktor-blocked {
+  color: var(--vscode-editorWarning-foreground, #d29922);
+}
+
+.faktor-badge {
+  display: inline-block;
+  padding: 0 5px;
+  border-radius: 7px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.5));
+  font-size: 10px;
+  line-height: 16px;
+  opacity: 0.9;
+}
+
+.faktor-badge-state {
+  text-transform: lowercase;
+}
+
+.faktor-badge-winner {
+  border-color: var(--vscode-testing-iconPassed, #3fb950);
+  color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.faktor-badge-dim {
+  opacity: 0.55;
+}
+
+.faktor-agent,
+.faktor-candidate,
+.faktor-post {
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+  border-radius: 4px;
+  padding: 4px 6px;
+  margin: 4px 0;
+}
+
+/* Durable presentation dimming: background children are tucked last and
+ * visibly dimmed; foreground children are never reordered. */
+.faktor-agent[data-presentation='background'] {
+  order: 1;
+  opacity: 0.55;
+  filter: grayscale(0.4);
+}
+
+.faktor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.faktor-btn {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  background: var(--vscode-button-secondaryBackground, var(--vscode-button-background));
+  color: var(--vscode-button-secondaryForeground, var(--vscode-button-foreground));
+  cursor: pointer;
+}
+
+.faktor-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.faktor-btn-primary {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+
+.faktor-btn-link {
+  background: transparent;
+  border: none;
+  color: var(--vscode-textLink-foreground);
+  text-align: left;
+  padding: 0;
+  cursor: pointer;
+}
+
+.faktor-input {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 11px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(128, 128, 128, 0.4)));
+  border-radius: 3px;
+  padding: 2px 4px;
+}
+
+.faktor-cockpit-section {
+  margin: 4px 0;
+}
+
+.faktor-evidence {
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.1));
+  border-radius: 3px;
+  padding: 4px;
+  margin: 4px 0;
+}
+
+.faktor-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* --------------------------------------------------- pixel identity (5x5) */
+
+.faktor-pixel {
+  display: inline-grid;
+  grid-template-columns: repeat(5, 3px);
+  grid-template-rows: repeat(5, 3px);
+  gap: 0;
+  margin-right: 2px;
+  vertical-align: middle;
+}
+
+.faktor-pixel-bit {
+  width: 3px;
+  height: 3px;
+  border-radius: 1px;
+  background: transparent;
+}
+
+.faktor-pixel-bit.on {
+  background: currentColor;
+}
+
+.faktor-pixel.pixel-running {
+  animation: faktor-pixel-pulse 1.1s ease-in-out infinite;
+}
+
+.faktor-pixel.pixel-paused {
+  animation: faktor-pixel-breathe 2.4s ease-in-out infinite;
+}
+
+.faktor-pixel.pixel-waiting {
+  animation: faktor-pixel-blink 2.8s steps(1, end) infinite;
+}
+
+.faktor-pixel.pixel-blocked {
+  animation: faktor-pixel-nudge 0.7s ease-in-out infinite;
+}
+
+.faktor-pixel.pixel-done {
+  animation: none;
+  opacity: 1;
+}
+
+.faktor-pixel.pixel-failed {
+  animation: faktor-pixel-flicker 1.3s linear infinite;
+}
+
+.faktor-pixel.pixel-cancelled {
+  animation: faktor-pixel-dim 1.6s ease-in-out infinite alternate;
+}
+
+@keyframes faktor-pixel-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 0.65;
+    transform: translateY(-1px);
+  }
+}
+
+@keyframes faktor-pixel-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+
+@keyframes faktor-pixel-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes faktor-pixel-nudge {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(1px);
+  }
+}
+
+@keyframes faktor-pixel-flicker {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  40% {
+    opacity: 0.55;
+  }
+  60% {
+    opacity: 0.8;
+  }
+}
+
+@keyframes faktor-pixel-dim {
+  from {
+    opacity: 0.5;
+  }
+  to {
+    opacity: 0.85;
+  }
+}
+
+/* Accessibility: reduced motion keeps the static state cues (opacity,
+ * color, glyph) and disables every transform/animation. */
+@media (prefers-reduced-motion: reduce) {
+  .faktor-pixel,
+  .faktor-pixel.pixel-running,
+  .faktor-pixel.pixel-paused,
+  .faktor-pixel.pixel-waiting,
+  .faktor-pixel.pixel-blocked,
+  .faktor-pixel.pixel-failed,
+  .faktor-pixel.pixel-cancelled {
+    animation: none !important;
+    transform: none !important;
+  }
+
+  .faktor-pixel.pixel-failed {
+    opacity: 0.7;
+  }
+
+  .faktor-pixel.pixel-cancelled {
+    opacity: 0.6;
+  }
+
+  .faktor-pixel.pixel-done {
+    opacity: 1;
+  }
+}

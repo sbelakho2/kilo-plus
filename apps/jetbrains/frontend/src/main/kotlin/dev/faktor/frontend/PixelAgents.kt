@@ -64,11 +64,88 @@ data class PixelPresence(
 /** One animation frame: bounded offsets/alpha/pulse for the paint code. */
 data class SpriteFrame(val dx: Int, val dy: Int, val alpha: Float, val alert: Boolean, val blink: Boolean)
 
+/**
+ * System animation policy: reduced motion when the IDE platform says so.
+ *
+ * The standalone kotlinc smoke compiles without platform jars, so the
+ * documented platform switches are consulted REFLECTIVELY — missing classes
+ * (standalone launcher, smoke) are the safe default (animations on), and a
+ * platform exception never propagates. The probes are:
+ *   - `com.intellij.ui.UISettings` presentation mode (animations off);
+ *   - `com.intellij.openapi.util.registry.Registry` animation-disable keys.
+ */
+object PixelMotion {
+
+    /** Test/explicit override; null consults the platform once. */
+    @Volatile
+    var override: Boolean? = null
+
+    private val platformReduced: Boolean by lazy { detectPlatformReducedMotion() }
+
+    /** True when motion should be suppressed (reduced motion). */
+    fun reducedMotion(): Boolean = override ?: platformReduced
+
+    private fun detectPlatformReducedMotion(): Boolean =
+        probeUISettings() || probeRegistry()
+
+    private fun probeUISettings(): Boolean {
+        return try {
+            val cls = Class.forName("com.intellij.ui.UISettings")
+            val instance = cls.getMethod("getInstance").invoke(null) ?: return false
+            val presentation = invokeBoolean(instance, "getPresentationMode")
+            if (presentation != null) return presentation
+            invokeBoolean(instance, "isPresentationMode") == true
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    private fun probeRegistry(): Boolean {
+        return try {
+            val cls = Class.forName("com.intellij.openapi.util.registry.Registry")
+            val isMethod = cls.getMethod("is", String::class.java)
+            var disabled = false
+            for (key in REGISTRY_ANIMATION_KEYS) {
+                if (isMethod.invoke(null, key) == true) {
+                    disabled = true
+                    break
+                }
+            }
+            disabled
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    private fun invokeBoolean(target: Any, method: String): Boolean? {
+        return try {
+            val value = target.javaClass.getMethod(method).invoke(target)
+            value as? Boolean
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private val REGISTRY_ANIMATION_KEYS = listOf(
+        "ide.animations.disabled",
+        "idea.animations.disabled",
+        "animations.disabled"
+    )
+}
+
 /** Pure, dependency-free identity/animation authority. */
 object PixelAgents {
 
     /** Avatar version so a future sprite change can be detected. */
     const val PIXEL_AVATAR_VERSION = 1
+
+    /**
+     * Bounded terminal transition: a terminal sprite may animate for this
+     * many 200ms ticks, after which its frame is static forever and the
+     * owning timer stops. Done gets one settle bounce, Failed one flicker;
+     * Cancelled is static from its first frame.
+     */
+    const val TERMINAL_TRANSITION_TICKS = 3
 
     /** FNV-1a 32-bit over the UTF-16 code units — byte-identical to the VS Code system. */
     fun hash(childId: String): Long {
@@ -149,18 +226,44 @@ object PixelAgents {
 
     /**
      * The deterministic animation frame of one state at [tick] (200ms steps):
-     * running bobs, waiting blinks, blocked shakes with a red alert, failed
-     * flickers, done bounces once per cycle, paused/cancelled dim. Pure so
-     * the smoke can assert every state's animation without a display.
+     * running bobs, waiting blinks, blocked shakes with a red alert. Terminal
+     * states are BOUNDED: Done bounces once and settles, Failed flickers once
+     * and settles, Cancelled is dim from its first frame; their X/slash marks
+     * are painted statically, never as animation. Pure so the smoke can assert
+     * every state's frames without a display.
      */
     fun frame(state: PixelState, tick: Int): SpriteFrame = when (state) {
         PixelState.RUNNING -> SpriteFrame(0, if (tick % 4 < 2) -1 else 0, 1f, false, false)
         PixelState.PAUSED -> SpriteFrame(0, 0, 0.55f, false, false)
         PixelState.WAITING -> SpriteFrame(0, 0, if (tick % 4 == 3) 0.55f else 0.85f, false, tick % 4 == 0)
         PixelState.BLOCKED -> SpriteFrame(if (tick % 2 == 0) -1 else 1, 0, 1f, true, false)
-        PixelState.DONE -> SpriteFrame(0, if (tick % 6 == 0) -1 else 0, 1f, false, false)
-        PixelState.FAILED -> SpriteFrame(0, 0, if (tick % 4 < 2) 1f else 0.35f, false, false)
+        PixelState.DONE -> if (tick < TERMINAL_TRANSITION_TICKS) {
+            SpriteFrame(0, if (tick % 2 == 0) -1 else 0, 1f, false, false)
+        } else {
+            SpriteFrame(0, 0, 1f, false, false)
+        }
+        PixelState.FAILED -> if (tick < TERMINAL_TRANSITION_TICKS) {
+            SpriteFrame(0, 0, if (tick % 2 == 0) 1f else 0.35f, false, false)
+        } else {
+            SpriteFrame(0, 0, 1f, false, false)
+        }
         PixelState.CANCELLED -> SpriteFrame(0, 0, 0.35f, false, false)
+    }
+
+    /**
+     * Whether one state's frame has fully settled at [tick]: Done/Failed are
+     * static after their bounded transition; Cancelled is static (its dim
+     * slash) from the first frame; live states never settle. The owning
+     * sprite timer stops exactly at this boundary.
+     */
+    fun isStatic(state: PixelState, tick: Int): Boolean = when (state) {
+        PixelState.RUNNING,
+        PixelState.PAUSED,
+        PixelState.WAITING,
+        PixelState.BLOCKED -> false
+        PixelState.CANCELLED -> true
+        PixelState.DONE,
+        PixelState.FAILED -> tick >= TERMINAL_TRANSITION_TICKS
     }
 
     private fun asciiLower(text: String): String {
@@ -172,8 +275,10 @@ object PixelAgents {
 
 /**
  * A live sprite component for one child. The timer runs only while the
- * component is part of a displayed hierarchy; every state has animated
- * presence, so a paused/cancelled sprite still repaints (dim, no motion).
+ * component is displayed AND the state is still animating; terminal states
+ * settle after their bounded transition (Done/Failed) or immediately
+ * (Cancelled), then the timer stops. Under reduced motion no timer starts and
+ * the settled/static frame renders directly.
  */
 class PixelSprite(childId: String, state: String = "waiting") : JComponent() {
 
@@ -182,10 +287,7 @@ class PixelSprite(childId: String, state: String = "waiting") : JComponent() {
 
     private var tick = 0
 
-    private val timer = Timer(200) {
-        tick++
-        repaint()
-    }
+    private val timer = Timer(200) { advance() }
 
     init {
         preferredSize = Dimension(22, 22)
@@ -198,13 +300,43 @@ class PixelSprite(childId: String, state: String = "waiting") : JComponent() {
         val updated = PixelAgents.presence(presence.childId, state)
         if (updated.state == presence.state) return
         presence = updated
+        tick = 0
         toolTipText = "${presence.childId}: ${presence.state.tag} (${presence.animation})"
+        syncTimer()
         repaint()
+    }
+
+    /** One animation step (the Timer body; visible to the smoke). */
+    internal fun advance() {
+        tick++
+        repaint()
+        if (PixelAgents.isStatic(presence.state, tick)) {
+            timer.stop()
+        }
+    }
+
+    /** Whether the sprite timer is currently running. */
+    fun animationRunning(): Boolean = timer.isRunning
+
+    /** The current frame tick. */
+    fun tick(): Int = tick
+
+    /** True when the state's frame is settled at the current tick. */
+    fun settled(): Boolean = PixelAgents.isStatic(presence.state, tick)
+
+    /** Applies the motion/timer policy at the current state and tick. */
+    internal fun syncTimer() {
+        val shouldRun = !PixelMotion.reducedMotion() && !PixelAgents.isStatic(presence.state, tick)
+        if (shouldRun && !timer.isRunning) {
+            timer.start()
+        } else if (!shouldRun && timer.isRunning) {
+            timer.stop()
+        }
     }
 
     override fun addNotify() {
         super.addNotify()
-        if (!timer.isRunning) timer.start()
+        syncTimer()
     }
 
     override fun removeNotify() {

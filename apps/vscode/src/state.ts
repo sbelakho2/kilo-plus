@@ -10,7 +10,7 @@
 
 import { foldPixelPresence, pixelPresence } from './pixelAgents.ts';
 import type { PixelPresence } from './pixelAgents.ts';
-import type { CockpitSection, CockpitView } from './cockpit';
+import type { CockpitSection, CockpitTournamentView, CockpitView } from './cockpit';
 
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -147,6 +147,31 @@ export interface UsageSummary {
   readonly truncated: boolean;
 }
 
+/**
+ * One coordination-board post as the Faktor panel renders it. The board is
+ * a run-family durable surface; when the daemon of this compatibility
+ * revision serves no board route the snapshot carries `available: false`
+ * with the explicit reason — never fabricated posts.
+ */
+export interface BoardPostSummary {
+  readonly id: string;
+  readonly author: string;
+  readonly subject: string;
+  readonly body: string;
+  readonly refs: readonly string[];
+  readonly revision: number | null;
+  readonly createdMs: number | null;
+}
+
+export interface BoardStateSummary {
+  readonly available: boolean;
+  readonly source: string;
+  readonly revision: number | null;
+  readonly unread: number | null;
+  readonly posts: readonly BoardPostSummary[];
+  readonly reason: string | null;
+}
+
 export interface SessionSummary {
   readonly id: string;
   readonly title: string;
@@ -222,6 +247,11 @@ export interface FaktorSnapshot {
   /** The persistent Task cockpit assembled from every native section. */
   readonly cockpit: CockpitView | null;
   readonly cockpitSections: readonly CockpitSection[];
+  /** The durable tournament of the session (proposal only; never auto-merged). */
+  readonly tournament: CockpitTournamentView | null;
+  /** The run-family coordination board surface (explicitly unavailable when
+   * the serving daemon exposes no board read). */
+  readonly board: BoardStateSummary | null;
   readonly transcript: readonly TranscriptEntry[];
   readonly streamStatus: string;
   readonly lastError: string | null;
@@ -245,6 +275,8 @@ export function emptySnapshot(): FaktorSnapshot {
     usage: null,
     cockpit: null,
     cockpitSections: [],
+    tournament: null,
+    board: null,
     transcript: [],
     streamStatus: 'stopped',
     lastError: null,
@@ -281,7 +313,20 @@ export class FaktorStore {
     if (!changed) {
       return;
     }
-    this.state = next as unknown as FaktorSnapshot;
+    const previous = this.state;
+    const nextState = next as unknown as FaktorSnapshot;
+    // Additive Faktor-only panels never bleed across a session switch or a
+    // daemon stop: they describe ONE session/run family. The host patches a
+    // fixed field set, so the store owns this invariant (extension.ts is
+    // deliberately not coupled to the panel fields).
+    const sessionChanged =
+      (nextState.session?.id ?? null) !== (previous.session?.id ?? null);
+    const stopped = nextState.daemon === 'stopped' && previous.daemon !== 'stopped';
+    if (sessionChanged || stopped) {
+      next.tournament = null;
+      next.board = null;
+    }
+    this.state = nextState;
     this.emit();
   }
 
@@ -730,7 +775,15 @@ export function summarizeAgents(
     }
     const state = asString(agent.state) ?? 'unknown';
     const model = asString(agent.model);
-    const info = model !== null ? catalog.find((entry) => entry.model === model) : undefined;
+    // The child session's durable provider rides the wire; the
+    // (provider, model) pair is the ONLY safe catalog join key because two
+    // providers may expose the same model id with different capabilities.
+    // A provider-less entry never guesses by model alone.
+    const provider = asString(agent.provider);
+    const info =
+      provider !== null && model !== null
+        ? catalog.find((entry) => entry.provider === provider && entry.model === model)
+        : undefined;
     const itemIdsRaw = Array.isArray(agent.item_ids) ? (agent.item_ids as Json[]) : [];
     const capabilitiesRaw = Array.isArray(agent.capabilities) ? (agent.capabilities as Json[]) : [];
     const progress = agent.progress ?? null;
@@ -742,7 +795,7 @@ export function summarizeAgents(
       state,
       goal: (asString(agent.goal) ?? '').slice(0, MAX_ENTRY_CHARS),
       model,
-      provider: info?.provider ?? null,
+      provider: provider ?? null,
       reasoning: info?.reasoning ?? null,
       thinking: info?.thinking ?? null,
       itemId: asString(agent.item_id),

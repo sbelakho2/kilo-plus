@@ -371,3 +371,38 @@ details summary {
   gap: 6px;
   margin: 2px 0;
 }
+
+.cockpit-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.cockpit-actions button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Accessibility: with prefers-reduced-motion every .pixel-* animation and
+   transform is removed, while each state keeps a STATIC cue (opacity) so
+   presence is still legible without motion. */
+@media (prefers-reduced-motion: reduce) {
+  .pixel,
+  .pixel-running,
+  .pixel-paused,
+  .pixel-waiting,
+  .pixel-blocked,
+  .pixel-done,
+  .pixel-failed,
+  .pixel-cancelled {
+    animation: none;
+    transform: none;
+  }
+  .pixel-running { opacity: 1; }
+  .pixel-paused { opacity: 0.55; }
+  .pixel-waiting { opacity: 0.85; }
+  .pixel-blocked { opacity: 1; }
+  .pixel-done { opacity: 1; }
+  .pixel-failed { opacity: 1; }
+  .pixel-cancelled { opacity: 0.35; }
+}

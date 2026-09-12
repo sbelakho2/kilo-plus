@@ -67,6 +67,33 @@
           line(block, lines[j], 'muted');
         }
       }
+      // State-gated tournament controls: a disabled action is rendered
+      // disabled and NEVER posts (the engine's settle rule is the gate).
+      var actions = Array.isArray(section.actions) ? section.actions : [];
+      if (section.key === 'tournament' && view && view.tournament && actions.length > 0) {
+        var controls = document.createElement('div');
+        controls.className = 'cockpit-actions';
+        for (var k = 0; k < actions.length; k++) {
+          (function (action) {
+            var button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = action.label;
+            button.disabled = action.enabled !== true;
+            button.addEventListener('click', function () {
+              if (action.enabled !== true || !view.tournament) {
+                return;
+              }
+              vscode.postMessage({
+                type: 'tournamentControl',
+                tournamentId: view.tournament.id,
+                action: action.key,
+              });
+            });
+            controls.appendChild(button);
+          })(actions[k]);
+        }
+        block.appendChild(controls);
+      }
       node.appendChild(block);
     }
   }

@@ -518,6 +518,10 @@ data class NativeAgent(
     val goal: String,
     val state: String,
     val model: String?,
+    /** The child session's durable provider (children only; null when a
+     * pre-provider daemon serves the entry). The (provider, model) pair is
+     * the only safe catalog join key. */
+    val provider: String? = null,
     val budget: Long?,
     val ownership: String,
     val itemIds: List<String>,
@@ -1004,6 +1008,7 @@ fun parseNativeAgents(json: String): List<NativeAgent> {
             goal = it.field("goal").string(),
             state = it.field("state").string(),
             model = it.optionalField("model")?.string(),
+            provider = it.optionalField("provider")?.string(),
             budget = it.optionalField("budget")?.long(),
             ownership = it.field("ownership").string(),
             itemIds = it.optionalField("item_ids")?.stringArray() ?: emptyList(),
