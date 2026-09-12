@@ -605,28 +605,67 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::Malformed);
     }
 
+    /// Serializes process-environment mutation: libtest runs tests on
+    /// parallel threads, so a test that installs authority inputs must be
+    /// the only one touching them while its children spawn.
+    static ENV_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Installs the named values and RESTORES the process environment on
+    /// Drop: a panicking assertion must never leak test values into other
+    /// tests or into the daemon's own environment.
+    struct EnvOverride(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvOverride {
+        fn new(entries: &[(&'static str, &str)]) -> Self {
+            let saved = entries
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect::<Vec<_>>();
+            for (name, value) in entries {
+                std::env::set_var(name, value);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvOverride {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     #[test]
     fn pty_env_uses_the_identical_authority_and_no_daemon_var_leaks() {
         // The exact terminal-side assertion, repeated through a REAL PTY:
         // PATH + the approved toolchain vars arrive; configured secret
         // names set in the parent never cross (even allowlisted explicitly);
-        // an undeclared daemon var never arrives.
-        std::env::set_var("CARGO_HOME", "/tmp/kp-pty-cargo-home");
-        std::env::set_var("RUSTUP_HOME", "/tmp/kp-pty-rustup-home");
-        std::env::set_var("FAKTOR_SERVER_PASSWORD", "hunter2");
-        std::env::set_var("OPENAI_API_KEY", "sk-pty-secret");
-        std::env::set_var("TEST_PRIVATE_SECRET", "private");
-        std::env::set_var("KP_PTY_UNDECLARED", "must-not-arrive");
+        // an undeclared daemon var never arrives. Host-independent: the
+        // approved values are installed by the test itself (serialized, and
+        // restored on Drop) instead of relying on the runner image.
+        let _serial = ENV_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvOverride::new(&[
+            ("CARGO_HOME", "/tmp/kp-pty-cargo-home"),
+            ("RUSTUP_HOME", "/tmp/kp-pty-rustup-home"),
+            ("FAKTOR_SERVER_PASSWORD", "hunter2"),
+            ("OPENAI_API_KEY", "sk-pty-secret"),
+            ("TEST_PRIVATE_SECRET", "private"),
+            ("KP_PTY_UNDECLARED", "must-not-arrive"),
+        ]);
         // The child PRINTS its env through the PTY: the assertions run on
-        // the bytes the terminal actually delivered.
-        let mut cfg = sh_cfg("env");
+        // the bytes the terminal actually delivered. The sentinel is the
+        // last line, so waiting for it makes the snapshot complete — no
+        // assertion can race the reader for a variable 'env' has not
+        // delivered yet.
+        let mut cfg = sh_cfg("env; echo __KP_PTY_ENV_END__");
         cfg.env = EnvSpec::toolchain();
         let mut pty = Pty::spawn(&cfg).unwrap();
         assert!(
-            pty.wait_for_contains(
-                "CARGO_HOME=/tmp/kp-pty-cargo-home",
-                std::time::Duration::from_secs(10)
-            ),
+            pty.wait_for_contains("__KP_PTY_ENV_END__", std::time::Duration::from_secs(10)),
             "PATH/toolchain vars must arrive: {:?}",
             String::from_utf8_lossy(&pty.snapshot())
         );
@@ -637,7 +676,15 @@ mod tests {
                 .any(|l| l.trim_end().starts_with("PATH=") && l.len() > "PATH=".len()),
             "PATH must be present and non-empty: {printed:?}"
         );
-        assert!(printed.contains("RUSTUP_HOME=/tmp/kp-pty-rustup-home"));
+        for approved in [
+            "CARGO_HOME=/tmp/kp-pty-cargo-home",
+            "RUSTUP_HOME=/tmp/kp-pty-rustup-home",
+        ] {
+            assert!(
+                printed.contains(approved),
+                "the authority must forward the approved name {approved}: {printed:?}"
+            );
+        }
         for secret in [
             "FAKTOR_SERVER_PASSWORD",
             "OPENAI_API_KEY",
@@ -663,12 +710,6 @@ mod tests {
             String::from_utf8_lossy(&pty.snapshot())
         );
         pty.kill();
-        std::env::remove_var("CARGO_HOME");
-        std::env::remove_var("RUSTUP_HOME");
-        std::env::remove_var("FAKTOR_SERVER_PASSWORD");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TEST_PRIVATE_SECRET");
-        std::env::remove_var("KP_PTY_UNDECLARED");
     }
 
     #[test]

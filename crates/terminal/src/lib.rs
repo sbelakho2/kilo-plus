@@ -3567,6 +3567,48 @@ mod windows_tests {
         (dir, ProcessSupervisor::new(cas))
     }
 
+    /// Every shell round-trip assertion names its case and dumps both
+    /// bounded heads (tails): a Windows CI failure must be root-causable
+    /// from the message alone — exit code, timeout flag, stdout/stderr.
+    fn case_tails(out: &SyncRunOutput) -> String {
+        let tail = |s: &str| {
+            let bytes = s.as_bytes();
+            let start = bytes.len().saturating_sub(400);
+            String::from_utf8_lossy(&bytes[start..]).into_owned()
+        };
+        format!(
+            "exit_code={:?} timed_out={} stdout_truncated={} stderr_truncated={} \
+             stdout_tail={:?} stderr_tail={:?}",
+            out.exit_code,
+            out.timed_out,
+            out.stdout_truncated,
+            out.stderr_truncated,
+            tail(&out.stdout_head),
+            tail(&out.stderr_head),
+        )
+    }
+
+    /// Run one shell case and assert the success contract with the case
+    /// label + heads attached to the failure.
+    fn shell_case(
+        sup: &ProcessSupervisor,
+        label: &str,
+        cfg: SpawnConfig,
+        deadline: Duration,
+    ) -> SyncRunOutput {
+        let out = sup
+            .run_sync(cfg, deadline, 64 * 1024, 64 * 1024)
+            .unwrap_or_else(|e| panic!("[{label}] run failed: {e:?}"));
+        let tails = case_tails(&out);
+        assert!(!out.timed_out, "[{label}] must not time out: {tails}");
+        assert_eq!(
+            out.exit_code,
+            Some(0),
+            "[{label}] expected success: {tails}"
+        );
+        out
+    }
+
     #[test]
     fn platform_default_shell_is_cmd_exe_not_git_bash() {
         let resolved = CommandSpec::shell("echo hi", ShellKind::PlatformDefault)
@@ -3650,33 +3692,37 @@ mod windows_tests {
     #[test]
     fn shell_echo_quoted_spaces_unicode_and_exit_codes_round_trip() {
         let (_dir, sup) = shell_supervisor();
-        let out = sup
-            .run_sync(
-                shell_cfg("echo hello-from-cmd"),
-                Duration::from_secs(20),
-                64 * 1024,
-                64 * 1024,
-            )
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
+        let out = shell_case(
+            &sup,
+            "cmd echo",
+            shell_cfg("echo hello-from-cmd"),
+            Duration::from_secs(20),
+        );
         assert!(
             out.stdout_head.contains("hello-from-cmd"),
-            "{:?}",
-            out.stdout_head
+            "[cmd echo] stdout must carry the echo: {}",
+            case_tails(&out)
         );
 
-        let out = sup
-            .run_sync(
-                shell_cfg("echo \"a b\""),
-                Duration::from_secs(20),
-                64 * 1024,
-                64 * 1024,
-            )
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
-        assert!(out.stdout_head.contains("a b"), "{:?}", out.stdout_head);
+        let out = shell_case(
+            &sup,
+            "cmd echo quoted spaces",
+            shell_cfg("echo \"a b\""),
+            Duration::from_secs(20),
+        );
+        assert!(
+            out.stdout_head.contains("a b"),
+            "[cmd echo quoted spaces] stdout must carry the quoted text: {}",
+            case_tails(&out)
+        );
 
-        // Unicode through PowerShell (cmd.exe output is codepage-bound).
+        // Unicode through PowerShell: the lowered `-Command` script carries
+        // the terminal-wide UTF-8 prelude (see
+        // `faktor_core::command::POWERSHELL_UTF8_PRELUDE`), so the captured
+        // bytes decode as UTF-8. A loaded Windows runner can take tens of
+        // seconds to cold-start PowerShell under the parallel tree tests
+        // (the pty/fault suites budget 60 s), so this case uses the same
+        // proven budget.
         let resolved = CommandSpec::shell("Write-Output '日本語'", ShellKind::PowerShell)
             .lower()
             .unwrap();
@@ -3694,12 +3740,22 @@ mod windows_tests {
             artifact_max: 1024 * 1024,
             network_isolation: NetworkIsolation::Inherit,
         };
-        let out = sup
-            .run_sync(cfg, Duration::from_secs(30), 64 * 1024, 64 * 1024)
-            .unwrap();
-        assert_eq!(out.exit_code, Some(0), "{:?}", out.stderr_head);
-        assert!(out.stdout_head.contains("日本語"), "{:?}", out.stdout_head);
+        let out = shell_case(
+            &sup,
+            "powershell unicode UTF-8",
+            cfg,
+            Duration::from_secs(60),
+        );
+        assert!(
+            out.stdout_head.contains("日本語"),
+            "[powershell unicode UTF-8] the UTF-8 prelude must make 日本語 \
+             round-trip (only real UTF-8 bytes decode to it): {}",
+            case_tails(&out)
+        );
 
+        // `exit /b 7` inside the materialized script must propagate exactly
+        // through `cmd.exe /d /c <path>` (the batch's exit code becomes
+        // cmd.exe's exit code).
         let out = sup
             .run_sync(
                 shell_cfg("exit /b 7"),
@@ -3707,8 +3763,18 @@ mod windows_tests {
                 64 * 1024,
                 64 * 1024,
             )
-            .unwrap();
-        assert_eq!(out.exit_code, Some(7), "{out:?}");
+            .unwrap_or_else(|e| panic!("[cmd exit /b 7] run failed: {e:?}"));
+        assert!(
+            !out.timed_out,
+            "[cmd exit /b 7] must not time out: {}",
+            case_tails(&out)
+        );
+        assert_eq!(
+            out.exit_code,
+            Some(7),
+            "[cmd exit /b 7] the batch exit code must propagate exactly: {}",
+            case_tails(&out)
+        );
     }
 
     #[test]

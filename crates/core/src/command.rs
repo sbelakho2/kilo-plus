@@ -224,7 +224,9 @@ pub enum ShellKind {
     PosixSh,
     /// Windows `cmd.exe /d /s /c`.
     Cmd,
-    /// `powershell.exe -NoProfile -NonInteractive -Command`.
+    /// `powershell.exe -NoProfile -NonInteractive -Command`. Scripts are
+    /// prefixed with [`POWERSHELL_UTF8_PRELUDE`] (the terminal-wide UTF-8
+    /// stdout convention).
     PowerShell,
 }
 
@@ -246,6 +248,17 @@ pub enum CommandSpec {
 
 /// Bound on a shell snippet before any process exists.
 pub const COMMAND_SCRIPT_MAX_BYTES: usize = 512 * 1024;
+
+/// The terminal-wide PowerShell convention: every [`ShellKind::PowerShell`]
+/// script is prefixed with this prelude. A redirected Windows PowerShell
+/// (5.1) stdout defaults to the OEM codepage (437), so non-ASCII output is
+/// mangled (`日本語` becomes `???`) or fails to write at all; pinning both
+/// `[Console]::OutputEncoding` (the stdout writer) and `$OutputEncoding`
+/// (native-command piping) to UTF-8 makes the captured bytes decode as
+/// UTF-8 deterministically on Windows PowerShell 5.1 and PowerShell 7. The
+/// prefixed script still rides as ONE `-Command` argv element.
+pub const POWERSHELL_UTF8_PRELUDE: &str =
+    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; $OutputEncoding=[System.Text.Encoding]::UTF8; ";
 
 /// Reserved prefix of a materialized cmd script (see
 /// [`materialize_cmd_script`]). The process supervisor deletes only files
@@ -319,7 +332,12 @@ fn sweep_abandoned_cmd_scripts(dir: &std::path::Path) {
 /// The argv of a materialized cmd script run: `cmd.exe /d /c <path>`. `/d`
 /// skips AutoRun and `/c` runs the script; without `/s` cmd keeps a single
 /// quoted path argument intact (`cmd /?` rule 1), which is exactly how std
-/// hands over a temp path containing spaces.
+/// hands over a temp path containing spaces. The path is handed over as a
+/// BARE `OsString` argument — never pre-quoted here: the process-spawn layer
+/// applies the MSVCRT argument-quoting rules (a quote only when the path
+/// contains whitespace or a quote), and cmd's rule 1 then runs the single
+/// quoted token as the script. A literal quote added here would be escaped
+/// by the spawn layer and break the path.
 fn cmd_script_argv(script: &str) -> Result<(OsString, Vec<OsString>), Error> {
     let script_path = materialize_cmd_script(script)?;
     Ok((
@@ -362,8 +380,9 @@ impl CommandSpec {
     /// fixed. Hostile input (NUL, empty, oversized) is refused typed before
     /// any process exists. A cmd shell snippet is materialized to a unique
     /// temp `.cmd` file and lowered to `cmd.exe /d /c <path>` (see
-    /// [`materialize_cmd_script`]); PowerShell/PosixSh snippets stay one
-    /// argv element.
+    /// [`materialize_cmd_script`]); PowerShell snippets stay one argv
+    /// element and carry [`POWERSHELL_UTF8_PRELUDE`]; PosixSh snippets stay
+    /// one argv element.
     pub fn lower_with(
         &self,
         configured_platform_shell: Option<&OsStr>,
@@ -453,6 +472,13 @@ impl CommandSpec {
                     }
                 }
                 if !materialized {
+                    // PowerShell scripts carry the terminal-wide UTF-8
+                    // stdout prelude (see [`POWERSHELL_UTF8_PRELUDE`]).
+                    let script = if matches!(shell, ShellKind::PowerShell) {
+                        format!("{POWERSHELL_UTF8_PRELUDE}{script}")
+                    } else {
+                        script.clone()
+                    };
                     args.push(script.into());
                 }
                 Ok(ResolvedCommand { program, args })
@@ -706,11 +732,16 @@ mod tests {
         // Every lowering materializes its own unique script file.
         let second = CommandSpec::shell(script, ShellKind::Cmd).lower().unwrap();
         assert_ne!(resolved.args[2], second.args[2]);
-        // PowerShell stays a single -Command argv element (unchanged).
+        // PowerShell stays a single -Command argv element, carrying the
+        // terminal-wide UTF-8 prelude before the verbatim script.
         let ps = CommandSpec::shell(script, ShellKind::PowerShell)
             .lower()
             .unwrap();
-        assert_eq!(ps.args.last().unwrap(), &OsString::from(script));
+        assert_eq!(ps.args.len(), 4);
+        assert_eq!(
+            ps.args[3],
+            OsString::from(format!("{POWERSHELL_UTF8_PRELUDE}{script}"))
+        );
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(std::path::PathBuf::from(&second.args[2]));
     }
@@ -727,6 +758,10 @@ mod tests {
             .unwrap();
         assert_eq!(ps.program, OsString::from("powershell.exe"));
         assert_eq!(ps.args[1], OsString::from("-NonInteractive"));
+        assert_eq!(
+            ps.args.last().unwrap(),
+            &OsString::from(format!("{POWERSHELL_UTF8_PRELUDE}Get-Date"))
+        );
         #[cfg(unix)]
         {
             let sh = CommandSpec::shell("true", ShellKind::PosixSh)
@@ -734,6 +769,41 @@ mod tests {
                 .unwrap();
             assert_eq!(sh.program, OsString::from("/bin/sh"));
         }
+    }
+
+    #[test]
+    fn powershell_scripts_carry_the_utf8_stdout_prelude_convention() {
+        // The terminal-wide PowerShell convention, frozen here so the
+        // invariant is testable on every host: fixed flags, one -Command
+        // argv element, and the exact UTF-8 prelude before the verbatim
+        // script (a redirected 5.1 stdout defaults to OEM 437 and would
+        // mangle non-ASCII output).
+        assert_eq!(
+            POWERSHELL_UTF8_PRELUDE,
+            "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
+             $OutputEncoding=[System.Text.Encoding]::UTF8; "
+        );
+        let script = "Write-Output '日本語'";
+        let ps = CommandSpec::shell(script, ShellKind::PowerShell)
+            .lower()
+            .unwrap();
+        assert_eq!(ps.program, OsString::from("powershell.exe"));
+        assert_eq!(
+            ps.args,
+            vec![
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from(format!("{POWERSHELL_UTF8_PRELUDE}{script}")),
+            ]
+        );
+        assert!(
+            ps.args[3]
+                .to_string_lossy()
+                .ends_with("Write-Output '日本語'"),
+            "the script itself must stay verbatim after the prelude: {:?}",
+            ps.args[3]
+        );
     }
 
     #[test]
