@@ -29,6 +29,9 @@ sealed class TaskTreeNode(val label: String) {
     class Plain(label: String) : TaskTreeNode(label)
 }
 
+/** Dimmed label color of background children (a presentation-only concept). */
+private val BACKGROUND_DIM = java.awt.Color(140, 140, 140)
+
 class TaskTreePanel : JPanel(BorderLayout()) {
 
     interface Listener {
@@ -228,6 +231,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
     fun childLabel(child: ChildNode): String {
         val text = StringBuilder()
         text.append(child.childId).append(" [").append(child.state).append("]")
+        if (child.background) text.append(" (background)")
         if (child.itemId != null) text.append(" item=").append(child.itemId)
         if (child.itemKind != null) text.append(" kind=").append(child.itemKind)
         text.append(" model=").append(child.model ?: "-")
@@ -292,8 +296,16 @@ class TaskTreePanel : JPanel(BorderLayout()) {
                 sprite?.setState(child.state)
                 panel.background = if (selected) backgroundSelectionColor else backgroundNonSelectionColor
                 panel.isOpaque = true
-                label.foreground = if (selected) textSelectionColor else textNonSelectionColor
-                label.font = label.font.deriveFont(Font.PLAIN)
+                // Background children are dimmed (gray + italic); presentation
+                // never changes the child's state badge or controls.
+                label.foreground = if (selected) {
+                    textSelectionColor
+                } else if (child.background) {
+                    BACKGROUND_DIM
+                } else {
+                    textNonSelectionColor
+                }
+                label.font = label.font.deriveFont(if (child.background) Font.ITALIC else Font.PLAIN)
                 label.text = bound(childLabel(child) + " || " + childResultLabel(child), 420)
                 return panel
             }

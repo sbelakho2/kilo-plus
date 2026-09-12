@@ -34,6 +34,33 @@ pub struct Validation {
     pub clean: bool,
 }
 
+/// Outcome of one [`WorktreeManager::commit_all`] (P2 completion steps):
+/// every exit is truthful — a clean tree NEVER mints an empty commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// The staged tree was committed on the current branch.
+    Committed { sha: String, subject: String },
+    /// The working tree was already clean: nothing to commit.
+    NothingToCommit,
+    /// The repository has no HEAD yet (unborn branch): an initial commit is
+    /// NOT minted silently by the completion path.
+    EmptyRepository,
+}
+
+/// Outcome of one [`WorktreeManager::push_branch`] (P2 completion steps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The command pushed (or confirmed) the branch on the remote.
+    Pushed { note: String },
+    /// The remote already held the branch at the pushed commit.
+    AlreadyCurrent { note: String },
+}
+
+/// Deliberate network-op bound: 60 s per push/remote read so a wedged or
+/// unreachable remote fails the step typed instead of hanging the daemon
+/// (the 15 s bound stays for local git ops).
+const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Durable worktree metadata (spec §33): git knows nothing about session
 /// ownership, so the manager records it next to the repository's own
 /// bookkeeping (inside `.git/` — never user-visible, gitignored by
@@ -307,6 +334,20 @@ impl WorktreeManager {
         args: &[OsString],
         owner: ProcessOwner,
     ) -> Result<String, Error> {
+        // Deliberate CI-hang bound: 15s per local git op so a wedged git
+        // process fails the op (and its test) instead of hanging the whole
+        // stage.
+        self.git_with_timeout(repo, args, owner, std::time::Duration::from_secs(15))
+            .await
+    }
+
+    async fn git_with_timeout(
+        &self,
+        repo: &Path,
+        args: &[OsString],
+        owner: ProcessOwner,
+        timeout: std::time::Duration,
+    ) -> Result<String, Error> {
         if !repo.is_dir() {
             return Err(Error::not_found(format!(
                 "repository {} not found",
@@ -323,15 +364,9 @@ impl WorktreeManager {
             owner,
             ..Default::default()
         };
-        // Deliberate CI-hang bound: 15s per git op so a wedged git process
-        // fails the op (and its test) instead of hanging the whole stage.
         let out = self
             .supervisor
-            .run(
-                cfg,
-                std::time::Duration::from_secs(15),
-                CancellationToken::new(),
-            )
+            .run(cfg, timeout, CancellationToken::new())
             .await?;
         if out.exit_code != Some(0) {
             return Err(Error::new(
@@ -351,6 +386,24 @@ impl WorktreeManager {
         // git output is used verbatim.
         let out = strip_exit_trailer(&out.excerpt);
         Ok(out)
+    }
+
+    /// A non-zero exit is a TYPED absence (`Ok(None)`) for probes whose
+    /// negative answer is plain state (unborn HEAD, missing remote-tracking
+    /// ref) — but a directory that is not a repository at all is still a
+    /// loud error, never "absent".
+    async fn git_probe(
+        &self,
+        repo: &Path,
+        args: &[&str],
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        match self.git(repo, &args, owner).await {
+            Ok(out) => Ok(Some(strip_exit_trailer(&out))),
+            Err(e) if e.message.contains("not a git repository") => Err(e),
+            Err(_) => Ok(None),
+        }
     }
 
     // ---------------------------------------------------------------- worktrees
@@ -525,6 +578,201 @@ impl WorktreeManager {
         })
     }
 
+    // --------------------------------------------------- completion helpers
+    // (P2 completion steps: commit/push execution behind the durable
+    // completion contract; all additive — no existing call site changes.)
+
+    /// The current branch of `repo`; empty on a detached HEAD (the caller
+    /// decides whether that is a typed failure).
+    pub async fn current_branch(&self, repo: &Path, owner: ProcessOwner) -> Result<String, Error> {
+        let out = self
+            .git_read(repo, &["branch", "--show-current"], owner)
+            .await?;
+        Ok(out.trim().to_string())
+    }
+
+    /// The SHA `HEAD` resolves to; `None` on an unborn branch (an empty
+    /// repository's truthful state, never an error).
+    pub async fn head_sha(
+        &self,
+        repo: &Path,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        Ok(self
+            .git_probe(repo, &["rev-parse", "--verify", "HEAD"], owner)
+            .await?
+            .map(|s| s.trim().to_string()))
+    }
+
+    /// The full commit message of `HEAD`; `None` on an unborn branch.
+    pub async fn head_message(
+        &self,
+        repo: &Path,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        let out = self
+            .git_probe(
+                repo,
+                &["log", "-1", "--pretty=format:%B", "--no-show-signature"],
+                owner,
+            )
+            .await?;
+        Ok(out.map(|s| s.trim_end().to_string()))
+    }
+
+    /// TRUE when the working tree (including untracked files) is clean.
+    pub async fn is_clean(&self, repo: &Path, owner: ProcessOwner) -> Result<bool, Error> {
+        let out = self
+            .git_read(repo, &["status", "--porcelain"], owner)
+            .await?;
+        Ok(out.trim().is_empty())
+    }
+
+    /// The URL of the configured `remote`, or `None` when the repository
+    /// carries NO remotes at all (the completion push step's documented
+    /// "no remote configured" case). A repository that has remotes but not
+    /// this one is a typed error — never a silent skip of a misconfigured
+    /// remote.
+    pub async fn remote_url(
+        &self,
+        repo: &Path,
+        remote: &str,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        validate_remote(remote)?;
+        let listed = self.git_read(repo, &["remote"], owner.clone()).await?;
+        let names: Vec<&str> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if names.is_empty() {
+            return Ok(None);
+        }
+        if !names.contains(&remote) {
+            return Err(Error::malformed(format!(
+                "git remote {remote:?} is not configured (remotes: {})",
+                names.join(", ")
+            )));
+        }
+        let url = self
+            .git_read(repo, &["remote", "get-url", remote], owner)
+            .await?;
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return Err(Error::malformed(format!(
+                "git remote {remote:?} has an empty URL"
+            )));
+        }
+        Ok(Some(url))
+    }
+
+    /// The remote-tracking SHA of `remote/branch`, or `None` when the local
+    /// repository has no such tracking ref (never fetched/pushed yet).
+    pub async fn pushed_ref_sha(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+        owner: ProcessOwner,
+    ) -> Result<Option<String>, Error> {
+        validate_remote(remote)?;
+        let refname = format!("refs/remotes/{remote}/{branch}");
+        Ok(self
+            .git_probe(repo, &["rev-parse", "--verify", &refname], owner)
+            .await?
+            .map(|s| s.trim().to_string()))
+    }
+
+    /// Stage every change in `repo` and commit it on the current branch.
+    /// Truthful outcomes only: a clean tree is [`CommitOutcome::NothingToCommit`]
+    /// and an unborn HEAD is [`CommitOutcome::EmptyRepository`] — an empty
+    /// commit is NEVER minted by this path.
+    pub async fn commit_all(
+        &self,
+        repo: &Path,
+        message: &str,
+        owner: ProcessOwner,
+    ) -> Result<CommitOutcome, Error> {
+        if message.trim().is_empty() {
+            return Err(Error::malformed("commit message must not be empty"));
+        }
+        // Dirty check + HEAD probe are read-only; `add`/`commit` serialize
+        // under the repository's write lock.
+        if self.is_clean(repo, owner.clone()).await? {
+            return Ok(CommitOutcome::NothingToCommit);
+        }
+        if self.head_sha(repo, owner.clone()).await?.is_none() {
+            return Ok(CommitOutcome::EmptyRepository);
+        }
+        self.git_mutate(repo, &["add", "-A"], owner.clone()).await?;
+        self.git_mutate_os(
+            repo,
+            &[
+                OsString::from("commit"),
+                OsString::from("-m"),
+                OsString::from(message),
+            ],
+            owner.clone(),
+        )
+        .await
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::Internal,
+                format!("git commit failed: {}", e.message),
+            )
+        })?;
+        let sha = self
+            .head_sha(repo, owner.clone())
+            .await?
+            .ok_or_else(|| Error::internal("commit succeeded but HEAD is unborn"))?;
+        let subject = self
+            .git_read(repo, &["log", "-1", "--pretty=%s"], owner)
+            .await?
+            .trim()
+            .to_string();
+        Ok(CommitOutcome::Committed { sha, subject })
+    }
+
+    /// Push `branch` to `remote` under the repository's write lock, with the
+    /// network bound ([`GIT_NETWORK_TIMEOUT`]). "Everything up-to-date" is a
+    /// truthful [`PushOutcome::AlreadyCurrent`] (the contract's idempotent
+    /// already-pushed success), never a failure.
+    pub async fn push_branch(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+        owner: ProcessOwner,
+    ) -> Result<PushOutcome, Error> {
+        validate_remote(remote)?;
+        validate_branch(branch)?;
+        let args: Vec<OsString> = [
+            OsString::from("push"),
+            OsString::from(remote),
+            OsString::from(branch),
+        ]
+        .into_iter()
+        .collect();
+        let lock = self.lock_for(repo);
+        let _guard = lock.write().await;
+        let out = self
+            .git_with_timeout(repo, &args, owner, GIT_NETWORK_TIMEOUT)
+            .await?;
+        let note = out
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        if out.contains("Everything up-to-date") {
+            Ok(PushOutcome::AlreadyCurrent { note })
+        } else {
+            Ok(PushOutcome::Pushed { note })
+        }
+    }
+
     pub async fn remove(&self, wt: &Worktree) -> Result<(), Error> {
         self.git_mutate_os(
             &wt.workspace_root,
@@ -545,7 +793,6 @@ impl WorktreeManager {
         self.save_meta(&wt.workspace_root, &meta);
         Ok(())
     }
-
     /// Deliberate, DURABLE ownership move (spec §33): the recorded owner of
     /// the worktree becomes `new_owner` and survives daemon restarts.
     pub async fn transfer(&self, wt: &Worktree, new_owner: SessionId) -> Result<(), Error> {
@@ -653,6 +900,27 @@ fn validate_name(name: &str) -> Result<(), Error> {
     }
     if name.contains('/') || name.contains("..") || name.contains(' ') || name.contains('\t') {
         return Err(Error::malformed(format!("worktree name {name:?} rejected")));
+    }
+    Ok(())
+}
+
+/// Remote names are git ref-ish identifiers: bounded ASCII without
+/// whitespace or characters that could re-parse as options/paths.
+fn validate_remote(remote: &str) -> Result<(), Error> {
+    if remote.is_empty() || remote.len() > 128 {
+        return Err(Error::malformed("remote name empty or too long"));
+    }
+    if remote.starts_with('-')
+        || remote.contains("..")
+        || remote.contains('/')
+        || remote.contains('\\')
+    {
+        return Err(Error::malformed(format!("remote name {remote:?} rejected")));
+    }
+    for c in remote.chars() {
+        if c.is_control() || c.is_whitespace() || matches!(c, '~' | '^' | ':' | '?' | '*' | '[') {
+            return Err(Error::malformed(format!("remote name {remote:?} rejected")));
+        }
     }
     Ok(())
 }
@@ -1604,5 +1872,189 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+    }
+
+    /// P2 completion-step git helpers (adversarial covers).
+    mod completion_git_tests {
+        use super::*;
+
+        async fn bare_fixture() -> (
+            tempfile::TempDir,
+            Arc<ProcessSupervisor>,
+            WorktreeManager,
+            PathBuf,
+            PathBuf,
+        ) {
+            let (dir, sup, mgr, repo) = fixture().await;
+            // Pin a local identity so `commit_all` (which never invents one)
+            // succeeds in the fixture repo.
+            mgr.git_mutate(
+                &repo,
+                &["config", "user.email", "test@kilo.local"],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            mgr.git_mutate(
+                &repo,
+                &["config", "user.name", "Kilo Test"],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            let bare = dir.path().join("remote.git");
+            mgr.git_mutate(
+                dir.path(),
+                &["init", "--bare", "-q", bare.to_str().unwrap()],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            (dir, sup, mgr, repo, bare)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn commit_all_is_truthful_and_never_mints_empty_commits() {
+            let (_d, _sup, mgr, repo, _bare) = bare_fixture().await;
+            std::fs::write(repo.join("README.md"), "# changed\n").unwrap();
+            let out = mgr
+                .commit_all(&repo, "faktor: implement the change", ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let (sha, subject) = match out {
+                CommitOutcome::Committed { sha, subject } => (sha, subject),
+                other => panic!("expected a real commit, got {other:?}"),
+            };
+            assert_eq!(sha.len(), 40, "full sha expected: {sha}");
+            assert_eq!(subject, "faktor: implement the change");
+            assert!(mgr.is_clean(&repo, ProcessOwner::Daemon).await.unwrap());
+            assert_eq!(
+                mgr.head_sha(&repo, ProcessOwner::Daemon).await.unwrap(),
+                Some(sha)
+            );
+            // Replay on a clean tree: truthful NothingToCommit, no new commit.
+            assert_eq!(
+                mgr.commit_all(&repo, "faktor: implement the change", ProcessOwner::Daemon)
+                    .await
+                    .unwrap(),
+                CommitOutcome::NothingToCommit
+            );
+            // Unborn HEAD with a dirty tree: EmptyRepository, nothing minted.
+            let empty = _d.path().join("empty-repo");
+            std::fs::create_dir_all(&empty).unwrap();
+            mgr.git_mutate(&empty, &["init", "-q", "-b", "main"], ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            std::fs::write(empty.join("a.txt"), "x").unwrap();
+            assert_eq!(
+                mgr.commit_all(&empty, "faktor: x", ProcessOwner::Daemon)
+                    .await
+                    .unwrap(),
+                CommitOutcome::EmptyRepository
+            );
+            assert!(
+                mgr.head_sha(&empty, ProcessOwner::Daemon)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "an initial commit must never be minted"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn push_branch_reports_pushed_then_already_current() {
+            let (_d, _sup, mgr, repo, bare) = bare_fixture().await;
+            mgr.git_mutate(
+                &repo,
+                &["remote", "add", "origin", bare.to_str().unwrap()],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            std::fs::write(repo.join("new.txt"), "content").unwrap();
+            let head = match mgr
+                .commit_all(&repo, "faktor: add new.txt", ProcessOwner::Daemon)
+                .await
+                .unwrap()
+            {
+                CommitOutcome::Committed { sha, .. } => sha,
+                other => panic!("expected commit, got {other:?}"),
+            };
+            let first = mgr
+                .push_branch(&repo, "origin", "main", ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            assert!(
+                matches!(first, PushOutcome::Pushed { .. }),
+                "first push must be Pushed: {first:?}"
+            );
+            // The remote-tracking ref now names the pushed commit.
+            assert_eq!(
+                mgr.pushed_ref_sha(&repo, "origin", "main", ProcessOwner::Daemon)
+                    .await
+                    .unwrap(),
+                Some(head.clone())
+            );
+            // Idempotent replay: the same push reports AlreadyCurrent.
+            let second = mgr
+                .push_branch(&repo, "origin", "main", ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            assert!(
+                matches!(second, PushOutcome::AlreadyCurrent { .. }),
+                "replayed push must be AlreadyCurrent: {second:?}"
+            );
+            let bare_head = mgr
+                .git_read(&bare, &["rev-parse", "main"], ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            assert_eq!(bare_head.trim(), head);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn remote_absence_and_hostile_names_are_typed() {
+            let (_d, _sup, mgr, repo, bare) = bare_fixture().await;
+            assert_eq!(
+                mgr.remote_url(&repo, "origin", ProcessOwner::Daemon)
+                    .await
+                    .unwrap(),
+                None,
+                "a repository with no remotes reports the documented absence"
+            );
+            mgr.git_mutate(
+                &repo,
+                &["remote", "add", "origin", bare.to_str().unwrap()],
+                ProcessOwner::Daemon,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                mgr.remote_url(&repo, "origin", ProcessOwner::Daemon)
+                    .await
+                    .unwrap(),
+                Some(bare.to_str().unwrap().to_string())
+            );
+            // Remotes exist but not the configured one: a typed error, never a
+            // silent skip of a misconfigured remote.
+            let err = mgr
+                .remote_url(&repo, "upstream", ProcessOwner::Daemon)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Malformed, "{err:?}");
+            for hostile in ["", "-x", "a b", "a/../b", "a\\b", "a\tb", "x~y", "x:y"] {
+                assert!(
+                    validate_remote(hostile).is_err(),
+                    "remote {hostile:?} must be rejected"
+                );
+            }
+            // A non-repository directory is loud, never "clean".
+            let not_repo = _d.path().join("not-a-repo");
+            std::fs::create_dir_all(&not_repo).unwrap();
+            let err = mgr
+                .commit_all(&not_repo, "faktor: x", ProcessOwner::Daemon)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::Internal, "{err:?}");
+        }
     }
 }

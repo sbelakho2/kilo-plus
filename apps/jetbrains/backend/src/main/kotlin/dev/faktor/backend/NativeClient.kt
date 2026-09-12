@@ -32,6 +32,7 @@ import dev.faktor.shared.NativePromptReceipt
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativePermissionAck
 import dev.faktor.shared.NativePermissionEntry
+import dev.faktor.shared.NativePresentationAck
 import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeReady
 import dev.faktor.shared.NativeRequests
@@ -44,7 +45,9 @@ import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
 import dev.faktor.shared.NativeTournament
+import dev.faktor.shared.NativeTournamentDecision
 import dev.faktor.shared.NativeTournamentStarted
+import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import dev.faktor.shared.parseNativeAbortAck
@@ -59,6 +62,7 @@ import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
 import dev.faktor.shared.parseNativePermissionAck
 import dev.faktor.shared.parseNativePermissionList
+import dev.faktor.shared.parseNativePresentationAck
 import dev.faktor.shared.parseNativeProjection
 import dev.faktor.shared.parseNativePromptReceipt
 import dev.faktor.shared.parseNativeReady
@@ -71,7 +75,9 @@ import dev.faktor.shared.parseNativeTaskRuns
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
 import dev.faktor.shared.parseNativeTournament
+import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
+import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeUsage
 import dev.faktor.shared.parseNativeVerificationView
 import java.io.ByteArrayOutputStream
@@ -263,6 +269,39 @@ class NativeClient(
             )
         )
 
+    /** The durable tournament listing of one session (newest last). */
+    fun tournaments(sessionId: String): List<NativeTournamentSummary> =
+        parseNativeTournamentSummaries(
+            request("GET", "/native/session/" + encode(sessionId) + "/tournaments")
+        )
+
+    /** Run the deterministic comparison; engine refusals are typed (404/409). */
+    fun decideTournament(sessionId: String, tournamentId: String): NativeTournamentDecision =
+        parseNativeTournamentDecision(
+            request(
+                "POST",
+                "/native/session/" + encode(sessionId) + "/tournaments/" +
+                    encode(tournamentId) + "/decide",
+                null,
+                NativeRequests.decideTournament()
+            )
+        )
+
+    /** Abort one tournament with an optional reason; returns the durable state. */
+    fun abortTournament(
+        sessionId: String,
+        tournamentId: String,
+        reason: String? = null
+    ): NativeTournament = parseNativeTournament(
+        request(
+            "POST",
+            "/native/session/" + encode(sessionId) + "/tournaments/" +
+                encode(tournamentId) + "/abort",
+            null,
+            NativeRequests.abortTournament(reason)
+        )
+    )
+
     // ------------------------------------------------------- orchestrator graph
 
     fun orchestratorGraph(sessionId: String): NativeOrchestratorGraph =
@@ -333,6 +372,26 @@ class NativeClient(
             )
         )
     }
+
+    /**
+     * Durable presentation/attention transition of one child of
+     * [sessionId]: `foreground` shows the child in the main tree,
+     * `background` dims/tucks it. The server owns the terminal-child
+     * refusal (typed 409) and the idempotent same-state no-op.
+     */
+    fun setAgentPresentation(
+        sessionId: String,
+        childId: String,
+        presentation: String
+    ): NativePresentationAck = parseNativePresentationAck(
+        request(
+            "POST",
+            "/native/session/" + encode(sessionId) + "/agents/" + encode(childId) +
+                "/presentation",
+            null,
+            NativeRequests.changePresentation(presentation)
+        )
+    )
 
     private fun agentControl(childId: String, action: String): NativeAgentControlAck =
         parseNativeAgentControlAck(

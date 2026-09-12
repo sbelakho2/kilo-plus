@@ -1,10 +1,14 @@
 // Tournament view: the durable candidates of a session tournament with
 // their verification record/verdict, independent review, measured cost and
-// wall time, and the winner state. Supports loading a tournament by id and
-// starting an N = 2..4 candidate tournament through the native route. Pure
-// presentation: work is delegated to a Listener.
+// wall time, and the winner state. Auto-populated from the durable listing
+// (`GET .../tournaments`) on session open; supports loading a tournament by
+// id, deciding/aborting an OPEN tournament through the additive native
+// control routes (decide is disabled until every candidate settled) and
+// starting an N = 2..4 candidate tournament. Pure presentation: work is
+// delegated to a Listener.
 package dev.faktor.frontend
 
+import dev.faktor.shared.NativeTournamentSummary
 import java.awt.BorderLayout
 import java.awt.FlowLayout
 import java.awt.GridLayout
@@ -25,9 +29,13 @@ class TournamentPanel : JPanel(BorderLayout()) {
     interface Listener {
         fun onLoadTournament(tournamentId: String)
         fun onStartTournament(goal: String, criteria: List<String>, n: Int)
+        fun onDecideTournament(tournamentId: String)
+        fun onAbortTournament(tournamentId: String, reason: String)
     }
 
     private val title = JLabel("tournament: none on this session")
+
+    private val summariesLabel = JLabel("session tournaments: none")
 
     private val candidatesModel = CandidateTableModel()
 
@@ -45,9 +53,17 @@ class TournamentPanel : JPanel(BorderLayout()) {
 
     private val startButton = JButton("Start tournament")
 
+    private val decideButton = JButton("Decide winner")
+
+    private val abortButton = JButton("Abort")
+
+    private val abortReasonField = JTextField(14)
+
     private val detail = compactArea(4)
 
     private var listener: Listener? = null
+
+    private var currentTournament: TournamentView? = null
 
     init {
         candidatesTable.fillsViewportHeight = true
@@ -90,10 +106,32 @@ class TournamentPanel : JPanel(BorderLayout()) {
             listener?.onStartTournament(goal, criteria, (countSpinner.value as Number).toInt())
         }
 
+        // Decide/abort are OPEN-only: decide additionally waits until every
+        // candidate settled (the engine refuses NoEligibleWinner otherwise).
+        decideButton.isEnabled = false
+        abortButton.isEnabled = false
+        decideButton.addActionListener {
+            val id = currentTournament?.id
+            if (id != null && decideButton.isEnabled) listener?.onDecideTournament(id)
+        }
+        abortButton.addActionListener {
+            val id = currentTournament?.id
+            if (id != null && abortButton.isEnabled) {
+                listener?.onAbortTournament(id, abortReasonField.text.trim())
+            }
+        }
+        val controlRow = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        controlRow.add(summariesLabel)
+        controlRow.add(decideButton)
+        controlRow.add(JLabel("abort reason"))
+        controlRow.add(abortReasonField)
+        controlRow.add(abortButton)
+
         val header = JPanel(GridLayout(0, 1, 0, 2))
         header.add(title)
         header.add(loadRow)
         header.add(startRow)
+        header.add(controlRow)
 
         val body = JPanel(BorderLayout(0, 4))
         body.add(header, BorderLayout.NORTH)
@@ -106,8 +144,22 @@ class TournamentPanel : JPanel(BorderLayout()) {
         listener = value
     }
 
+    /** The durable listing of the session's tournaments (newest last). */
+    fun setSummaries(summaries: List<NativeTournamentSummary>) {
+        if (summaries.isEmpty()) {
+            summariesLabel.text = "session tournaments: none"
+            return
+        }
+        summariesLabel.text = "session tournaments: " + summaries.joinToString(", ") {
+            it.id + "[" + it.state + "]"
+        }
+    }
+
     /** Renders (or clears) the tournament; null means "no tournament exists". */
     fun setTournament(tournament: TournamentView?) {
+        currentTournament = tournament
+        decideButton.isEnabled = tournament != null && tournament.canDecide
+        abortButton.isEnabled = tournament != null && tournament.open
         if (tournament == null) {
             title.text = "tournament: none on this session"
             candidatesModel.setCandidates(emptyList())
@@ -120,6 +172,16 @@ class TournamentPanel : JPanel(BorderLayout()) {
         candidatesModel.setCandidates(tournament.candidates)
         if (tournament.candidates.isNotEmpty()) candidatesTable.setRowSelectionInterval(0, 0)
     }
+
+    fun current(): TournamentView? = currentTournament
+
+    fun decideEnabled(): Boolean = decideButton.isEnabled
+
+    fun abortEnabled(): Boolean = abortButton.isEnabled
+
+    fun summariesText(): String = summariesLabel.text
+
+    fun abortReason(): String = abortReasonField.text.trim()
 
     fun candidateCount(): Int = candidatesModel.rowCount
 

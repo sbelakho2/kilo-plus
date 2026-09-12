@@ -636,6 +636,33 @@ data class NativeTournamentStarted(
     val winner: String?
 )
 
+/** One listing summary of a durable tournament (`GET .../tournaments`). */
+data class NativeTournamentSummary(
+    val id: String,
+    val state: String,
+    val candidateCount: Long,
+    val winner: String?,
+    val decidedMs: Long?
+)
+
+/** One discarded candidate of a decision (`discarded[]`). */
+data class NativeTournamentDiscarded(val childId: String, val reason: String)
+
+/** The deterministic decision ack (`POST .../tournaments/{id}/decide`). */
+data class NativeTournamentDecision(
+    val tournamentId: String,
+    val winner: String,
+    val rationale: String,
+    val discarded: List<NativeTournamentDiscarded>
+)
+
+/** One durable presentation transition ack (`changed=false` = idempotent). */
+data class NativePresentationAck(
+    val childId: String,
+    val presentation: String,
+    val changed: Boolean
+)
+
 // ------------------------------------------------- permissions (SDK reply path)
 
 data class NativePermissionEntry(
@@ -1149,6 +1176,43 @@ fun parseNativeTournamentStarted(json: String): NativeTournamentStarted {
     )
 }
 
+fun parseNativeTournamentSummaries(json: String): List<NativeTournamentSummary> {
+    val v = JsonCodec.parse(json).view("GET /native/session/{id}/tournaments")
+    return v.array().map {
+        NativeTournamentSummary(
+            id = it.field("id").string(),
+            state = it.field("state").string(),
+            candidateCount = it.field("candidate_count").long(),
+            winner = it.optionalField("winner")?.string(),
+            decidedMs = it.optionalField("decided_ms")?.long()
+        )
+    }
+}
+
+fun parseNativeTournamentDecision(json: String): NativeTournamentDecision {
+    val v = JsonCodec.parse(json).view("POST /native/session/{id}/tournaments/{id}/decide")
+    return NativeTournamentDecision(
+        tournamentId = v.field("tournament_id").string(),
+        winner = v.field("winner").string(),
+        rationale = v.field("rationale").string(),
+        discarded = v.field("discarded").array().map {
+            NativeTournamentDiscarded(
+                childId = it.field("child_id").string(),
+                reason = it.field("reason").string()
+            )
+        }
+    )
+}
+
+fun parseNativePresentationAck(json: String): NativePresentationAck {
+    val v = JsonCodec.parse(json).view("POST /native/session/{id}/agents/{child}/presentation")
+    return NativePresentationAck(
+        childId = v.field("child_id").string(),
+        presentation = v.field("presentation").string(),
+        changed = v.field("changed").bool()
+    )
+}
+
 // ----------------------------------------------------------- permission parse
 
 fun parseNativePermissionList(json: String): List<NativePermissionEntry> {
@@ -1318,6 +1382,15 @@ object NativeRequests {
         .toJson()
 
     fun steer(text: String): String = JsonObjectBuilder().put("text", text).toJson()
+
+    /** The strict decide body: no operator input, exactly `{}`. */
+    fun decideTournament(): String = JsonObjectBuilder().toJson()
+
+    fun abortTournament(reason: String?): String =
+        JsonObjectBuilder().put("reason", reason?.takeIf { it.isNotEmpty() }).toJson()
+
+    fun changePresentation(presentation: String): String =
+        JsonObjectBuilder().put("state", presentation).toJson()
 
     fun changeModel(model: String): String = JsonObjectBuilder().put("model", model).toJson()
 

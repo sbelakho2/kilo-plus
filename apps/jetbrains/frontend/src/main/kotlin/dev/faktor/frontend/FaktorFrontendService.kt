@@ -26,6 +26,7 @@ import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativePermissionAck
 import dev.faktor.shared.NativePermissionEntry
+import dev.faktor.shared.NativePresentationAck
 import dev.faktor.shared.NativeProjection
 import dev.faktor.shared.NativePromptReceipt
 import dev.faktor.shared.NativeSessionCreated
@@ -37,7 +38,9 @@ import dev.faktor.shared.NativeTaskRunStarted
 import dev.faktor.shared.NativeTaskVerification
 import dev.faktor.shared.NativeTaskView
 import dev.faktor.shared.NativeTournament
+import dev.faktor.shared.NativeTournamentDecision
 import dev.faktor.shared.NativeTournamentStarted
+import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeUsageTotals
 import dev.faktor.shared.NativeVerificationView
 import java.nio.file.Path
@@ -240,6 +243,18 @@ class FaktorFrontendService(
     fun tournamentState(tournamentId: String): NativeTournament =
         clientOrThrow().tournamentState(requireSession(), tournamentId)
 
+    /** The durable tournament listing of the current session (newest last). */
+    fun tournaments(): List<NativeTournamentSummary> =
+        clientOrThrow().tournaments(requireSession())
+
+    /** Decide the tournament; engine refusals surface as typed NativeApiException. */
+    fun decideTournament(tournamentId: String): NativeTournamentDecision =
+        clientOrThrow().decideTournament(requireSession(), tournamentId)
+
+    /** Abort the tournament with an optional reason; returns the durable state. */
+    fun abortTournament(tournamentId: String, reason: String? = null): NativeTournament =
+        clientOrThrow().abortTournament(requireSession(), tournamentId, reason)
+
     // -------------------------------------------------------------- permissions
 
     fun permissions(): List<NativePermissionEntry> =
@@ -275,6 +290,10 @@ class FaktorFrontendService(
         maxTokens: Long? = null,
         maxCostMicro: Long? = null
     ): NativeAgentControlAck = clientOrThrow().setAgentBudget(childId, maxTokens, maxCostMicro)
+
+    /** Durable foreground/background presentation transition of one child. */
+    fun setAgentPresentation(childId: String, presentation: String): NativePresentationAck =
+        clientOrThrow().setAgentPresentation(requireSession(), childId, presentation)
 
     // ------------------------------------------------------ usage/verification
 

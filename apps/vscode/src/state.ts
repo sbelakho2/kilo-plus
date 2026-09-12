@@ -89,6 +89,9 @@ export interface AgentSummary {
   readonly result: Json;
   readonly budget: number | null;
   readonly blockers: readonly string[];
+  /** Durable presentation/attention state; background children render
+   * dimmed and tucked. Absent on the wire means foreground. */
+  readonly presentation: 'foreground' | 'background';
   readonly pixel: import('./pixelAgents').PixelPresence;
 }
 
@@ -755,6 +758,7 @@ export function summarizeAgents(
       result: boundJson(result),
       budget: asInt(agent.budget),
       blockers: agentBlockers(agent),
+      presentation: agent.presentation === 'background' ? 'background' : 'foreground',
       pixel: folded?.get(agentId) ?? pixelPresence(agentId, state),
     });
   }

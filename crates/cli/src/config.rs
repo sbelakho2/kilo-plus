@@ -36,9 +36,118 @@ pub struct Config {
     pub sandbox: SandboxCfg,
     /// The additive `[tasks]` section: native task execution policy.
     pub tasks: TasksCfg,
+    /// The additive `[completion]` section (P2 completion-step execution):
+    /// the strict commit/push/PR execution policy.
+    pub completion: CompletionCfg,
     /// The additive `[efficiency]` section (audit 86 + the efficiency-variant
     /// production flags): five boolean feature switches, ALL default `false`.
     pub efficiency: EfficiencyCfg,
+}
+
+/// The additive `[completion]` section (P2 follow-up): how a contracted
+/// run's ordered commit/push/PR steps execute.
+///
+/// Strict by construction: unknown keys are parse errors (derived
+/// `deny_unknown_fields`), non-string values are type errors, and the
+/// resolved [`faktor_orchestrator::runtime::completion_steps::CompletionStepsConfig`]
+/// is validated (bounded remote/base branch; a bounded single-line
+/// `pr_command` template without shell metacharacters, with known
+/// placeholders only and `{branch}` required). An absent section keeps the
+/// inert defaults: push targets `origin`, the PR base is `main`, and an
+/// unconfigured `pr_command` records the documented `Skipped` outcome — a
+/// requested PR step is never silently invented.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+pub struct CompletionCfg {
+    /// The git remote the push step targets (default `origin`).
+    pub remote: Option<String>,
+    /// The base branch rendered into the PR template (default `main`).
+    pub base_branch: Option<String>,
+    /// The PR command template, e.g. `"gh pr create --head {branch} --base {base}"`.
+    /// `None` (the default) means a requested PR step records `Skipped`.
+    pub pr_command: Option<String>,
+}
+
+/// Map-only strict parsing: a positional JSON array must never configure the
+/// section by position, duplicates are refused and unknown keys are typed
+/// errors — the same discipline the completion contract itself uses.
+impl<'de> serde::Deserialize<'de> for CompletionCfg {
+    fn deserialize<D>(de: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct SectionVisitor;
+
+        impl<'de> Visitor<'de> for SectionVisitor {
+            type Value = CompletionCfg;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("the [completion] section as a JSON object")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<CompletionCfg, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut out = CompletionCfg::default();
+                let mut seen: u8 = 0;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "remote" => {
+                            if seen & 1 != 0 {
+                                return Err(A::Error::duplicate_field("remote"));
+                            }
+                            seen |= 1;
+                            out.remote = map.next_value()?;
+                        }
+                        "base_branch" => {
+                            if seen & 2 != 0 {
+                                return Err(A::Error::duplicate_field("base_branch"));
+                            }
+                            seen |= 2;
+                            out.base_branch = map.next_value()?;
+                        }
+                        "pr_command" => {
+                            if seen & 4 != 0 {
+                                return Err(A::Error::duplicate_field("pr_command"));
+                            }
+                            seen |= 4;
+                            out.pr_command = map.next_value()?;
+                        }
+                        other => {
+                            return Err(A::Error::unknown_field(
+                                other,
+                                &["remote", "base_branch", "pr_command"],
+                            ))
+                        }
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_map(SectionVisitor)
+    }
+}
+
+impl CompletionCfg {
+    /// Resolve and STRICTLY validate the completion-step execution policy.
+    /// Any invalid remote/base/template is an error: a typo never half-runs.
+    pub fn steps_config(
+        &self,
+    ) -> Result<faktor_orchestrator::runtime::completion_steps::CompletionStepsConfig, String> {
+        let config = faktor_orchestrator::runtime::completion_steps::CompletionStepsConfig {
+            remote: self.remote.clone().unwrap_or_else(|| "origin".to_string()),
+            base_branch: self
+                .base_branch
+                .clone()
+                .unwrap_or_else(|| "main".to_string()),
+            pr_command: self.pr_command.clone(),
+        };
+        config.validate().map_err(|e| format!("completion: {e}"))?;
+        Ok(config)
+    }
 }
 
 /// The additive `[tasks]` section (P0-48 shadow mutation roots, wave-24
@@ -343,6 +452,8 @@ impl<'de> serde::Deserialize<'de> for Config {
             sandbox: SandboxCfg,
             #[serde(default)]
             tasks: TasksCfg,
+            #[serde(default)]
+            completion: CompletionCfg,
             #[serde(default = "production_efficiency")]
             efficiency: EfficiencyCfg,
         }
@@ -364,6 +475,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             verification: file.verification,
             sandbox: file.sandbox,
             tasks: file.tasks,
+            completion: file.completion,
             efficiency: file.efficiency,
         })
     }
@@ -397,6 +509,7 @@ impl Default for Config {
             verification: VerificationCfg::default(),
             sandbox: SandboxCfg::default(),
             tasks: TasksCfg::default(),
+            completion: CompletionCfg::default(),
             efficiency: EfficiencyCfg::production_defaults(),
         }
     }
@@ -2208,5 +2321,78 @@ mod tests {
             baseline, boosted,
             "the parsed flag must decide planner construction"
         );
+    }
+}
+
+#[cfg(test)]
+mod completion_cfg_tests {
+    //! Adversarial strictness covers for the additive `[completion]` section
+    //! (P2 step execution): absent => inert defaults, unknown keys / wrong
+    //! shapes / invalid templates are parse or validation errors, and a
+    //! configured template resolves to the exact orchestrator policy.
+    use super::*;
+
+    fn parse(json: serde_json::Value) -> Result<Config, serde_json::Error> {
+        serde_json::from_value(json)
+    }
+
+    #[test]
+    fn absent_completion_section_keeps_the_inert_defaults() {
+        let cfg = parse(serde_json::json!({"model": "m"})).unwrap();
+        assert_eq!(cfg.completion, CompletionCfg::default());
+        let steps = cfg.completion.steps_config().unwrap();
+        assert_eq!(steps.remote, "origin");
+        assert_eq!(steps.base_branch, "main");
+        assert_eq!(steps.pr_command, None);
+    }
+
+    #[test]
+    fn configured_completion_section_resolves_to_the_validated_policy() {
+        let cfg = parse(serde_json::json!({
+            "model": "m",
+            "completion": {
+                "remote": "upstream",
+                "base_branch": "develop",
+                "pr_command": "gh pr create --head {branch} --base {base}"
+            }
+        }))
+        .unwrap();
+        let steps = cfg.completion.steps_config().unwrap();
+        assert_eq!(steps.remote, "upstream");
+        assert_eq!(steps.base_branch, "develop");
+        assert_eq!(
+            steps.pr_command.as_deref(),
+            Some("gh pr create --head {branch} --base {base}")
+        );
+    }
+
+    #[test]
+    fn completion_section_is_strict_and_hostile_values_are_refused() {
+        // Unknown key anywhere in the section.
+        assert!(
+            parse(serde_json::json!({"completion": {"pr_command": "x {branch}", "extra": 1}}))
+                .is_err()
+        );
+        // Non-string member.
+        assert!(parse(serde_json::json!({"completion": {"pr_command": 7}})).is_err());
+        // Positional array shape is not a section.
+        assert!(parse(serde_json::json!({"completion": ["origin"]})).is_err());
+        // A shell-metachar / unclosed / unknown-placeholder / branch-less
+        // template is refused at resolution time (never half-run).
+        for (name, command) in [
+            ("metachar", "gh pr create --head {branch}; rm -rf /"),
+            ("unknown", "gh pr create --head {nope}"),
+            ("branchless", "gh pr create --base main"),
+            ("unclosed", "gh pr create --head {branch"),
+        ] {
+            let cfg = parse(serde_json::json!({"completion": {"pr_command": command}})).unwrap();
+            let err = cfg.completion.steps_config().unwrap_err();
+            assert!(err.starts_with("completion: "), "{name}: {err}");
+        }
+        // Hostile remote / base names are refused.
+        let cfg = parse(serde_json::json!({"completion": {"remote": "a b"}})).unwrap();
+        assert!(cfg.completion.steps_config().is_err());
+        let cfg = parse(serde_json::json!({"completion": {"base_branch": "a..b"}})).unwrap();
+        assert!(cfg.completion.steps_config().is_err());
     }
 }

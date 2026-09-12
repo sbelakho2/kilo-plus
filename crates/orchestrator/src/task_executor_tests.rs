@@ -3626,3 +3626,149 @@ async fn tournament_abort_discards_all_candidates_and_is_durable() {
     assert_eq!(reopened.state, TournamentState::Aborted);
     assert!(reopened.winner.is_none());
 }
+
+// ------------------------------------------------ completion steps (P2)
+
+/// The completion-step runner over a real supervisor and an allow-all
+/// egress policy (the executor fixture's agent carries no supervisor, so
+/// the runner is installed explicitly).
+fn completion_step_runner(
+    root: &std::path::Path,
+) -> Arc<crate::runtime::completion_steps::CompletionStepRunner> {
+    use crate::runtime::completion_steps::{
+        CompletionStepRunner, CompletionStepsConfig, EgressPolicy,
+    };
+    let cas = Arc::new(faktor_cas::Cas::open(root.join("completion-cas")).unwrap());
+    let supervisor = faktor_terminal::ProcessSupervisor::new(cas);
+    let egress: Arc<dyn EgressPolicy> = Arc::new(|_url: &str| Ok(()));
+    Arc::new(
+        CompletionStepRunner::new(supervisor, egress, CompletionStepsConfig::default()).unwrap(),
+    )
+}
+
+fn cs_git(cwd: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn cs_seed_repo(root: &std::path::Path) {
+    cs_git(root, &["init", "-q", "-b", "main"]);
+    cs_git(root, &["config", "user.email", "test@kilo.local"]);
+    cs_git(root, &["config", "user.name", "Kilo Test"]);
+    std::fs::write(root.join("README.md"), "base\n").unwrap();
+    cs_git(root, &["add", "-A"]);
+    cs_git(root, &["commit", "-q", "-m", "init"]);
+}
+
+/// Adversarial executor-level cover of the additive invocation: an
+/// uncontracted or unverified run NEVER invokes the runner (no rows, no git
+/// side effects), while a contracted run whose durable verification passed
+/// executes the requested step against the owner root and records the
+/// outcome durably.
+#[tokio::test]
+async fn completion_steps_are_additive_and_fail_closed() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = open_real_tool_env_full(
+        dir.path(),
+        vec![],
+        faktor_agent::VerificationService::disabled(),
+        false,
+        false,
+        MutationMode::DirectCompat,
+    );
+    env.executor
+        .set_completion_steps(Some(completion_step_runner(dir.path())));
+    cs_seed_repo(&env.owner_root);
+    let h = env.manager.get_session(env.parent).unwrap().unwrap();
+    let task_id = h.task_id().unwrap();
+    let now = h.now_ms();
+    h.create_task(faktor_session::Task {
+        task_id,
+        session_id: env.parent,
+        goal: "execute the agreed completion steps".into(),
+        acceptance_criteria: vec![],
+        plan: vec![],
+        budget: faktor_session::TaskBudget::default(),
+        state: TaskState::Pending,
+        created_ms: now,
+        updated_ms: now,
+    })
+    .unwrap();
+    // (1) No contract: the runner is never invoked — the deliberately
+    // uninitialized root in the injected runner would have failed loudly.
+    assert!(env
+        .executor
+        .run_completion_steps(env.parent)
+        .await
+        .unwrap()
+        .is_none());
+    // (2) Contract recorded, but the durable verification fact says nothing
+    // (or failed): fail-closed — no step runs, no row lands.
+    let rev = h.task_revision(task_id).unwrap();
+    h.set_completion_contract(
+        task_id,
+        rev,
+        faktor_core::completion::CompletionContract {
+            include_commit: true,
+            include_push: false,
+            include_pr: false,
+        },
+    )
+    .unwrap();
+    assert!(env
+        .executor
+        .run_completion_steps(env.parent)
+        .await
+        .unwrap()
+        .is_none());
+    h.upsert_memory_fact("verification", "last", r#"{"status":"failed"}"#)
+        .unwrap();
+    assert!(env
+        .executor
+        .run_completion_steps(env.parent)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(h
+        .ledger_completion_step_statuses(task_id.raw(), rev.raw())
+        .unwrap()
+        .is_empty());
+    // (3) Verification passed with a real change: the commit step runs
+    // against the session's owner root and the durable row is Succeeded.
+    std::fs::write(env.owner_root.join("feature.txt"), "content\n").unwrap();
+    h.upsert_memory_fact("verification", "last", r#"{"status":"passed"}"#)
+        .unwrap();
+    let report = env
+        .executor
+        .run_completion_steps(env.parent)
+        .await
+        .unwrap()
+        .expect("a contracted verified run must execute");
+    assert!(report.all_succeeded(), "{report:?}");
+    let rows = h
+        .ledger_completion_step_statuses(task_id.raw(), rev.raw())
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].status,
+        faktor_core::completion::CompletionStepOutcome::Succeeded
+    );
+    let porcelain = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&env.owner_root)
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&porcelain.stdout).trim().is_empty(),
+        "the owner root must be committed clean"
+    );
+}

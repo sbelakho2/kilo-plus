@@ -595,6 +595,118 @@ fn tournament_error_response(e: &faktor_orchestrator::tournament::TournamentErro
     })
 }
 
+/// Max bytes of a native abort reason (bounded everything; the rationale
+/// persisted on the durable decision row is never operator-unbounded).
+pub(crate) const MAX_ABORT_REASON_BYTES: usize = 512;
+
+/// Strict request DTO of the additive tournament decide route
+/// (`POST /native/session/{id}/tournaments/{tournament_id}/decide`): the
+/// engine's comparison takes NO operator input, so the body is exactly `{}`
+/// (a typo, a hostile member or a missing body is a plain 400).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTournamentDecideBody {}
+
+/// Strict request DTO of the additive tournament abort route
+/// (`POST /native/session/{id}/tournaments/{tournament_id}/abort`): an
+/// optional bounded `reason` recorded verbatim on the durable decision row.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeTournamentAbortBody {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /native/session/{id}/tournaments/{tournament_id}/decide` — run the
+/// deterministic comparison of ONE durable tournament through the executor's
+/// ONE decide authority ([`faktor_orchestrator::runtime::task_executor::TaskExecutor::decide_tournament`]):
+/// the `TournamentDecided` audit row is persisted, every loser is discarded
+/// and the PROPOSED winner is returned (integration stays the explicit
+/// approved-merge path). Engine refusals are typed: unknown ids 404, a
+/// non-open tournament or no eligible candidate 409 (the candidate band must
+/// have settled with a passing verification and an independent review).
+/// Strict body (`{}` only); hostile bodies are 400s.
+pub(crate) async fn native_tournament_decide(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, tournament_id)): Path<(String, String)>,
+    body: Result<Json<NativeTournamentDecideBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(_) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native tournament decide body")),
+    };
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match state
+        .deps
+        .tasks
+        .decide_tournament(handle.id(), &tournament_id)
+    {
+        Ok(decision) => Json(serde_json::json!({
+            "tournament_id": decision.tournament_id,
+            "winner": decision.winner.child_id,
+            "rationale": decision.rationale,
+            "discarded": decision
+                .discarded
+                .iter()
+                .map(|(child_id, reason)| serde_json::json!({
+                    "child_id": child_id,
+                    "reason": reason,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => exec_error_response(&e),
+    }
+}
+
+/// `POST /native/session/{id}/tournaments/{tournament_id}/abort` — discard
+/// ONE tournament through the executor's ONE abort authority
+/// ([`faktor_orchestrator::runtime::task_executor::TaskExecutor::abort_tournament`]):
+/// every candidate is settled terminal + its worktree removed, the terminal
+/// `TournamentDecided { outcome: aborted }` row records the reason and no
+/// winner is proposed. The response is the reconstructed durable tournament.
+/// Unknown ids are 404s; a terminal tournament is a typed 409. Strict body
+/// (`{"reason"?: "..."}`, bounded); hostile bodies are 400s.
+pub(crate) async fn native_tournament_abort(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, tournament_id)): Path<(String, String)>,
+    body: Result<Json<NativeTournamentAbortBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(e) = authed(&headers, &state) {
+        return (StatusCode::UNAUTHORIZED, Json(e.to_json())).into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(_) => return wire_status(malformed_body("invalid native tournament abort body")),
+    };
+    let reason = body.reason.unwrap_or_default();
+    if reason.len() > MAX_ABORT_REASON_BYTES {
+        return wire_status(malformed_body(&format!(
+            "abort reason must be <= {MAX_ABORT_REASON_BYTES} bytes"
+        )));
+    }
+    let handle = match native_resolve_session(&state, &id) {
+        Ok(h) => h,
+        Err(r) => return *r,
+    };
+    match state
+        .deps
+        .tasks
+        .abort_tournament(handle.id(), &tournament_id, &reason)
+    {
+        Ok(tournament) => Json(tournament).into_response(),
+        Err(e) => exec_error_response(&e),
+    }
+}
+
 /// `GET /native/session/{id}/tournaments` — the durable listing of the
 /// session's tournaments (id, state, candidate count, winner, decided_ms),
 /// folded from the typed ledger rows (`TournamentStarted` + settlements +

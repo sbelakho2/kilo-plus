@@ -3249,6 +3249,13 @@ pub mod task_executor;
 #[path = "shadow.rs"]
 pub mod shadow;
 
+/// PR/CI-fix completion step EXECUTION (P2 follow-up): the ordered
+/// commit/push/pr runner invoked additively after a run's deterministic
+/// verification and before the durable completion gate certifies, recording
+/// every outcome through the existing `set_completion_step_status` seam.
+#[path = "completion_steps.rs"]
+pub mod completion_steps;
+
 /// Map a finished drive to the child's terminal or blocked state plus the
 /// durable blocker when one applies. A genuine end whose OWN verification
 /// failed is a FAILED child — never a claimed complete. A turn that ended

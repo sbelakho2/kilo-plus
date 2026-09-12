@@ -163,6 +163,25 @@ button:disabled {
   padding: 1px 6px;
 }
 
+/* Background children: dimmed and tucked into their own group. */
+.agent.agent-background {
+  opacity: 0.55;
+}
+
+.agent.agent-background .agent-title {
+  font-style: italic;
+}
+
+.agent-group-label {
+  margin-top: 2px;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.6;
+  border-top: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.35));
+  padding-top: 4px;
+}
+
 #entries {
   display: flex;
   flex-direction: column;

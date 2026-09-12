@@ -117,6 +117,29 @@
     return button;
   }
 
+  /** The durable presentation tag (absent = foreground, per the native v1 contract). */
+  function presentationOf(agent) {
+    return agent && agent.presentation === 'background' ? 'background' : 'foreground';
+  }
+
+  /** The foreground/background toggle: posts the EXACT next durable state. */
+  function presentationButton(agent) {
+    var background = presentationOf(agent) === 'background';
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'presentation-toggle';
+    button.textContent = background ? 'Foreground' : 'Background';
+    button.addEventListener('click', function () {
+      vscode.postMessage({
+        type: 'agentControl',
+        agentId: agent.agentId,
+        action: 'presentation',
+        state: background ? 'foreground' : 'background',
+      });
+    });
+    return button;
+  }
+
   /** The deterministic pixel sprite as an inline SVG (no external assets). */
   function pixelSprite(agent) {
     var pixel = agent.pixel;
@@ -191,10 +214,45 @@
       return;
     }
     card.hidden = false;
-    for (var i = 0; i < agents.length; i++) {
-      var agent = agents[i];
+    // Background children are dimmed AND grouped/tucked after every
+    // foreground entry; the order derives only from the durable
+    // presentation field, never from a state heuristic.
+    var ordered = [];
+    var backgroundCount = 0;
+    var i;
+    for (i = 0; i < agents.length; i++) {
+      if (agents[i].kind === 'child' && presentationOf(agents[i]) === 'background') {
+        backgroundCount += 1;
+      } else {
+        ordered.push(agents[i]);
+      }
+    }
+    var grouped = ordered.slice();
+    if (backgroundCount > 0) {
+      grouped.push({ groupLabel: 'Background (' + backgroundCount + ') — dimmed', background: true });
+    }
+    for (i = 0; i < agents.length; i++) {
+      if (agents[i].kind === 'child' && presentationOf(agents[i]) === 'background') {
+        grouped.push(agents[i]);
+      }
+    }
+
+    for (i = 0; i < grouped.length; i++) {
+      var entry = grouped[i];
+      if (entry.groupLabel) {
+        var groupItem = document.createElement('li');
+        groupItem.className = 'agent-group-label';
+        groupItem.textContent = entry.groupLabel;
+        list.appendChild(groupItem);
+        continue;
+      }
+      var agent = entry;
+      var background = agent.kind === 'child' && presentationOf(agent) === 'background';
       var item = document.createElement('li');
-      item.className = 'agent agent-' + (agent.kind === 'child' ? 'child' : 'self');
+      item.className =
+        'agent agent-' +
+        (agent.kind === 'child' ? 'child' : 'self') +
+        (background ? ' agent-background' : '');
 
       var head = document.createElement('div');
       head.className = 'agent-head';
@@ -210,6 +268,7 @@
         agent.agentId +
         ' · ' +
         agent.state +
+        (background ? ' · background' : '') +
         (agent.model ? ' · ' + agent.model : '') +
         (agent.provider ? ' · ' + agent.provider : '');
       head.appendChild(title);
@@ -245,6 +304,7 @@
       if (agent.kind === 'child') {
         var controls = document.createElement('div');
         controls.className = 'agent-controls';
+        controls.appendChild(presentationButton(agent));
         controls.appendChild(agentButton(agent, 'pause', 'Pause'));
         controls.appendChild(agentButton(agent, 'resume', 'Resume'));
         controls.appendChild(agentButton(agent, 'steer', 'Steer'));

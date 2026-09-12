@@ -29,6 +29,7 @@ import dev.faktor.shared.NativeTaskView
 import dev.faktor.shared.NativeTournament
 import dev.faktor.shared.NativeTournamentCandidate
 import dev.faktor.shared.NativeTournamentCriterion
+import dev.faktor.shared.NativeTournamentSummary
 import dev.faktor.shared.NativeVerificationView
 
 /** Max evidence refs surfaced by one task tree (bounded like the cockpit). */
@@ -106,8 +107,14 @@ data class ChildNode(
     val remainingTokens: Long?,
     val remainingCostMicro: Long?,
     val progress: NativeAgentProgress?,
-    val result: NativeChildResult?
-)
+    val result: NativeChildResult?,
+    /** Durable presentation/attention state: foreground or background. */
+    val presentation: String = "foreground"
+) {
+    /** Background children render dimmed and are tucked after the foreground ones. */
+    val background: Boolean
+        get() = presentation == "background"
+}
 
 /** Verification status of the task tree (criteria/checks/owed). */
 data class VerificationSummary(
@@ -159,7 +166,19 @@ data class TournamentView(
 ) {
     val decided: Boolean
         get() = winner != null
+
+    /** Buttons are exposed while the engine can still act on the tournament. */
+    val open: Boolean
+        get() = state == "open" || state == "deciding"
+
+    /** Decide is enabled once every candidate has settled (engine rule). */
+    val canDecide: Boolean
+        get() = open && candidates.isNotEmpty() && candidates.none { it.state == "running" }
 }
+
+/** The tournament the panel auto-loads on session open: the NEWEST summary. */
+fun latestTournamentId(summaries: List<NativeTournamentSummary>): String? =
+    summaries.lastOrNull()?.id
 
 /** Everything the rich tree panel renders, built purely from native DTOs. */
 data class TaskTreeModel(
@@ -194,6 +213,10 @@ object TaskTree {
     ): TaskTreeModel {
         val children = agents
             .filter { it.kind == "child" }
+            // Background children are tucked after the foreground ones; the
+            // sort is stable so the daemon's listing order survives inside
+            // each group.
+            .sortedBy { if (it.presentation == "background") 1 else 0 }
             .map { child ->
                 childNode(child, catalog, childUsage[child.sessionId.toString()])
             }
@@ -285,7 +308,8 @@ object TaskTree {
             remainingTokens = remainingTokens,
             remainingCostMicro = remainingCost,
             progress = agent.progress,
-            result = agent.result
+            result = agent.result,
+            presentation = agent.presentation
         )
     }
 

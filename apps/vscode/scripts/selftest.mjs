@@ -26,6 +26,7 @@ import * as px from '../src/pixelAgents.ts';
 import * as cp from '../src/cockpit.ts';
 import composerPolicy from '../media/composer-state.js';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { bridgeTests } from './bridge-selftest.mjs';
 
 // ------------------------------------------------------------- test harness
@@ -234,6 +235,7 @@ const agentsJson = [
   },
 ];
 const controlAckJson = { queuedSeq: 3, applied: null };
+const presentationAckJson = { child_id: 'c1', presentation: 'background', changed: true };
 const messagePageJson = {
   sessionId: '7',
   messages: [
@@ -440,7 +442,12 @@ async function validatorAccepts() {
     assertEqual(nc.validateTaskRunStarted(clone(taskRunStartedJson)).state, 'Pending');
     assertEqual(nc.validateTaskRunCancelled(clone(taskRunCancelledJson)).cancelled, true);
     assertEqual(nc.validateAgents(clone(agentsJson)).length, 2);
+    assertEqual(nc.validateAgents(clone(agentsJson))[1].presentation, 'foreground');
+    const presented = clone(agentsJson);
+    presented[1].presentation = 'background';
+    assertEqual(nc.validateAgents(presented)[1].presentation, 'background');
     assertEqual(nc.validateAgentControlAck(clone(controlAckJson), 'test').queuedSeq, 3);
+    assertEqual(nc.validateAgentPresentationAck(clone(presentationAckJson), 'test').presentation, 'background');
     assertEqual(nc.validateMessagePage(clone(messagePageJson)).messages[0].parts[0].kind, 'text');
     assertEqual(nc.validateEventPage(clone(eventPageJson)).events[0].seq, 1);
     assertEqual(nc.validateSessionUsage(clone(sessionUsageJson)).tasks[0].taskId, 't1');
@@ -491,6 +498,14 @@ async function validatorRejects() {
     );
     assertProtocol(() => nc.validateAgents([{ ...clone(agentsJson[1]), kind: 'parent' }]), 'expected "self" or "child"');
     assertProtocol(() => nc.validateAgents([{ ...clone(agentsJson[1]), budget: 1.5 }]), 'expected an integer or null');
+    assertProtocol(
+      () => nc.validateAgents([{ ...clone(agentsJson[1]), presentation: 'hidden' }]),
+      'expected "foreground" or "background"',
+    );
+    assertProtocol(
+      () => nc.validateAgentPresentationAck({ child_id: 'c1', presentation: null, changed: true }, 'test'),
+      'expected "foreground" or "background"',
+    );
     assertProtocol(() => nc.validateMessagePage({ ...clone(messagePageJson), messages: [{ seq: '2' }] }), 'missing required field id');
     assertProtocol(() => nc.validateEventPage({ ...clone(eventPageJson), events: [{ ...eventPageJson.events[0], opId: 7 }] }), 'expected a string or null');
     const missingDurable = clone(usageTotalsJson);
@@ -529,6 +544,7 @@ async function clientAccepts() {
       'POST /native/agents/c1/steer': () => jsonResponse(controlAckJson),
       'POST /native/agents/c1/model': () => jsonResponse(controlAckJson),
       'POST /native/agents/c1/budget': () => jsonResponse(controlAckJson),
+      'POST /native/session/7/agents/c1/presentation': () => jsonResponse(presentationAckJson),
       'GET /native/messages': () => jsonResponse(messagePageJson),
       'GET /native/events': () => jsonResponse(eventPageJson),
       'GET /native/usage': () => jsonResponse(usageTotalsJson),
@@ -566,6 +582,10 @@ async function clientAccepts() {
     assertEqual((await client.steerAgent('c1', 'focus')).queuedSeq, 3);
     assertEqual((await client.setAgentModel('c1', 'm')).queuedSeq, 3);
     assertEqual((await client.setAgentBudget('c1', { max_tokens: 1000 })).queuedSeq, 3);
+    assertEqual(
+      (await client.setAgentPresentation('7', 'c1', 'background')).presentation,
+      'background',
+    );
     assertEqual((await client.messages('7', { before: 9, limit: 2 })).messages[0].id, 2);
     assertEqual((await client.events('7', { after: 7, limit: 3 })).events[0].seq, 1);
     assertEqual((await client.usage()).sessions, 1);
@@ -600,6 +620,9 @@ async function clientAccepts() {
     assertDeepEqual(findCall(calls, 'POST', '/native/agents/c1/steer').body, { text: 'focus' });
     assertDeepEqual(findCall(calls, 'POST', '/native/agents/c1/model').body, { model: 'm' });
     assertDeepEqual(findCall(calls, 'POST', '/native/agents/c1/budget').body, { max_tokens: 1000 });
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/agents/c1/presentation').body, {
+      state: 'background',
+    });
     assertDeepEqual(findCall(calls, 'POST', '/native/evidence/41/retrieve').body, {
       selector: 'all',
     });
@@ -1198,10 +1221,51 @@ async function childInspectionTests() {
     assertEqual(child.provider, 'fake');
     assertEqual(child.reasoning, true);
     assertEqual(child.thinking, true);
+    assertEqual(child.presentation, 'foreground');
     assertEqual(child.pixel.childId, 'c1');
     const self = summaries.find((agent) => agent.agentId === 'r1');
     assertDeepEqual(self.itemIds, ['main']);
     assertEqual(self.provider, null);
+  });
+
+  await test('background presentation survives the summary and defaults to foreground', () => {
+    const [background] = st.summarizeAgents([
+      { ...clone(agentsJson[1]), presentation: 'background' },
+    ]);
+    assertEqual(background.presentation, 'background');
+    const [missing] = st.summarizeAgents([clone(agentsJson[1])]);
+    assertEqual(missing.presentation, 'foreground');
+    const [hostile] = st.summarizeAgents([
+      { ...clone(agentsJson[1]), presentation: 'invisible' },
+    ]);
+    assertEqual(hostile.presentation, 'foreground', 'unknown tags never fabricate background');
+  });
+
+  await test('presentation transitions use the session-scoped route and surface typed 409s', async () => {
+    const { client, calls } = makeClient({
+      'POST /native/session/7/agents/c1/presentation': () => jsonResponse(presentationAckJson),
+    });
+    const ack = await client.setAgentPresentation('7', 'c1', 'background');
+    assertEqual(ack.child_id, 'c1');
+    assertEqual(ack.changed, true);
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/agents/c1/presentation').body, {
+      state: 'background',
+    });
+    const terminal = makeClient({
+      'POST /native/session/7/agents/c1/presentation': () =>
+        new Response(
+          JSON.stringify({
+            error: { code: 'conflict', message: 'terminal child', retryable: false },
+          }),
+          { status: 409 },
+        ),
+    });
+    await assertRejects(
+      () => terminal.client.setAgentPresentation('7', 'c1', 'foreground'),
+      (error) =>
+        error instanceof nc.NativeApiError && error.status === 409 && error.code === 'conflict',
+      'typed terminal presentation refusal',
+    );
   });
 
   await test('child summary fields are bounded and blocker fields surface when present', () => {
@@ -1426,6 +1490,226 @@ async function cockpitTests() {
     assertEqual(cp.phaseOf({ stage: 'verify' }), 'verify');
     assertEqual(cp.buildCockpit({ task: null, agents: [], verification: null, usage: null, taskVerification: null }), null);
   });
+
+  await test('cockpit tucks background children last and marks them dimmed', () => {
+    const [backgroundChild] = st.summarizeAgents([
+      { ...clone(agentsJson[1]), presentation: 'background' },
+    ]);
+    const [foregroundChild] = st.summarizeAgents([clone(agentsJson[1])]);
+    const view = cp.buildCockpit({
+      task: null,
+      agents: [backgroundChild, foregroundChild],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    assertDeepEqual(
+      view.children.map((child) => child.presentation),
+      ['foreground', 'background'],
+      'background children are ordered after the foreground ones',
+    );
+    const children = cp.cockpitSections(view).find((section) => section.key === 'children');
+    assert(
+      children.lines[1].includes('background (dimmed)'),
+      JSON.stringify(children.lines),
+    );
+  });
+}
+
+// ----------------------------------------- presentation webview (fake DOM)
+
+function makeFakeDom() {
+  const nodesById = new Map();
+  function makeNode(tagName) {
+    const node = {
+      tagName,
+      children: [],
+      parentNode: null,
+      attributes: {},
+      listeners: {},
+      className: '',
+      textContent: '',
+      scrollTop: 0,
+      scrollHeight: 0,
+      hidden: false,
+      value: '',
+      type: '',
+    };
+    node.appendChild = (child) => {
+      node.children.push(child);
+      child.parentNode = node;
+      return child;
+    };
+    node.removeChild = (child) => {
+      const index = node.children.indexOf(child);
+      if (index >= 0) {
+        node.children.splice(index, 1);
+      }
+      return child;
+    };
+    node.setAttribute = (key, value) => {
+      node.attributes[key] = String(value);
+    };
+    node.getAttribute = (key) => (key in node.attributes ? node.attributes[key] : null);
+    node.addEventListener = (type, callback) => {
+      if (!node.listeners[type]) {
+        node.listeners[type] = [];
+      }
+      node.listeners[type].push(callback);
+    };
+    node.dispatch = (type, event) => {
+      for (const callback of node.listeners[type] || []) {
+        callback(event || {});
+      }
+    };
+    node.click = () => node.dispatch('click', {});
+    node.cloneNode = () => {
+      const copy = makeNode(tagName);
+      copy.className = node.className;
+      copy.textContent = node.textContent;
+      return copy;
+    };
+    Object.defineProperty(node, 'firstChild', { get: () => node.children[0] || null });
+    Object.defineProperty(node, 'childNodes', { get: () => node.children });
+    return node;
+  }
+  const document = {
+    getElementById(id) {
+      if (!nodesById.has(id)) {
+        nodesById.set(id, makeNode('div'));
+      }
+      return nodesById.get(id);
+    },
+    createElement: makeNode,
+    createElementNS: (namespace, tagName) => makeNode(tagName),
+    querySelectorAll: () => [],
+  };
+  return { document, nodesById, makeNode };
+}
+
+function walkFake(root, visit) {
+  visit(root);
+  for (const child of root.children || []) {
+    walkFake(child, visit);
+  }
+}
+
+function findFake(root, predicate) {
+  let found = null;
+  walkFake(root, (node) => {
+    if (found === null && predicate(node)) {
+      found = node;
+    }
+  });
+  return found;
+}
+
+function webviewSnapshot(agents) {
+  return {
+    daemon: 'running',
+    daemonDetail: 'selftest',
+    baseUrl: 'http://127.0.0.1:9',
+    session: clone(sessionSummaryJson),
+    machineState: 'idle',
+    machineLabel: 'Idle',
+    sessions: [clone(sessionSummaryJson)],
+    runs: [],
+    activeRunId: null,
+    agents,
+    task: null,
+    verification: null,
+    usage: null,
+    cockpit: null,
+    cockpitSections: [],
+    transcript: [],
+    streamStatus: 'open',
+    lastError: null,
+    busy: false,
+  };
+}
+
+function runChatWebview(snapshot) {
+  const source = readFileSync(new URL('../media/chat.js', import.meta.url), 'utf8');
+  const posted = [];
+  const dom = makeFakeDom();
+  let messageHandler = null;
+  const sandbox = {
+    document: dom.document,
+    window: {
+      addEventListener(type, callback) {
+        if (type === 'message') {
+          messageHandler = callback;
+        }
+      },
+    },
+    acquireVsCodeApi: () => ({ postMessage: (message) => posted.push(message) }),
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  assert(messageHandler, 'chat.js must register a window message listener');
+  messageHandler({ data: { type: 'snapshot', snapshot } });
+  return { posted, dom };
+}
+
+async function presentationWebviewTests() {
+  await test('background children render dimmed+grouped and the toggle posts the next state', () => {
+    const backgroundWire = clone(agentsJson).map((agent) =>
+      agent.kind === 'child' ? { ...agent, presentation: 'background' } : agent,
+    );
+    const agents = st.summarizeAgents(nc.validateAgents(backgroundWire));
+    const { posted, dom } = runChatWebview(webviewSnapshot(agents));
+    const list = dom.document.getElementById('agent-list');
+    const dimmed = findFake(list, (node) => String(node.className).includes('agent-background'));
+    assert(dimmed, 'a background child must carry the agent-background class');
+    const group = findFake(list, (node) => node.className === 'agent-group-label');
+    assert(
+      group && /Background \(1\)/.test(group.textContent),
+      `background children must be grouped: ${group && group.textContent}`,
+    );
+    const title = findFake(dimmed, (node) => String(node.className).includes('agent-title'));
+    assert(
+      title && title.textContent.includes('background'),
+      `the dimmed marker must surface in the title: ${title && title.textContent}`,
+    );
+    const toggle = findFake(
+      dimmed,
+      (node) => node.tagName === 'button' && node.textContent === 'Foreground',
+    );
+    assert(toggle, 'a background child must offer a Foreground toggle');
+    toggle.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'agentControl',
+      agentId: 'c1',
+      action: 'presentation',
+      state: 'foreground',
+    });
+
+    const foreground = st.summarizeAgents(nc.validateAgents(clone(agentsJson)));
+    const second = runChatWebview(webviewSnapshot(foreground));
+    const secondList = second.dom.document.getElementById('agent-list');
+    assert(
+      !findFake(secondList, (node) => String(node.className).includes('agent-background')),
+      'foreground children are never dimmed',
+    );
+    assert(
+      !findFake(secondList, (node) => node.className === 'agent-group-label'),
+      'no background group without background children',
+    );
+    const forward = findFake(
+      secondList,
+      (node) => node.tagName === 'button' && node.textContent === 'Background',
+    );
+    assert(forward, 'a foreground child must offer a Background toggle');
+    forward.click();
+    assertDeepEqual(second.posted[second.posted.length - 1], {
+      type: 'agentControl',
+      agentId: 'c1',
+      action: 'presentation',
+      state: 'background',
+    });
+  });
 }
 
 
@@ -1446,6 +1730,7 @@ async function main() {
   await childInspectionTests();
   await pixelAgentTests();
   await cockpitTests();
+  await presentationWebviewTests();
   for (const { label, fn } of bridgeTests) {
     await test(`bridge: ${label}`, fn);
   }

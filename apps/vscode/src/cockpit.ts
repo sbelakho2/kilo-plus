@@ -39,6 +39,7 @@ export interface CockpitChildView {
   readonly budget: number | null;
   readonly progress: string | null;
   readonly result: string | null;
+  readonly presentation: 'foreground' | 'background';
 }
 
 export interface CockpitVerificationView {
@@ -176,7 +177,12 @@ function boundedJson(value: unknown): string | null {
 
 export function buildCockpit(input: CockpitInput): CockpitView | null {
   const { task, agents, verification, usage, taskVerification } = input;
-  const children = agents.filter((agent) => agent.kind === 'child');
+  // Background children are TUCKED: they render after the foreground ones
+  // (the durable presentation field decides; never the state heuristics).
+  const allChildren = agents.filter((agent) => agent.kind === 'child');
+  const children = allChildren.filter((child) => child.presentation !== 'background').concat(
+    allChildren.filter((child) => child.presentation === 'background'),
+  );
   if (task === null && children.length === 0 && verification === null) {
     return null;
   }
@@ -344,6 +350,7 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
       budget: child.budget,
       progress: boundedJson(child.progress),
       result: boundedJson(child.result),
+      presentation: child.presentation === 'background' ? 'background' : 'foreground',
     })),
     blockers,
     verification: verificationView,
@@ -388,6 +395,7 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
         ? view.children.map((child) => {
             const bits = [
               `${child.childId} [${child.state}]`,
+              child.presentation === 'background' ? 'background (dimmed)' : null,
               child.itemId ? `item ${child.itemId}${child.itemKind ? ` (${child.itemKind})` : ''}` : null,
               child.worktreeId !== null ? `worktree ${child.worktreeId}` : null,
               `ownership ${child.ownership}`,

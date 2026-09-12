@@ -959,6 +959,18 @@ fn build_daemon_core(
         Some(shadows.clone()),
         config.tasks.mutation_mode,
     );
+    // P2 completion-step execution: the strict `[completion]` section feeds
+    // the executor's commit/push/PR policy. An absent section keeps the
+    // inert defaults (push origin, base main, unconfigured PR => Skipped);
+    // an invalid section fails daemon startup instead of half-running.
+    tasks
+        .configure_completion_steps(
+            config
+                .completion
+                .steps_config()
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
     // THE durable evidence authority is the runtime's own allocation: the
     // graph stores the same `Arc` the runtime's compiler/archiver use, and
     // serve hands the same `Arc` to the native server. No second authority

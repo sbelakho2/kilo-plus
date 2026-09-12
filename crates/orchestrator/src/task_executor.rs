@@ -58,6 +58,10 @@ use faktor_session::{
     SessionManager, TaskBudget, MAX_TASK_CRITERIA, MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
 };
 
+use super::completion_steps::{
+    CompletionStepContext, CompletionStepReport, CompletionStepRunner, CompletionStepsConfig,
+    EgressPolicy,
+};
 use super::shadow::ShadowRoots;
 use super::{
     parent_facts, ChildSpec, CrashSeam, ExecConfig, ExecError, OrchestratorRuntime,
@@ -401,6 +405,19 @@ pub struct TaskExecutor {
     /// The ONE candidate-root allocator: every orchestrated run's isolated
     /// root is allocated here, never supplied by a client.
     run_roots: Arc<CandidateWorkspaceService>,
+    /// P2 completion-step wiring: the strict execution config plus the
+    /// lazily built runner (over the agent's own supervisor + sandbox
+    /// egress policy). `None` runner = no completion step is ever invoked;
+    /// an uncontracted run never touches this field beyond `None`.
+    completion_steps: Mutex<CompletionStepsWiring>,
+}
+
+/// The completion-step wiring of one executor: the configured template
+/// values and the cached runner (rebuilt when the config changes).
+#[derive(Default)]
+struct CompletionStepsWiring {
+    config: CompletionStepsConfig,
+    runner: Option<Arc<CompletionStepRunner>>,
 }
 
 impl std::fmt::Debug for TaskExecutor {
@@ -469,7 +486,72 @@ impl TaskExecutor {
             shadows,
             mode,
             run_roots,
+            completion_steps: Mutex::new(CompletionStepsWiring::default()),
         })
+    }
+
+    /// Configure the PR/push/commit execution policy of the completion-step
+    /// runner (the daemon's strict `[completion]` config section). The
+    /// config is validated BEFORE it is stored; a cached runner is dropped so
+    /// the next contracted run rebuilds with the new values.
+    pub fn configure_completion_steps(
+        &self,
+        config: CompletionStepsConfig,
+    ) -> Result<(), ExecError> {
+        config.validate().map_err(ExecError::InvalidPlan)?;
+        let mut wiring = self
+            .completion_steps
+            .lock()
+            .expect("completion-step lock poisoned");
+        wiring.config = config;
+        wiring.runner = None;
+        Ok(())
+    }
+
+    /// The configured completion-step policy.
+    pub fn completion_steps_config(&self) -> CompletionStepsConfig {
+        self.completion_steps
+            .lock()
+            .expect("completion-step lock poisoned")
+            .config
+            .clone()
+    }
+
+    /// Install an explicit runner (daemon wiring/tests). `None` clears it:
+    /// the executor then lazily rebuilds from the agent's supervisor.
+    pub fn set_completion_steps(&self, runner: Option<Arc<CompletionStepRunner>>) {
+        self.completion_steps
+            .lock()
+            .expect("completion-step lock poisoned")
+            .runner = runner;
+    }
+
+    /// The runner of this executor: an explicitly installed one, else one
+    /// built from the agent's own process supervisor + sandbox egress gate.
+    /// `None` when the daemon has no supervisor (nothing can be executed).
+    fn completion_step_runner(&self) -> Result<Option<Arc<CompletionStepRunner>>, ExecError> {
+        let mut wiring = self
+            .completion_steps
+            .lock()
+            .expect("completion-step lock poisoned");
+        if let Some(runner) = &wiring.runner {
+            return Ok(Some(runner.clone()));
+        }
+        let Some(supervisor) = self.agent.deps().supervisor.clone() else {
+            return Ok(None);
+        };
+        let sandbox = self.agent.deps().sandbox.clone();
+        let egress: Arc<dyn EgressPolicy> = Arc::new(move |url: &str| match &sandbox {
+            Some(engine) => engine.check_egress(url).map_err(|e| e.to_string()),
+            None => Ok(()),
+        });
+        let runner = Arc::new(
+            CompletionStepRunner::new(supervisor, egress, wiring.config.clone()).map_err(|e| {
+                ExecError::InvalidPlan(format!("completion-step runner config: {e}"))
+            })?,
+        );
+        wiring.runner = Some(runner.clone());
+        Ok(Some(runner))
     }
 
     /// The default candidate-root authority: `<store data dir>/candidate-runs`
@@ -951,7 +1033,7 @@ impl TaskExecutor {
             let agent = self.agent.clone();
             tokio::spawn(async move {
                 agent.run_session_queue(parent).await;
-                exec.after_shadowed_drive(parent);
+                exec.after_shadowed_drive(parent).await;
             });
         } else {
             let agent = self.agent.clone();
@@ -961,7 +1043,7 @@ impl TaskExecutor {
                 let receipt2 = receipt.clone();
                 tokio::spawn(async move {
                     let _ = agent.drive_receipt(&h, receipt2, model).await;
-                    exec.after_shadowed_drive(parent);
+                    exec.after_shadowed_drive(parent).await;
                 });
             }
         }
@@ -1136,6 +1218,79 @@ impl TaskExecutor {
         })
     }
 
+    // ------------------------------------------- completion steps (P2 follow-up)
+
+    /// Execute the durable completion contract's requested steps (ordered
+    /// commit, push, pr) for one session's current task, recording every
+    /// outcome through `set_completion_step_status`.
+    ///
+    /// Additive invocation: the executor calls this from the post-drive
+    /// settlement of a contracted run (deterministic verification has run);
+    /// an uncontracted run returns `Ok(None)` BEFORE any runner exists or
+    /// any git/supervisor work happens — the default path is byte-identical.
+    ///
+    /// Fail-closed guard: the steps run only when the durable verification
+    /// fact for the latest genuine end says `passed`; a failed/pending/absent
+    /// verification records nothing, so a rework run is never prematurely
+    /// committed/pushed.
+    pub async fn run_completion_steps(
+        &self,
+        parent: SessionId,
+    ) -> Result<Option<CompletionStepReport>, ExecError> {
+        let handle = self
+            .session
+            .get_session(parent)?
+            .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        let task_id = handle.task_id()?;
+        let Some((_revision, contract)) = handle
+            .completion_contract(task_id)
+            .map_err(|e| ExecError::Internal(format!("completion contract read: {e}")))?
+        else {
+            return Ok(None);
+        };
+        if contract.is_default() {
+            return Ok(None);
+        }
+        let Some(task) = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("completion task read: {e}")))?
+        else {
+            return Ok(None);
+        };
+        if task.state.is_terminal() {
+            // A terminal row is frozen: nothing to execute (an already
+            // certified run) and nothing to resurrect (a failed/cancelled
+            // one).
+            return Ok(None);
+        }
+        if !verification_passed(&handle) {
+            return Ok(None);
+        }
+        // The run's integration/candidate root: the LIVE shadow root when
+        // the session has one, else its durable owner worktree root.
+        let root = match self.session.active_root(parent)? {
+            Some(root) => root,
+            None => self.owner_root_of(parent, &handle)?,
+        };
+        let Some(runner) = self.completion_step_runner()? else {
+            return Err(ExecError::Conflict(
+                "completion steps are requested but the daemon has no process supervisor; no step can be executed".into(),
+            ));
+        };
+        let report = runner
+            .run(
+                &handle,
+                task_id,
+                &CompletionStepContext {
+                    root,
+                    goal: task.goal,
+                },
+            )
+            .await
+            .map_err(|e| ExecError::Internal(format!("completion steps: {e}")))?;
+        Ok(Some(report))
+    }
+
     // ------------------------------------------------- shadow helpers (P0-48)
 
     /// The registered worktree root of the session (the durable owner root
@@ -1220,14 +1375,20 @@ impl TaskExecutor {
     }
 
     /// Post-drive hook of a shadowed run (spawned with the detached drive):
-    /// settle the shadow once the drive returned. The durable task row is
-    /// the decision input, so a crashed executor re-runs the same decision
-    /// on reopen ([`Self::finalize_shadow_run`] is idempotent per state).
+    /// execute the accepted completion contract's requested steps (a
+    /// no-contract run is a pure no-op) and then settle the shadow. The
+    /// runner only records step outcomes — completion still goes through the
+    /// existing gate — and every decision reads durable rows, so a crashed
+    /// executor re-runs the same decision on reopen.
+    ///
     /// When the drive ended BEFORE the run reached a terminal state (the
     /// verifier may still certify in the background), a BOUNDED watcher
     /// re-runs the decision on the next terminal end instead of leaving the
     /// shadow live forever.
-    fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
+    async fn after_shadowed_drive(self: &Arc<Self>, parent: SessionId) {
+        if let Err(e) = self.run_completion_steps(parent).await {
+            eprintln!("completion-step execution failed for session {parent}: {e}");
+        }
         match self.finalize_shadow_run(parent) {
             Ok(Some(ShadowFinalize {
                 action: ShadowFinalizeAction::Retained,
@@ -2025,6 +2186,27 @@ fn record_completion_contract(
             }
             other => ExecError::Internal(format!("completion contract seed: {other}")),
         })
+}
+
+/// TRUE when the durable verification fact of the session's latest genuine
+/// end says the deterministic verification PASSED. This is the executor's
+/// fail-closed gate for running completion steps: no fact, a failed fact or
+/// a pending fact means the run is not (yet) at a verified end, so nothing
+/// is committed, pushed or opened.
+fn verification_passed(handle: &faktor_session::SessionHandle) -> bool {
+    let Ok(facts) = handle.memory_facts() else {
+        return false;
+    };
+    let Some((_, _, last)) = facts
+        .iter()
+        .find(|(kind, key, _)| kind == "verification" && key == "last")
+    else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(last) else {
+        return false;
+    };
+    value.get("status").and_then(|s| s.as_str()) == Some("passed")
 }
 
 fn truncate_bytes(s: &str, max: usize) -> String {

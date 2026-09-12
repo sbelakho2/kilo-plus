@@ -19,6 +19,7 @@ package dev.faktor.frontend
 import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeAgent
+import dev.faktor.shared.NativeApiException
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
@@ -138,6 +139,8 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     private var currentTree: TaskTreeModel? = null
 
     private var trackedTournamentId: String? = null
+
+    private var trackedTournament: NativeTournament? = null
 
     private var pendingPermissions: List<NativePermissionEntry> = emptyList()
 
@@ -426,7 +429,6 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
             override fun onLoadTournament(tournamentId: String) {
                 runAsync("load tournament") {
                     val tournament = service.tournamentState(tournamentId)
-                    trackedTournamentId = tournament.id
                     onEdt { applyTournament(tournament) }
                 }
             }
@@ -441,6 +443,41 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                                 "candidates=${started.candidates.size}"
                         )
                     }
+                    refreshTournamentsBlocking()
+                    refreshTaskTreeBlocking()
+                }
+            }
+
+            override fun onDecideTournament(tournamentId: String) {
+                runAsync("decide tournament") {
+                    try {
+                        val decision = service.decideTournament(tournamentId)
+                        onEdt {
+                            appendSystem(
+                                "tournament ${decision.tournamentId} decided: " +
+                                    "winner=${decision.winner} " +
+                                    "discarded=${decision.discarded.size}"
+                            )
+                        }
+                    } catch (e: NativeApiException) {
+                        // The engine rule (not all candidates settled / no
+                        // eligible winner) surfaces as a typed refusal.
+                        surfaceTournamentError("decide", e)
+                    }
+                    refreshTournamentsBlocking()
+                    refreshTaskTreeBlocking()
+                }
+            }
+
+            override fun onAbortTournament(tournamentId: String, reason: String) {
+                runAsync("abort tournament") {
+                    try {
+                        val aborted = service.abortTournament(tournamentId, reason)
+                        onEdt { appendSystem("tournament ${aborted.id} aborted [${aborted.state}]") }
+                    } catch (e: NativeApiException) {
+                        surfaceTournamentError("abort", e)
+                    }
+                    refreshTournamentsBlocking()
                     refreshTaskTreeBlocking()
                 }
             }
@@ -507,6 +544,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         refreshAgentsBlocking()
         refreshUsageBlocking()
         refreshVerificationBlocking()
+        refreshTournamentsBlocking()
         refreshTaskTreeBlocking()
     }
 
@@ -607,6 +645,54 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
 
     // ---------------------------------------------------------------- tree
 
+    /**
+     * Auto-populates the tournament panel from the durable listing on every
+     * session refresh: the tracked tournament when it still exists, else the
+     * newest summary. Listing/load failures are surfaced as TYPED errors
+     * (status/code/detail), never swallowed.
+     */
+    private fun refreshTournamentsBlocking() {
+        if (!service.isRunning() || service.currentSessionId() == null) return
+        val summaries = try {
+            service.tournaments()
+        } catch (e: NativeApiException) {
+            surfaceTournamentError("listing", e)
+            return
+        } catch (e: Exception) {
+            onEdt {
+                appendSystem("tournament listing failed: ${e.message ?: e.javaClass.simpleName}")
+            }
+            return
+        }
+        onEdt { tournamentPanel.setSummaries(summaries) }
+        val tracked = trackedTournamentId
+        val target = if (tracked != null && summaries.any { it.id == tracked }) {
+            tracked
+        } else {
+            latestTournamentId(summaries)
+        }
+        if (target == null) {
+            trackedTournamentId = null
+            trackedTournament = null
+            onEdt { tournamentPanel.setTournament(null) }
+            return
+        }
+        try {
+            val tournament = service.tournamentState(target)
+            onEdt { applyTournament(tournament) }
+        } catch (e: NativeApiException) {
+            surfaceTournamentError("load", e)
+        } catch (e: Exception) {
+            onEdt {
+                appendSystem("tournament $target load failed: ${e.message ?: e.javaClass.simpleName}")
+            }
+        }
+    }
+
+    private fun surfaceTournamentError(action: String, e: NativeApiException) {
+        onEdt { appendSystem("tournament $action refused: ${e.status} ${e.code}: ${e.detail}") }
+    }
+
     private fun refreshTaskTreeBlocking() {
         val projection = service.projection()
         val task = try {
@@ -653,11 +739,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 // A child session without usage simply has no spend envelope.
             }
         }
-        val tournament = try {
-            trackedTournamentId?.let { service.tournamentState(it) }
-        } catch (e: Exception) {
-            null
-        }
+        val tournament = trackedTournament
         val permissions = try {
             service.permissions()
         } catch (e: Exception) {
@@ -686,6 +768,8 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     }
 
     private fun applyTournament(tournament: NativeTournament) {
+        trackedTournamentId = tournament.id
+        trackedTournament = tournament
         tournamentPanel.setTournament(TaskTree.tournamentView(tournament))
         appendSystem("tournament ${tournament.id} [${tournament.state}] winner=${tournament.winner ?: "-"}")
     }

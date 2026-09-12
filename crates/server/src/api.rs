@@ -466,6 +466,18 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/session/{id}/tournaments",
             get(native_tournaments_list),
         )
+        // Additive tournament control (strict DTOs): decide runs the
+        // deterministic comparison (typed 404 unknown / 409 non-open or no
+        // eligible winner) and abort discards every candidate with the
+        // reason on the terminal durable row (typed 404/409).
+        .route(
+            "/native/session/{id}/tournaments/{tournament_id}/decide",
+            post(native_tournament_decide),
+        )
+        .route(
+            "/native/session/{id}/tournaments/{tournament_id}/abort",
+            post(native_tournament_abort),
+        )
         .route("/native/evidence/{id}", get(native_evidence_get))
         .route(
             "/native/evidence/{id}/retrieve",
@@ -11117,6 +11129,286 @@ mod tests {
         .await;
         let list: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 2);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn native_tournament_decide_and_abort_are_strict_and_engine_gated() {
+        // The additive decide/abort routes over the typed ledger: happy
+        // decide (deterministic winner + losers discarded), happy abort
+        // (terminal row with the reason), and every refusal boundary —
+        // unknown ids 404, non-open/no-eligible-winner 409, hostile bodies
+        // and oversized reasons 400, missing auth 401. The engine stays the
+        // ONE authority: the routes never mutate the fold directly.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let token = deps.auth_token.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let base = format!("http://{}", handle.addr);
+        let ws = manager.create_workspace("/plain").unwrap();
+        let s = manager
+            .create_session(ws, "tour-control", "fake", "m")
+            .unwrap();
+        let sid = s.id();
+
+        let criteria = vec![faktor_session::ledger::TournamentCriterionRow {
+            id: "c1".into(),
+            spec: "cargo test".into(),
+        }];
+        let candidates: Vec<faktor_session::ledger::TournamentCandidateRow> = (0..2)
+            .map(|i| faktor_session::ledger::TournamentCandidateRow {
+                child_id: format!("child-{i}"),
+                worktree: String::new(),
+                base_revision: String::new(),
+            })
+            .collect();
+        let derived = faktor_orchestrator::tournament::derive_check_specs(&[
+            faktor_orchestrator::tournament::Criterion {
+                id: "c1".into(),
+                spec: "cargo test".into(),
+            },
+        ]);
+        let settlement = |child_id: &str, rank: &str, cost: u64| {
+            faktor_session::ledger::TournamentSettlementRow {
+                child_id: child_id.into(),
+                worktree: String::new(),
+                base_revision: String::new(),
+                state: "done".into(),
+                verification: Some(7),
+                verification_pass: Some(true),
+                checks: derived.clone(),
+                review: Some(rank.into()),
+                reviewer: Some("review-0".into()),
+                cost_micro: cost,
+                wall_ms: 100,
+                reason: "settled".into(),
+            }
+        };
+
+        // Unauthenticated is 401 before anything else.
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-x/decide"
+            ))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        // A tournament with no eligible candidate refuses decide as a typed
+        // 409 (nothing was persisted; a second decide reads the same state).
+        s.ledger_tournament_started("tour-bare", "run-bare", "bare goal", &criteria, &candidates)
+            .unwrap();
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-bare/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tournament/tour-bare"),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.json::<serde_json::Value>().await.unwrap()["state"],
+            "open"
+        );
+
+        // Happy decide: clean review outranks the cheaper concern reviewer.
+        s.ledger_tournament_started(
+            "tour-happy",
+            "run-happy",
+            "happy goal",
+            &criteria,
+            &candidates,
+        )
+        .unwrap();
+        s.ledger_candidate_settled("tour-happy", &settlement("child-0", "clean", 500))
+            .unwrap();
+        s.ledger_candidate_settled("tour-happy", &settlement("child-1", "concern", 1))
+            .unwrap();
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-happy/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let decided: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(decided["tournament_id"], "tour-happy");
+        assert_eq!(decided["winner"], "child-0");
+        assert!(decided["rationale"]
+            .as_str()
+            .unwrap_or("")
+            .contains("child-0"));
+        let discarded = decided["discarded"].as_array().unwrap();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0]["child_id"], "child-1");
+        // Wrong state: deciding or aborting the decided tournament is 409.
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-happy/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-happy/abort"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"reason": "too late"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        let resp = native_get(
+            &client,
+            &base,
+            &token,
+            &format!("/native/session/{sid}/tournament/tour-happy"),
+        )
+        .await;
+        let state: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(state["state"], "decided");
+        assert_eq!(state["winner"], "child-0");
+        assert_eq!(state["candidates"][1]["state"], "discarded");
+
+        // Happy abort: the terminal row carries the reason and every
+        // candidate is discarded; a second abort is a typed 409.
+        s.ledger_tournament_started(
+            "tour-abort",
+            "run-abort",
+            "abort goal",
+            &criteria,
+            &candidates,
+        )
+        .unwrap();
+        s.ledger_candidate_settled("tour-abort", &settlement("child-0", "clean", 10))
+            .unwrap();
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-abort/abort"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"reason": "operator stopped it"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let aborted: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(aborted["id"], "tour-abort");
+        assert_eq!(aborted["state"], "aborted");
+        assert!(aborted["winner"].is_null());
+        for candidate in aborted["candidates"].as_array().unwrap() {
+            assert_eq!(candidate["state"], "discarded");
+        }
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-abort/abort"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+
+        // Hostile boundaries: unknown tournament 404, unknown session 404,
+        // strict bodies 400 (unknown member / non-JSON / missing body /
+        // oversized reason).
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/nope/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/nope/abort"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let resp = client
+            .post(format!(
+                "{base}/native/session/999999/tournaments/nope/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        for body in [
+            serde_json::json!({"bogus": 1}),
+            serde_json::json!({"reason": "decide takes no reason"}),
+        ] {
+            let resp = client
+                .post(format!(
+                    "{base}/native/session/{sid}/tournaments/tour-bare/decide"
+                ))
+                .bearer_auth(token.as_str())
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 400, "hostile decide body: {body}");
+        }
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-bare/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .header("content-type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-bare/decide"
+            ))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(format!(
+                "{base}/native/session/{sid}/tournaments/tour-bare/abort"
+            ))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"reason": "x".repeat(600)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
         let _ = handle.shutdown.send(());
     }
 

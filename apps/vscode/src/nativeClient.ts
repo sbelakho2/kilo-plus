@@ -448,6 +448,16 @@ export interface NativeAgentEntry {
   /** Additive blocker fields, surfaced when the daemon serves them. */
   readonly blockers: Json | null;
   readonly blocker: Json | null;
+  /** Durable presentation/attention state (default `foreground`; terminal
+   * children are Background-only). Presentation never changes scheduling. */
+  readonly presentation: 'foreground' | 'background';
+}
+
+/** One durable presentation transition ack (`changed:false` = idempotent). */
+export interface NativeAgentPresentationAck {
+  readonly child_id: string;
+  readonly presentation: 'foreground' | 'background';
+  readonly changed: boolean;
 }
 
 export interface NativeAgentControlAck {
@@ -1194,6 +1204,18 @@ export function validateTaskRunCancelled(json: Json): NativeTaskRunCancelled {
   return { run_id: fString(object, 'run_id', path), cancelled: fBool(object, 'cancelled', path) };
 }
 
+function presentationTag(object: JsonObject, key: string, path: string): 'foreground' | 'background' {
+  if (!Object.prototype.hasOwnProperty.call(object, key)) {
+    // Absent = the daemon's default (foreground): additive v1 contract.
+    return 'foreground';
+  }
+  const value = object[key];
+  if (value === 'foreground' || value === 'background') {
+    return value;
+  }
+  fail(`${path}.${key}`, `expected "foreground" or "background", got ${JSON.stringify(value)}`);
+}
+
 export function validateAgents(json: Json): NativeAgentEntry[] {
   const path = 'GET /native/agents';
   if (!Array.isArray(json)) {
@@ -1248,8 +1270,19 @@ export function validateAgents(json: Json): NativeAgentEntry[] {
       item_kind: 'item_kind' in object ? fNullableString(object, 'item_kind', itemPath) : null,
       blockers: 'blockers' in object ? fJson(object, 'blockers', itemPath) : null,
       blocker: 'blocker' in object ? fJson(object, 'blocker', itemPath) : null,
+      presentation: presentationTag(object, 'presentation', itemPath),
     };
   });
+}
+
+export function validateAgentPresentationAck(json: Json, path: string): NativeAgentPresentationAck {
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['child_id', 'presentation', 'changed']);
+  return {
+    child_id: fString(object, 'child_id', path),
+    presentation: presentationTag(object, 'presentation', path),
+    changed: fBool(object, 'changed', path),
+  };
 }
 
 export function validateAgentControlAck(json: Json, path: string): NativeAgentControlAck {
@@ -1892,6 +1925,28 @@ export class NativeClient {
       body: { ...budget },
       validate: (json, path) => validateAgentControlAck(json, path),
     });
+  }
+
+  /**
+   * Durable presentation/attention transition of one child of `sessionId`:
+   * `POST /native/session/{id}/agents/{child}/presentation`. Idempotent
+   * (same-state answers `changed:false` with no write); a foreground revival
+   * of a terminal child is a typed 409 from the server, surfaced as a
+   * `NativeApiError`, never silently applied.
+   */
+  setAgentPresentation(
+    sessionId: string,
+    childId: string,
+    state: 'foreground' | 'background',
+  ): Promise<NativeAgentPresentationAck> {
+    return this.request(
+      'POST',
+      `/native/session/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(childId)}/presentation`,
+      {
+        body: { state },
+        validate: (json, path) => validateAgentPresentationAck(json, path),
+      },
+    );
   }
 
   private agentControlPost(

@@ -748,6 +748,20 @@ async function controlAgent(message: ChatMessage): Promise<void> {
         return;
       }
       await client.setAgentBudget(agentId, tokens === undefined ? {} : { max_tokens: tokens });
+    } else if (action === 'presentation') {
+      // Durable presentation transition (dimmed/tucked background):
+      // the server owns the terminal-child refusal (typed 409 surfaced by
+      // reportError) and the idempotent same-state no-op.
+      const state = message.state;
+      if (state !== 'foreground' && state !== 'background') {
+        reportError(new Error('presentation state must be foreground or background'));
+        return;
+      }
+      const sessionId = active.sessionId;
+      if (!sessionId) {
+        return;
+      }
+      await client.setAgentPresentation(sessionId, agentId, state);
     } else {
       return;
     }

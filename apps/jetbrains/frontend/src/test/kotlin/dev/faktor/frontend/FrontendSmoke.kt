@@ -19,11 +19,14 @@ import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeModelCatalog
 import dev.faktor.shared.parseNativeOrchestratorGraph
 import dev.faktor.shared.parseNativePermissionList
+import dev.faktor.shared.parseNativePresentationAck
 import dev.faktor.shared.parseNativeSessionUsage
 import dev.faktor.shared.parseNativeTaskVerification
 import dev.faktor.shared.parseNativeTaskViews
 import dev.faktor.shared.parseNativeTournament
+import dev.faktor.shared.parseNativeTournamentDecision
 import dev.faktor.shared.parseNativeTournamentStarted
+import dev.faktor.shared.parseNativeTournamentSummaries
 import dev.faktor.shared.parseNativeVerificationView
 import java.awt.image.BufferedImage
 import java.nio.file.Files
@@ -46,7 +49,8 @@ private const val AGENTS_JSON = "[" +
     "\"capabilities\":[{\"cap\":\"ReadWorkspace\"}]," +
     "\"progress\":{\"lastOutputAt\":1,\"lastProgressAt\":2,\"lastOpCompletedAt\":3," +
     "\"inFlightOp\":null,\"silenceMs\":500,\"stallThresholdMs\":1000,\"stalled\":true}," +
-    "\"result\":{\"summary\":\"main step output\",\"merge\":null}}" +
+    "\"result\":{\"summary\":\"main step output\",\"merge\":null}," +
+    "\"presentation\":\"background\"}" +
     "]"
 
 private const val TASK_JSON = "[" +
@@ -126,6 +130,33 @@ private const val TOURNAMENT_STARTED_JSON = "{" +
     "\"tournament_id\":\"t-1\",\"run_id\":\"run-7\"," +
     "\"candidates\":[\"child-0\",\"child-1\"],\"state\":\"open\",\"winner\":null}"
 
+private const val TOURNAMENTS_LIST_JSON = "[" +
+    "{\"id\":\"t-1\",\"state\":\"decided\",\"candidate_count\":2," +
+    "\"winner\":\"child-0\",\"decided_ms\":123}," +
+    "{\"id\":\"t-2\",\"state\":\"open\",\"candidate_count\":2," +
+    "\"winner\":null,\"decided_ms\":null}]"
+
+private const val TOURNAMENT_OPEN_JSON = "{" +
+    "\"id\":\"t-2\",\"run_family\":\"run-8\",\"goal\":\"pick the open winner\"," +
+    "\"criteria\":[{\"id\":\"c-1\",\"spec\":\"tests pass\"}]," +
+    "\"candidates\":[" +
+    "{\"child_id\":\"child-0\",\"worktree\":\"/tmp/w0\",\"base_revision\":\"abc\"," +
+    "\"state\":\"done\",\"verification\":12,\"verification_pass\":true," +
+    "\"review\":{\"rank\":\"clean\",\"reviewer\":\"rev-1\"}," +
+    "\"cost_micro\":100,\"wall_ms\":1000}," +
+    "{\"child_id\":\"child-1\",\"worktree\":\"/tmp/w1\",\"base_revision\":\"abc\"," +
+    "\"state\":\"running\",\"verification\":null,\"verification_pass\":null," +
+    "\"review\":null,\"cost_micro\":0,\"wall_ms\":0}]," +
+    "\"winner\":null,\"state\":\"open\"}"
+
+private const val TOURNAMENT_DECISION_JSON = "{" +
+    "\"tournament_id\":\"t-2\",\"winner\":\"child-0\"," +
+    "\"rationale\":\"winner child-0 (verification=pass)\"," +
+    "\"discarded\":[{\"child_id\":\"child-1\",\"reason\":\"candidate ended failed\"}]}"
+
+private const val PRESENTATION_ACK_JSON = "{" +
+    "\"child_id\":\"child-1\",\"presentation\":\"background\",\"changed\":true}"
+
 private const val PERMISSION_LIST_JSON = "{" +
     "\"permissions\":[{\"id\":\"7\",\"session_id\":\"9\",\"capability\":\"shell\"," +
     "\"detail\":{\"tool\":\"bash\"}}]}"
@@ -195,6 +226,49 @@ object FrontendSmoke {
             assertEquals(listOf("child-0", "child-1"), started.candidates)
             assertEquals("open", started.state)
             assertEquals(null, started.winner)
+
+            // The durable listing + decision ack + presentation ack parse.
+            val summaries = parseNativeTournamentSummaries(TOURNAMENTS_LIST_JSON)
+            assertEquals(2, summaries.size)
+            assertEquals("t-1", summaries[0].id)
+            assertEquals(2L, summaries[0].candidateCount)
+            assertEquals("child-0", summaries[0].winner)
+            assertEquals(123L, summaries[0].decidedMs)
+            assertEquals(null, summaries[1].winner)
+            assertEquals(null, summaries[1].decidedMs)
+            assertEquals("t-2", latestTournamentId(summaries))
+            val decision = parseNativeTournamentDecision(TOURNAMENT_DECISION_JSON)
+            assertEquals("t-2", decision.tournamentId)
+            assertEquals("child-0", decision.winner)
+            assertEquals(1, decision.discarded.size)
+            assertEquals("child-1", decision.discarded[0].childId)
+            assertTrue(decision.rationale.contains("child-0"), "rationale must surface")
+            val presentation = parseNativePresentationAck(PRESENTATION_ACK_JSON)
+            assertEquals("child-1", presentation.childId)
+            assertEquals("background", presentation.presentation)
+            assertEquals(true, presentation.changed)
+        }
+
+        step("tournament panel gates decide on all candidates settled") {
+            val runningOpen = TaskTree.tournamentView(parseNativeTournament(TOURNAMENT_OPEN_JSON))
+            val panel = TournamentPanel()
+            panel.setSummaries(parseNativeTournamentSummaries(TOURNAMENTS_LIST_JSON))
+            assertTrue(panel.summariesText().contains("t-2[open]"), panel.summariesText())
+            panel.setTournament(runningOpen)
+            assertEquals(false, panel.decideEnabled())
+            assertEquals(true, panel.abortEnabled())
+            // All candidates settled: decide becomes available.
+            val settled = runningOpen.copy(
+                candidates = runningOpen.candidates.map { it.copy(state = "done") }
+            )
+            panel.setTournament(settled)
+            assertEquals(true, panel.decideEnabled())
+            assertEquals(true, panel.abortEnabled())
+            // A decided tournament exposes no controls.
+            panel.setTournament(TaskTree.tournamentView(parseNativeTournament(TOURNAMENT_JSON)))
+            assertEquals(false, panel.decideEnabled())
+            assertEquals(false, panel.abortEnabled())
+            assertEquals(null, panel.current()?.takeIf { it.open })
         }
 
         step("canned native parsing: provider/reasoning catalog join + permissions") {
@@ -323,6 +397,8 @@ object FrontendSmoke {
             assertEquals(1, model.children.size)
             val child = model.children[0]
             assertEquals("permission", child.blocker?.kind)
+            assertEquals("background", child.presentation)
+            assertEquals(true, child.background)
             assertEquals("fake", child.provider)
             assertEquals(true, child.reasoning)
             assertEquals(1000L, child.budgetMaxTokens)
@@ -343,6 +419,10 @@ object FrontendSmoke {
             assertEquals(listOf(41L, 42L, 43L), evidenceIds)
             assertEquals(93L, model.spend?.remainingTokens)
             assertEquals(true, model.spend?.durable)
+            // Background children are tucked after foreground children.
+            val foregroundChild = agents[1].copy(agentId = "child-2", presentation = "foreground")
+            val ordered = TaskTree.build(agents = listOf(agents[1], foregroundChild)).children
+            assertEquals(listOf("child-2", "child-1"), ordered.map { it.childId })
             assertEquals("child-0", model.tournament?.winner)
             assertEquals(true, model.tournament?.candidates?.get(0)?.winner)
             assertEquals(false, model.tournament?.candidates?.get(1)?.winner)
@@ -365,6 +445,10 @@ object FrontendSmoke {
             assertTrue(
                 tree.childLabel(model.children[0]).contains("child-1"),
                 "child label must surface the child id"
+            )
+            assertTrue(
+                tree.childLabel(model.children[0]).contains("(background)"),
+                "background children must be dimmed/marked in the tree"
             )
             val blockers = BlockersPanel()
             blockers.update(model.blockers, parseNativePermissionList(PERMISSION_LIST_JSON), model.taskBlockers)
@@ -470,6 +554,36 @@ object FrontendSmoke {
                         } catch (e: NativeApiException) {
                             if (e.status != 404) {
                                 fail("unexpected tournament error ${e.status} ${e.code}")
+                            }
+                        }
+                    }
+                    step("tournament listing + decide/abort are typed") {
+                        val summaries = client.tournaments(sid)
+                        println("  tournaments=${summaries.size}")
+                        try {
+                            client.decideTournament(sid, "does-not-exist")
+                            fail("unknown decide must not answer 200")
+                        } catch (e: NativeApiException) {
+                            if (e.status != 404) {
+                                fail("unexpected decide error ${e.status} ${e.code}")
+                            }
+                        }
+                        try {
+                            client.abortTournament(sid, "does-not-exist", "smoke")
+                            fail("unknown abort must not answer 200")
+                        } catch (e: NativeApiException) {
+                            if (e.status != 404) {
+                                fail("unexpected abort error ${e.status} ${e.code}")
+                            }
+                        }
+                    }
+                    step("presentation transition on an unknown child is a typed 404") {
+                        try {
+                            client.setAgentPresentation(sid, "no-such-child", "background")
+                            fail("unknown child presentation must not answer 200")
+                        } catch (e: NativeApiException) {
+                            if (e.status != 404) {
+                                fail("unexpected presentation error ${e.status} ${e.code}")
                             }
                         }
                     }
