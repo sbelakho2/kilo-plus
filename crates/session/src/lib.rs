@@ -66,8 +66,8 @@ pub mod verification_job;
 
 pub use actor::{DbActor, DbActorConfig, DbActorStats, StoreHandle};
 pub use board::{
-    BoardAction, BoardId, BoardPage, BoardPost, BoardPostId, BoardRead, BoardReceipt,
-    BoardReceipts, BoardReset, ChildId, MAX_BOARD_BODY_BYTES, MAX_BOARD_FAMILY_DEPTH,
+    BoardAction, BoardDeliveryView, BoardId, BoardPage, BoardPost, BoardPostId, BoardRead,
+    BoardReceipt, BoardReceipts, BoardReset, ChildId, MAX_BOARD_BODY_BYTES, MAX_BOARD_FAMILY_DEPTH,
     MAX_BOARD_PAGE, MAX_BOARD_RECEIPTS_PER_POST, MAX_BOARD_RECEIPT_NOTE_BYTES, MAX_BOARD_REFS,
     MAX_BOARD_REF_BYTES, MAX_BOARD_SCAN_ROWS, MAX_BOARD_SUBJECT_BYTES,
 };
@@ -76,8 +76,9 @@ pub use budget::{
     MAX_ROUTE_DECISION_JSON_BYTES,
 };
 pub use child::{
-    ChildBlocker, ChildControl, ChildIdentity, ChildOwnership, ChildPhase, ChildRuntimeBlockerRow,
-    ControlRow, DriveState, MAX_CHILD_BLOCKER_DEPENDENCY_CHARS, MAX_CHILD_BLOCKER_KIND_CHARS,
+    BlockerKind, ChildBlocker, ChildControl, ChildIdentity, ChildOwnership, ChildPhase,
+    ChildRuntimeBlockerRow, ControlRow, DriveState, ExecutionPhase,
+    MAX_CHILD_BLOCKER_DEPENDENCY_CHARS, MAX_CHILD_BLOCKER_KIND_CHARS,
     MAX_CHILD_BLOCKER_REASON_CHARS, MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
     MAX_CHILD_CONTROL_MODEL_CHARS, MAX_CHILD_CONTROL_NOTE_CHARS, MAX_CHILD_CONTROL_ROWS,
 };

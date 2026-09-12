@@ -3,9 +3,11 @@
 **Same Kilo Code UX. A substantially better native engine.**
 
 Faktor replaces the Kilo Code engine (TypeScript/Bun) with a native Rust
-runtime while targeting the frozen Kilo v7.5.6 IDE UX (TARGET baseline — the
-actual upstream webviews are not vendored in this repo; `apps/` holds launcher
-scaffolds and wire-level harnesses that will host them).
+runtime while targeting the frozen Kilo v7.5.6 IDE UX. The v7.5.6 VS Code
+webview sources are vendored under `ui/` (pinned at commit `fa02955` with a
+SHA-256 manifest) and served through `apps/vscode`; the JetBrains 7.1.2
+Kotlin shell is NOT vendored — `apps/jetbrains` carries the Faktor-owned
+frontend/backend sources that talk to the native daemon.
 
 ```
 same UI
@@ -38,21 +40,22 @@ LLM used only where reasoning is actually needed
   production daemon wiring is in progress).
 - **Explicit concurrency** — resource-class budgets, dependency DAG scheduling,
   state-aware retries with jitter, circuit breakers.
-- **Process supervision** — no orphans. Process groups on Unix; Windows uses
-  taskkill /T /F today (Job Objects are a documented TARGET),
-  Windows, deliberate ownership transfer.
+- **Process supervision** — no orphans. Process groups on Unix; Windows
+  assigns every supervised child to a kill-on-close Job Object
+  (`crates/winjob`, `AssignProcessToJobObject` via `faktor-terminal`) with
+  `taskkill /T` as the escalation path.
 - **Provider normalization** — ~10 transport families + dynamic model registry.
   No `if provider == "deepseek"` anywhere in the agent.
 
 ## Layout
 
 ```
-apps/        (TARGET: frozen v7.5.6 VS Code webview + JetBrains 7.1.2 Kotlin shell — currently launcher scaffolds + compatibility harnesses)
-crates/      (the Rust engine workspace)
+apps/        (VS Code extension host + Faktor chat/cockpit panel; JetBrains split-mode Kotlin shell; no upstream JetBrains sources)
+crates/      (the Rust engine workspace, incl. winjob/agent/verify/sandbox/index/cas/snapshot)
 compat/      (permanent protocol fixtures: kilo-v756/, jetbrains-712/)
 fixtures/    (protocol, providers, screenshots, repositories)
 tests/       (integration, soak, fault, visual, performance — adversarial only)
-ui/          (vendored frozen upstream UI: kilo-v756-webview/, kilo-ui/, pinned manifest)
+ui/          (vendored frozen upstream UI: kilo-v756-webview/ + kilo-ui/, pinned manifest)
 ```
 
 ## Frozen baselines
@@ -100,21 +103,24 @@ in-tree metadata is unchanged.
 
 ## Status notes
 
-- **Completion contract (gate landed; step execution follow-up).** The
-  reviewed PR/CI-fix item that lets a native task declare
-  `completion_contract` (`include_commit`, `include_push`, `include_pr`) is
-  implemented: the DTO parses strictly, the accepted contract and every
-  per-step outcome are durable ledger rows (immutable per task revision,
-  pinned across compaction), and `VerifiedComplete` is refused with a typed
-  error while any requested step lacks a succeeding status row. Automatic
-  commit/push/PR step **execution** is still a follow-up: the run's caller
-  records step outcomes through the durable step-status seam. Normative
-  semantics and the exact seams are in `docs/certification.md` §3.3.
+- **Completion contract (gate + step execution IMPLEMENTED).** The reviewed
+  PR/CI-fix item that lets a native task declare `completion_contract`
+  (`include_commit`, `include_push`, `include_pr`) is implemented end to end:
+  the DTO parses strictly, the accepted contract and every per-step outcome
+  are durable ledger rows (immutable per task revision, pinned across
+  compaction), `VerifiedComplete` is refused with a typed error while any
+  requested step lacks a succeeding status row, and
+  `crates/orchestrator/src/completion_steps.rs` executes the requested steps
+  in gate order (idempotent, policy-checked push, supervisor-issued PR
+  command). Both IDEs expose the Task-mode checkboxes and report the durable
+  step provenance; a serving daemon without the additive completion read
+  shows `unavailable`, never a fabricated success. Normative semantics and
+  the exact seams are in `docs/certification.md` §3.3.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |
-| PR/CI-fix completion contract | IMPLEMENTED (gate; step execution follow-up) | `crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, §3.3 |
-| Coordination board | IMPLEMENTED | `crates/session/src/board.rs` + durable `board_*` ledger rows |
+| PR/CI-fix completion contract | IMPLEMENTED (gate + ordered step execution) | `crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/orchestrator/src/completion_steps.rs`, §3.3 |
+| Coordination board | IMPLEMENTED (session board tools; no native HTTP read yet — IDE board state stays unavailable) | `crates/session/src/board.rs` + durable `board_*` ledger rows |
 | Multi-candidate tournament | IMPLEMENTED | `crates/orchestrator/src/tournament.rs` + native start/state/list endpoints; integration stays an explicit approved merge |
 | Pixel agents | IMPLEMENTED | `apps/vscode/src/pixelAgents.ts` + JetBrains `PixelAgents.kt` (identical FNV-1a hashes) |
 | Canonical child blockers | IMPLEMENTED | `crates/session/src/child.rs` (`child_runtime` v23 row) + native agent projection |

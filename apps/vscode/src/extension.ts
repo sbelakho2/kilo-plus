@@ -18,6 +18,7 @@ import { DaemonHandle, startDaemon, stopDaemon } from './daemon';
 import {
   FetchLike,
   NativeClient,
+  NativeCompletionContract,
   NativeEvidenceSelector,
   NativeMessagePage,
   NativeModelInfo,
@@ -40,6 +41,7 @@ import {
   FaktorStore,
   Json,
   RunSummary,
+  TaskCompletionSummary,
   TaskSummary,
   TranscriptEntry,
   UsageSummary,
@@ -53,7 +55,13 @@ import {
 } from './state';
 import { CockpitTaskVerification, buildCockpit, cockpitSections, tournamentViewOf } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
-import { StartFailure, StartTaskSettings, startTaskRun } from './taskStart';
+import {
+  StartFailure,
+  StartTaskSettings,
+  completionContractSetting,
+  hasCompletionSteps,
+  startTaskRun,
+} from './taskStart';
 import {
   SessionBindings,
   boundSessionFor,
@@ -66,6 +74,9 @@ import { ChatMessage, ChatViewProvider } from './webview';
 const HISTORY_PAGE_LIMIT = 100;
 const MAX_EVIDENCE_PREVIEW_BYTES = 256 * 1024;
 const SESSION_BINDINGS_KEY = 'faktor.sessionBindings';
+/** Bounds of one composer attachment list (mirror the daemon's own caps). */
+const MAX_WEBVIEW_FILES = 64;
+const MAX_WEBVIEW_FILE_CHARS = 4096;
 
 interface ActiveSession {
   daemon: DaemonHandle | null;
@@ -82,6 +93,10 @@ interface ActiveSession {
   tournamentId: string | null;
   /** Persistent deterministic pixel presence per ChildId. */
   pixelPresence: Map<string, PixelPresence>;
+  /** The completion contract the operator submitted for the active task
+   * (kept in host memory so the cockpit can tell a contracted run from a
+   * plain prompt even when the daemon serves no completion read). */
+  completionContract: NativeCompletionContract | null;
 }
 
 const active: ActiveSession = {
@@ -96,6 +111,7 @@ const active: ActiveSession = {
   taskVerification: null,
   tournamentId: null,
   pixelPresence: new Map(),
+  completionContract: null,
 };
 
 const store = new FaktorStore();
@@ -182,6 +198,119 @@ function reportError(error: unknown): void {
   void vscode.window.showErrorMessage(`Faktor: ${message}`);
 }
 
+/**
+ * Strictly bound the composer's file list. Malformed entries are refused
+ * individually (count only, never echoed); a message carrying files is never
+ * dropped wholesale because of them, and the goal always survives.
+ */
+function boundedWebviewFiles(raw: unknown): { files: string[]; refused: number } {
+  if (raw === undefined || raw === null) {
+    return { files: [], refused: 0 };
+  }
+  if (!Array.isArray(raw)) {
+    return { files: [], refused: 1 };
+  }
+  const files: string[] = [];
+  let refused = 0;
+  for (const entry of raw) {
+    if (
+      typeof entry !== 'string' ||
+      entry.trim().length === 0 ||
+      entry.length > MAX_WEBVIEW_FILE_CHARS ||
+      files.length >= MAX_WEBVIEW_FILES
+    ) {
+      refused += 1;
+      continue;
+    }
+    files.push(entry);
+  }
+  return { files, refused };
+}
+
+/**
+ * The completion-contract block of the cockpit/task card. Step rows come
+ * from the daemon when it serves them; otherwise the block is derived from
+ * the DURABLE task-run state and the submitted contract:
+ *   - a non-terminal run shows every requested step as `pending`;
+ *   - a `Done` (VerifiedComplete) run shows `succeeded` — the durable
+ *     completion gate refuses `VerifiedComplete` until every requested
+ *     step row is Succeeded, so certification is the step proof;
+ *   - a terminal Failed/Cancelled run shows `unknown` with the explicit
+ *     reason that this daemon exposes no per-step completion read. A
+ *     missing read is never presented as success.
+ */
+function completionSummaryOf(
+  view: NativeTaskView,
+  runState: string | null,
+  submitted: NativeCompletionContract | null,
+): TaskCompletionSummary | null {
+  if (view.completion !== null) {
+    return {
+      includeCommit: view.completion.contract.include_commit,
+      includePush: view.completion.contract.include_push,
+      includePr: view.completion.contract.include_pr,
+      steps: view.completion.steps.map((row) => ({
+        step: row.step,
+        status: row.status,
+        detail: row.detail.length > 0 ? row.detail : null,
+      })),
+      source: 'daemon',
+      reason: null,
+    };
+  }
+  if (!hasCompletionSteps(submitted)) {
+    return null;
+  }
+  const contract = submitted as NativeCompletionContract;
+  const requested: Array<{ step: string; enabled: boolean }> = [
+    { step: 'commit', enabled: contract.include_commit },
+    { step: 'push', enabled: contract.include_push },
+    { step: 'pr', enabled: contract.include_pr },
+  ];
+  const selected = requested.filter((entry) => entry.enabled);
+  const state = (runState ?? view.state).trim().toLowerCase();
+  if (state === 'done') {
+    return {
+      includeCommit: contract.include_commit,
+      includePush: contract.include_push,
+      includePr: contract.include_pr,
+      steps: selected.map((entry) => ({
+        step: entry.step,
+        status: 'succeeded',
+        detail: 'certified by the durable completion gate (all requested steps succeeded)',
+      })),
+      source: 'derived',
+      reason: null,
+    };
+  }
+  if (state === 'failed' || state === 'cancelled') {
+    return {
+      includeCommit: contract.include_commit,
+      includePush: contract.include_push,
+      includePr: contract.include_pr,
+      steps: selected.map((entry) => ({
+        step: entry.step,
+        status: 'unknown',
+        detail: 'the run ended before certification',
+      })),
+      source: 'unavailable',
+      reason: 'the serving daemon exposes no per-step completion read; exact statuses are not served',
+    };
+  }
+  return {
+    includeCommit: contract.include_commit,
+    includePush: contract.include_push,
+    includePr: contract.include_pr,
+    steps: selected.map((entry) => ({
+      step: entry.step,
+      status: 'pending',
+      detail: 'awaiting deterministic verification and the durable completion gate',
+    })),
+    source: 'derived',
+    reason: null,
+  };
+}
+
 // ------------------------------------------------------------ daemon + session
 
 async function startServer(context: vscode.ExtensionContext): Promise<void> {
@@ -250,6 +379,7 @@ function stopServer(): void {
   active.taskVerification = null;
   active.tournamentId = null;
   active.pixelPresence = new Map();
+  active.completionContract = null;
   store.patch({
     daemon: 'stopped',
     daemonDetail: '',
@@ -432,7 +562,10 @@ async function refresh(): Promise<void> {
         // not blank the rest of the snapshot.
         client.modelCatalog().catch(() => [] as NativeModelInfo[]),
       ]);
-    const task = tasks.length > 0 ? taskSummary(tasks[0]!) : null;
+    const task =
+      tasks.length > 0
+        ? taskSummary(tasks[0]!, runs[0]?.state ?? null, active.completionContract)
+        : null;
     // busy/activeRunId are DERIVED FROM THE RUN STATE: a terminal run
     // (Done/Failed/Cancelled) is not running merely because it is listed.
     const activeRunId = activeRunIdAfter(active.activeRunId, runs.map(runSummary));
@@ -597,7 +730,11 @@ function cockpitTaskVerificationView(view: NativeTaskVerification | null): Cockp
   };
 }
 
-function taskSummary(view: NativeTaskView): TaskSummary {
+function taskSummary(
+  view: NativeTaskView,
+  runState: string | null,
+  submitted: NativeCompletionContract | null,
+): TaskSummary {
   return {
     goal: view.goal,
     state: view.state,
@@ -626,6 +763,7 @@ function taskSummary(view: NativeTaskView): TaskSummary {
     evidenceRefs: view.evidenceRefs,
     phase: view.phase,
     progress: view.progress,
+    completion: completionSummaryOf(view, runState, submitted),
   };
 }
 
@@ -678,7 +816,12 @@ function runSummary(run: NativeTaskRun): RunSummary {
 
 // ---------------------------------------------------------------- task actions
 
-async function startTask(goal: string, context: vscode.ExtensionContext): Promise<void> {
+async function startTask(
+  goal: string,
+  files: readonly string[],
+  contract: NativeCompletionContract | null,
+  context: vscode.ExtensionContext,
+): Promise<void> {
   try {
     if (!active.client || !active.sessionId) {
       await startServer(context);
@@ -696,6 +839,8 @@ async function startTask(goal: string, context: vscode.ExtensionContext): Promis
       mutationMode: config('mutationMode', ''),
       maxTokens: config('budgetTokens', 0),
       maxCostMicro: config('budgetCostMicro', 0),
+      files,
+      completionContract: contract,
     };
     const outcome = await startTaskRun({
       client,
@@ -704,8 +849,14 @@ async function startTask(goal: string, context: vscode.ExtensionContext): Promis
       settings,
       onStarted: (started) => {
         active.activeRunId = started.run_id;
+        active.completionContract = contract;
         store.patch({ activeRunId: started.run_id, busy: true, lastError: null });
-        chatProvider?.postNotice('info', `task run ${started.run_id} started (${started.state})`);
+        const attachments = files.length > 0 ? ` with ${files.length} attachment(s)` : '';
+        const steps = contract !== null ? ' + completion contract' : '';
+        chatProvider?.postNotice(
+          'info',
+          `task run ${started.run_id} started (${started.state})${attachments}${steps}`,
+        );
         scheduleRefresh(0);
       },
       onFailure: (failure: StartFailure) => {
@@ -719,6 +870,49 @@ async function startTask(goal: string, context: vscode.ExtensionContext): Promis
     reportError(error);
     chatProvider?.postStartResult(goal, false);
   }
+}
+
+/**
+ * Task-mode completion controls for the command path (the vendored UI owns
+ * its own composer and never grows Faktor-only checkboxes): a multi-select
+ * list of the three conditional steps. An empty selection = today's
+ * default path (no contract, no work item).
+ */
+async function promptCompletionContract(): Promise<NativeCompletionContract | null> {
+  const picks = await vscode.window.showQuickPick(
+    [
+      { label: 'Commit when verified', key: 'include_commit' as const, picked: false },
+      { label: 'Push', key: 'include_push' as const, picked: false },
+      { label: 'Create PR', key: 'include_pr' as const, picked: false },
+    ],
+    {
+      canPickMany: true,
+      title: 'Faktor: Task completion contract',
+      placeHolder: 'Conditional steps the durable completion gate must certify (Task mode only)',
+      ignoreFocusOut: true,
+    },
+  );
+  if (picks === undefined || picks.length === 0) {
+    return null;
+  }
+  return {
+    include_commit: picks.some((pick) => pick.key === 'include_commit'),
+    include_push: picks.some((pick) => pick.key === 'include_push'),
+    include_pr: picks.some((pick) => pick.key === 'include_pr'),
+  };
+}
+
+async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<void> {
+  const goal = await vscode.window.showInputBox({
+    title: 'Faktor: new task',
+    prompt: 'Goal for the task run',
+    ignoreFocusOut: true,
+  });
+  if (goal === undefined || goal.trim().length === 0) {
+    return;
+  }
+  const contract = await promptCompletionContract();
+  await startTask(goal.trim(), [], contract, context);
 }
 
 async function cancelActiveRun(): Promise<void> {
@@ -934,22 +1128,25 @@ async function handleWebviewMessage(
       return;
     case 'sendGoal': {
       const goal = typeof message.goal === 'string' ? message.goal.trim() : '';
-      if (goal.length > 0) {
-        await startTask(goal, context);
+      if (goal.length === 0) {
+        return;
       }
+      // Files ride the SAME attachment vocabulary the frozen bridge maps
+      // (`sendGoal.files`); malformed entries are refused individually and
+      // never discard the goal. The completion contract is Task-mode only:
+      // a non-object / partial / all-false contract is refused to null and
+      // the run takes today's default path.
+      const { files, refused } = boundedWebviewFiles(message.files);
+      const contract = completionContractSetting(message.completionContract);
+      if (refused > 0) {
+        chatProvider?.postNotice('error', `${refused} attachment(s) refused (malformed or out of bounds)`);
+      }
+      await startTask(goal, files, contract, context);
       return;
     }
-    case 'newTask': {
-      const goal = await vscode.window.showInputBox({
-        title: 'Faktor: new task',
-        prompt: 'Goal for the task run',
-        ignoreFocusOut: true,
-      });
-      if (goal !== undefined && goal.trim().length > 0) {
-        await startTask(goal.trim(), context);
-      }
+    case 'newTask':
+      await newTaskFromCommand(context);
       return;
-    }
     case 'cancelRun':
       await cancelActiveRun();
       return;
@@ -961,6 +1158,17 @@ async function handleWebviewMessage(
       return;
     case 'retrieveEvidence':
       await retrieveEvidence(message);
+      return;
+    // Coordination board: the native server exposes no board read route at
+    // this revision (the durable board lives in the session ledger and is
+    // reachable only through the agent's own board tools). The host answers
+    // these gestures truthfully — no fabricated posts, no silent no-op.
+    case 'boardRead':
+    case 'boardPost':
+      chatProvider?.postNotice(
+        'info',
+        'coordination board is not exposed by the native server yet (no board read route); no board state is fabricated',
+      );
       return;
     default:
       return;
@@ -997,14 +1205,7 @@ export function activate(context: vscode.ExtensionContext): void {
       chatProvider?.focus();
     }),
     vscode.commands.registerCommand('faktor.newTask', async () => {
-      const goal = await vscode.window.showInputBox({
-        title: 'Faktor: new task',
-        prompt: 'Goal for the task run',
-        ignoreFocusOut: true,
-      });
-      if (goal !== undefined && goal.trim().length > 0) {
-        await startTask(goal.trim(), context);
-      }
+      await newTaskFromCommand(context);
     }),
     vscode.commands.registerCommand('faktor.cancelTask', () => cancelActiveRun()),
     vscode.commands.registerCommand('faktor.refresh', () => refresh()),

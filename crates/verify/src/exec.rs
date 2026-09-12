@@ -928,6 +928,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn sh_spec(id: &str, script: &str) -> CheckSpec {
         CheckSpec::new(
             id,
@@ -939,6 +940,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn passing_check_reports_passed_exit_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -949,6 +951,7 @@ mod tests {
         assert_eq!(out.exit, Some(0));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failing_check_reports_failed_with_exit_code() {
         let dir = tempfile::tempdir().unwrap();
@@ -982,6 +985,7 @@ mod tests {
         assert!(out.summary.unwrap_or_default().contains("not found"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn deadline_kills_the_whole_process_group_no_orphans() {
         let dir = tempfile::tempdir().unwrap();
@@ -1016,6 +1020,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_stops_a_running_check() {
         let dir = tempfile::tempdir().unwrap();
@@ -1111,6 +1116,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn executor_reports_its_supervisor_owner_for_sessions() {
         // The SpawnConfig owner is ProcessOwner::Verification(session): the
@@ -1151,6 +1157,7 @@ mod tests {
         let _ = cancel;
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn checks_run_with_the_toolchain_allowlist_and_never_see_secrets() {
         // One environment authority: a verification child sees PATH and the
@@ -1216,6 +1223,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn huge_output_is_capped_not_deadlocked() {
         let dir = tempfile::tempdir().unwrap();
@@ -1233,6 +1241,7 @@ mod tests {
         assert!(out.summary.unwrap_or_default().len() < 16 * 1024);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn hostile_cwd_values_are_rejected_before_spawn() {
         let dir = tempfile::tempdir().unwrap();

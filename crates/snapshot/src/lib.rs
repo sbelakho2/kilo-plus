@@ -1768,6 +1768,7 @@ mod tests {
     /// P0-51: corrupt and hostile checkpoint paths surface as loud TYPED
     /// errors at probe time (snapshot load / recovery), while genuine
     /// ENOENT — including a deleted parent directory — stays `missing`.
+    #[cfg(unix)]
     #[test]
     fn probe_classifies_corrupt_and_hostile_rows_loudly_enoent_stays_missing() {
         let (_d, _cps, h, _id, _session) = fixture();
@@ -1829,6 +1830,7 @@ mod tests {
     /// advisory cache would trust (its window was primed by a prior read)
     /// aborts the rollback with a loud typed error — no silent
     /// wrong-content restore.
+    #[cfg(unix)]
     #[test]
     fn rollback_with_same_size_same_mtime_corruption_fails_loudly_never_restores_wrong_content() {
         let (_d, cps, h, id, session) = fixture();

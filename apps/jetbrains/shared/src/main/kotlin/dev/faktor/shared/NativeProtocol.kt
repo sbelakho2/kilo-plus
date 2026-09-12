@@ -359,6 +359,14 @@ class JsonObjectBuilder {
     fun putStrings(name: String, values: List<String>?): JsonObjectBuilder =
         put(name, if (values == null) null else JsonValue.Arr(values.map { JsonValue.Str(it) }))
 
+    /** One nested object (strict DTO members only). */
+    fun putObject(name: String, block: JsonObjectBuilder.() -> Unit): JsonObjectBuilder =
+        put(name, JsonObjectBuilder().apply(block).build())
+
+    /** An array of nested objects (insertion order preserved). */
+    fun putObjects(name: String, values: List<JsonObjectBuilder>): JsonObjectBuilder =
+        put(name, if (values.isEmpty()) null else JsonValue.Arr(values.map { it.build() }))
+
     fun build(): JsonValue.Obj = JsonValue.Obj(fields)
 
     fun toJson(): String = JsonCodec.write(build())
@@ -492,7 +500,48 @@ data class NativeTaskView(
     val blockers: List<String> = emptyList(),
     val evidenceRefs: List<String> = emptyList(),
     val phase: String? = null,
-    val progress: NativeAgentProgress? = null
+    val progress: NativeAgentProgress? = null,
+    /** Additive durable completion contract + step rows; null when the
+     * serving daemon exposes no completion read (never fabricated). */
+    val completion: NativeTaskCompletion? = null
+)
+
+/** The Task-mode completion contract (wire vocabulary `include_*`). */
+data class NativeCompletionContract(
+    val includeCommit: Boolean,
+    val includePush: Boolean,
+    val includePr: Boolean
+) {
+    /** All-false means today's default path: no contract is sent. */
+    val isDefault: Boolean
+        get() = !includeCommit && !includePush && !includePr
+
+    /** The requested conditional steps, in gate order. */
+    fun requestedSteps(): List<String> {
+        val steps = mutableListOf<String>()
+        if (includeCommit) steps.add("commit")
+        if (includePush) steps.add("push")
+        if (includePr) steps.add("pr")
+        return steps
+    }
+
+    companion object {
+        fun of(includeCommit: Boolean, includePush: Boolean, includePr: Boolean) =
+            NativeCompletionContract(includeCommit, includePush, includePr)
+    }
+}
+
+/** One durable completion-step row as served on a task view. */
+data class NativeCompletionStepStatus(
+    val step: String,
+    val status: String,
+    val detail: String
+)
+
+/** The durable completion surface of one task (contract + step rows). */
+data class NativeTaskCompletion(
+    val contract: NativeCompletionContract,
+    val steps: List<NativeCompletionStepStatus>
 )
 
 data class NativeTaskRun(
@@ -931,6 +980,31 @@ private fun parseTaskBlockers(v: JsonView): List<String> =
         }
     } ?: emptyList()
 
+/**
+ * Strict additive completion parse: when the daemon serves a `completion`
+ * block both members are required and every step row carries
+ * step/status/detail. A malformed block is a loud protocol failure, never
+ * a silently empty (or fabricated) success.
+ */
+private fun parseTaskCompletion(v: JsonView): NativeTaskCompletion {
+    val contract = v.field("contract")
+    val steps = v.field("steps").array().map { step ->
+        NativeCompletionStepStatus(
+            step = step.field("step").string(),
+            status = step.field("status").string(),
+            detail = step.field("detail").string()
+        )
+    }
+    return NativeTaskCompletion(
+        contract = NativeCompletionContract(
+            includeCommit = contract.field("include_commit").bool(),
+            includePush = contract.field("include_push").bool(),
+            includePr = contract.field("include_pr").bool()
+        ),
+        steps = steps
+    )
+}
+
 fun parseNativeTaskViews(json: String): List<NativeTaskView> {
     val v = JsonCodec.parse(json).view("GET /native/session/{id}/tasks")
     return v.array().map {
@@ -954,7 +1028,8 @@ fun parseNativeTaskViews(json: String): List<NativeTaskView> {
             blockers = parseTaskBlockers(it),
             evidenceRefs = optionalStrings(it, "evidenceRefs", "evidence_refs"),
             phase = it.optionalField("phase")?.string(),
-            progress = progress?.let { p -> parseAgentProgress(p) }
+            progress = progress?.let { p -> parseAgentProgress(p) },
+            completion = it.optionalField("completion")?.let { c -> parseTaskCompletion(c) }
         )
     }
 }
@@ -1355,16 +1430,41 @@ object NativeRequests {
         maxTokens: Long? = null,
         maxCostMicro: Long? = null,
         mutationMode: String? = null,
-        files: List<String>? = null
-    ): String = JsonObjectBuilder()
-        .put("goal", goal)
-        .putStrings("criteria", criteria)
-        .put("model", model)
-        .put("max_tokens", maxTokens)
-        .put("max_cost_micro", maxCostMicro)
-        .put("mutation_mode", mutationMode)
-        .putStrings("files", if (files.isNullOrEmpty()) null else files)
-        .toJson()
+        files: List<String>? = null,
+        completionContract: NativeCompletionContract? = null
+    ): String {
+        val builder = JsonObjectBuilder()
+            .put("goal", goal)
+            .putStrings("criteria", criteria)
+            .put("model", model)
+            .put("max_tokens", maxTokens)
+            .put("max_cost_micro", maxCostMicro)
+            .put("mutation_mode", mutationMode)
+            .putStrings("files", if (files.isNullOrEmpty()) null else files)
+        // A non-default completion contract requires explicit work items (the
+        // daemon refuses it on the plain-prompt path). ONE mutating `main`
+        // item keeps the same in-session drive with the durable contract seam;
+        // the default path stays byte-identical.
+        val contract = completionContract?.takeIf { !it.isDefault }
+        if (contract != null) {
+            builder.putObjects(
+                "work_items",
+                listOf(
+                    JsonObjectBuilder()
+                        .put("id", "main")
+                        .put("kind", "Implementation")
+                        .put("summary", goal)
+                        .put("ownership", JsonValue.Str("isolated_worktree"))
+                )
+            )
+            builder.putObject("completion_contract") {
+                put("include_commit", contract.includeCommit)
+                put("include_push", contract.includePush)
+                put("include_pr", contract.includePr)
+            }
+        }
+        return builder.toJson()
+    }
 
     fun startTournament(
         goal: String,

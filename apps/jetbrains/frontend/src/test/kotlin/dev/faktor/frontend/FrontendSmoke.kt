@@ -13,7 +13,9 @@ import dev.faktor.backend.assertTrue
 import dev.faktor.backend.fail
 import dev.faktor.backend.NativeClient
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
+import dev.faktor.shared.NativeProtocolException
 import dev.faktor.shared.NativeRequests
 import dev.faktor.shared.parseNativeAgents
 import dev.faktor.shared.parseNativeModelCatalog
@@ -316,6 +318,111 @@ object FrontendSmoke {
                 "{\"selector\":\"line_range\",\"start\":2,\"end\":5}",
                 NativeRequests.evidenceSelectorLines(2, 5)
             )
+        }
+
+        step("completion contract: strict request, strict parse, durable provenance") {
+            // The default path stays byte-identical (no contract, no item).
+            assertEquals("{\"goal\":\"g\"}", NativeRequests.startTaskRun("g"))
+            assertEquals(
+                "{\"goal\":\"g\"}",
+                NativeRequests.startTaskRun(
+                    "g",
+                    completionContract = NativeCompletionContract(false, false, false)
+                )
+            )
+            // A non-default contract starts ONE explicit mutating work item.
+            assertEquals(
+                "{\"goal\":\"g\",\"criteria\":[\"c\"]," +
+                    "\"work_items\":[{\"id\":\"main\",\"kind\":\"Implementation\"," +
+                    "\"summary\":\"g\",\"ownership\":\"isolated_worktree\"}]," +
+                    "\"completion_contract\":{\"include_commit\":true,\"include_push\":false," +
+                    "\"include_pr\":true}}",
+                NativeRequests.startTaskRun(
+                    "g",
+                    listOf("c"),
+                    completionContract = NativeCompletionContract(true, false, true)
+                )
+            )
+            // The additive durable completion block parses strictly.
+            val served = parseNativeTaskViews(
+                "[{\"goal\":\"g\",\"state\":\"running\"," +
+                    "\"milestones\":{\"completed\":[],\"open\":[]}," +
+                    "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"budget\":null," +
+                    "\"completion\":{\"contract\":{\"include_commit\":true," +
+                    "\"include_push\":true,\"include_pr\":false}," +
+                    "\"steps\":[{\"step\":\"commit\",\"status\":\"succeeded\"," +
+                    "\"detail\":\"abc\"}]}}]"
+            )[0]
+            val servedCompletion = served.completion ?: fail("served completion must parse")
+            assertEquals(true, servedCompletion.contract.includeCommit)
+            assertEquals(1, servedCompletion.steps.size)
+            assertEquals("succeeded", servedCompletion.steps[0].status)
+            assertEquals("abc", servedCompletion.steps[0].detail)
+            // A malformed served block is a loud protocol failure.
+            try {
+                parseNativeTaskViews(
+                    "[{\"goal\":\"g\",\"state\":\"running\"," +
+                        "\"milestones\":{\"completed\":[],\"open\":[]}," +
+                        "\"changedFiles\":[],\"tests\":{\"run\":[],\"failed\":[]},\"budget\":null," +
+                        "\"completion\":{\"contract\":{\"include_commit\":true},\"steps\":[]}}]"
+                )
+                fail("a malformed completion block must fail loudly")
+            } catch (e: NativeProtocolException) {
+                assertTrue(e.message?.contains("include_push") == true, e.message)
+            }
+            // Without a served read the block derives from the DURABLE run state.
+            val task = parseNativeTaskViews(TASK_JSON)[0]
+            assertEquals(null, TaskTree.build(task = task).completion, "no contract => no block")
+            val pending = TaskTree.build(
+                task = task,
+                submittedCompletion = NativeCompletionContract(true, false, true),
+                runState = "Running"
+            ).completion ?: fail("pending completion must build")
+            assertEquals("derived", pending.source)
+            assertEquals(2, pending.steps.size)
+            assertEquals("pending", pending.steps[0].status)
+            val certified = TaskTree.build(
+                task = task,
+                submittedCompletion = NativeCompletionContract(true, false, false),
+                runState = "Done"
+            ).completion ?: fail("certified completion must build")
+            assertEquals("derived", certified.source)
+            assertEquals("succeeded", certified.steps[0].status)
+            val unknown = TaskTree.build(
+                task = task,
+                submittedCompletion = NativeCompletionContract(false, true, false),
+                runState = "Failed"
+            ).completion ?: fail("terminal completion must build")
+            assertEquals("unavailable", unknown.source)
+            assertEquals("unknown", unknown.steps[0].status)
+            assertTrue(
+                unknown.reason?.contains("no per-step completion read") == true,
+                unknown.reason
+            )
+            // Daemon-served rows win and the panel renders them as rows.
+            val daemon = TaskTree.build(task = served).completion ?: fail("daemon completion")
+            assertEquals("daemon", daemon.source)
+            assertEquals(listOf("[succeeded] commit - abc"), TaskTreePanel().completionLabels(daemon))
+        }
+
+        step("Task-mode contract controls are checked only in the Task tab") {
+            val panel = FaktorChatPanel(
+                FaktorFrontendService(
+                    Paths.get("target/debug/faktor-cli"),
+                    Paths.get(System.getProperty("java.io.tmpdir"), "faktor-frontend-contract-smoke")
+                )
+            )
+            try {
+                assertEquals(null, panel.completionContractFromControls())
+                panel.completionCommit.isSelected = true
+                panel.completionPr.isSelected = true
+                assertEquals(
+                    NativeCompletionContract(includeCommit = true, includePush = false, includePr = true),
+                    panel.completionContractFromControls()
+                )
+            } finally {
+                panel.shutdown()
+            }
         }
 
         step("evidence ref parsing mirrors the cockpit vocabulary") {

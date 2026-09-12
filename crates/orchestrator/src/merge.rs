@@ -1755,6 +1755,7 @@ impl OrchestratorRuntime {
             updated_ms: now,
             base_snapshot_id: None,
             env_snapshot_id: None,
+            execution_phase: ExecutionPhase::Review,
         };
         // Base rows: the reviewer's own fresh copy IS its base (audit 70:
         // "base snapshot at review start"); the manifest returned by the
@@ -2381,6 +2382,7 @@ mod tests {
                 updated_ms: 1,
                 base_snapshot_id: Some("base-child-0".into()),
                 env_snapshot_id: None,
+                execution_phase: ExecutionPhase::default(),
             };
             let handle = manager.get_session(parent).unwrap().unwrap();
             handle

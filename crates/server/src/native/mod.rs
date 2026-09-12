@@ -17,6 +17,7 @@ use faktor_protocol::error::ApiError;
 use crate::api::{AppState, ServerDeps};
 
 pub(crate) mod agents;
+pub(crate) mod board;
 pub(crate) mod evidence;
 pub(crate) mod models;
 /// The ONE product execution entry for ordinary prompts + task starts
@@ -30,6 +31,7 @@ pub(crate) mod usage;
 pub(crate) mod verification;
 
 pub(crate) use agents::*;
+pub(crate) use board::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;
 pub use prompt::*;

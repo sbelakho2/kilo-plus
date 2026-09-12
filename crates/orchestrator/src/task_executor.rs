@@ -784,7 +784,7 @@ impl TaskExecutor {
         let exec = self.clone();
         let run_id_owned = run_id.to_string();
         tokio::spawn(async move {
-            let _ = orch
+            if let Err(e) = orch
                 .reattach(
                     parent,
                     &run_id_owned,
@@ -794,7 +794,10 @@ impl TaskExecutor {
                     PathBuf::new(),
                     crash_seam,
                 )
-                .await;
+                .await
+            {
+                eprintln!("resumed-run re-attach failed for run {run_id_owned}: {e}");
+            }
             // A re-attached run settles through the SAME common pass as a
             // fresh orchestrated run (idempotent: an already-settled run is
             // a no-op with the same outcome).
@@ -1117,7 +1120,9 @@ impl TaskExecutor {
             if let Some(h) = handle2 {
                 let receipt2 = receipt.clone();
                 tokio::spawn(async move {
-                    let _ = agent.drive_receipt(&h, receipt2, model).await;
+                    if let Err(e) = agent.drive_receipt(&h, receipt2, model).await {
+                        eprintln!("in-session drive failed for session {parent}: {e}");
+                    }
                     exec.after_shadowed_drive(parent).await;
                 });
             }
@@ -1287,7 +1292,9 @@ impl TaskExecutor {
         };
         let run_id2 = run_id.clone();
         tokio::spawn(async move {
-            let _ = orch.execute_task(plan, owner, config, &specs).await;
+            if let Err(e) = orch.execute_task(plan, owner, config, &specs).await {
+                eprintln!("orchestrated run {run_id2} failed: {e}");
+            }
             // THE post-run settlement (never an await-then-clear): the
             // aggregate root verification, the accepted contract's steps and
             // the completion gate all run before the active slot is freed.

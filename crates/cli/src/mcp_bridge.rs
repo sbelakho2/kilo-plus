@@ -86,6 +86,8 @@ pub fn mcp_tool(server: Arc<McpServer>, tool: &McpTool) -> Tool {
                     // MCP calls have unknown external effects: never replay.
                     effect_status: faktor_core::op::EffectStatus::Unknown,
                     postcondition: None,
+                    // MCP server output is tool-class data, never policy.
+                    provenance: faktor_context::compiler::ProvenanceSource::Tool,
                 })
             })
         }),

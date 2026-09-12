@@ -3894,6 +3894,7 @@ fn craft_child_row(
         updated_ms: 1,
         base_snapshot_id: None,
         env_snapshot_id: None,
+        execution_phase: ExecutionPhase::default(),
     };
     if let Some(b) = blocker {
         row.set_blocker(&b).unwrap();
@@ -4056,7 +4057,7 @@ async fn budget_blocked_child_is_durable_across_reopen_and_clears_on_resume() {
         .orchestrator_child_blocker_get()
         .unwrap()
         .expect("typed blocker");
-    assert_eq!(typed.kind, "budget");
+    assert_eq!(typed.kind, BlockerKind::Budget);
     assert_eq!(typed.reason, reason);
     // The open is in the child's typed ledger (audit history).
     let entries = child.ledger_entries_page(None, 500).unwrap().entries;
@@ -4076,7 +4077,7 @@ async fn budget_blocked_child_is_durable_across_reopen_and_clears_on_resume() {
     assert_eq!(rows2[0].blocker_kind.as_deref(), Some("budget"));
     let s2 = m.get_session(SessionId::new(child_sid)).unwrap().unwrap();
     let typed2 = s2.orchestrator_child_blocker_get().unwrap().unwrap();
-    assert_eq!(typed2.kind, "budget");
+    assert_eq!(typed2.kind, BlockerKind::Budget);
     assert_eq!(typed2.reason, reason);
     assert_eq!(typed2.last_progress_ms, None);
 }
@@ -4225,7 +4226,323 @@ async fn dependency_blocked_child_names_the_dependency_durably() {
         .orchestrator_child_blocker_get()
         .unwrap()
         .expect("typed dependency blocker");
-    assert_eq!(typed.kind, "dependency");
+    assert_eq!(typed.kind, BlockerKind::Dependency);
     assert_eq!(typed.dependency.as_deref(), Some("a"));
     assert_registry_consistent(&env, "run-dep");
+}
+
+// ------------------------------------------------ ack discipline + derivation
+
+#[tokio::test]
+async fn control_ack_failure_is_typed_and_the_mirror_never_claims_applied() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let run = env.orchestrator.clone();
+    let owner = env.owner.clone();
+    let config = base_config(&env, "run-ack");
+    let handle = tokio::spawn(async move {
+        run.execute_task(p, owner, config, &[spec("analysis")])
+            .await
+            .unwrap()
+    });
+    wait_until(|| env.provider.count() >= 1, 300).await;
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    env.orchestrator.pause_child("child-0").expect("pause ok");
+    wait_until(|| paused_waiting(&env, "child-0"), 10).await;
+    // A clean first change: the mirror is derived from the durable task row.
+    env.orchestrator
+        .change_child_budget("child-0", 1_000)
+        .expect("first budget change");
+    assert_eq!(
+        env.orchestrator
+            .child("child-0")
+            .unwrap()
+            .unwrap()
+            .budget_max_tokens,
+        Some(1_000)
+    );
+    // Inject a failing control-row ACK (the upsert's UPDATE branch aborts).
+    env.manager
+        .store()
+        .sql_execute(
+            "CREATE TRIGGER fail_ctl_ack BEFORE UPDATE ON memory_fact \
+             WHEN NEW.kind = 'orchestrator_ctl' \
+             BEGIN SELECT RAISE(ABORT, 'injected ack failure'); END;",
+        )
+        .unwrap();
+    let err = env
+        .orchestrator
+        .change_child_budget("child-0", 2_000)
+        .expect_err("a failed ack must be a typed error, never a claimed apply");
+    assert!(
+        matches!(err, ExecError::RetriablePersistence { .. }),
+        "{err:?}"
+    );
+    // The in-memory mirror did NOT claim the failed change applied.
+    let child = env.orchestrator.child("child-0").unwrap().unwrap();
+    assert_eq!(child.budget_max_tokens, Some(1_000));
+    // The enqueued row exists but is NOT acked.
+    let child_session = env
+        .manager
+        .get_session(SessionId::new(child.session_id))
+        .unwrap()
+        .unwrap();
+    let pending = child_session.orchestrator_ctl_pending().unwrap();
+    let unacked = pending
+        .iter()
+        .find(|r| matches!(r.control, ChildControl::ChangeBudget { max_tokens: 2_000 }))
+        .expect("the failed change left its durable row unapplied");
+    assert!(!unacked.applied());
+    // Remove the seam: the retry is idempotent and applies.
+    env.manager
+        .store()
+        .sql_execute("DROP TRIGGER fail_ctl_ack;")
+        .unwrap();
+    env.orchestrator
+        .change_child_budget("child-0", 2_000)
+        .expect("retry after the seam");
+    assert_eq!(
+        env.orchestrator
+            .child("child-0")
+            .unwrap()
+            .unwrap()
+            .budget_max_tokens,
+        Some(2_000)
+    );
+    env.orchestrator.resume_child("child-0").expect("resume ok");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+        .await
+        .expect("drive must finish after resume")
+        .expect("execute task panicked");
+    assert!(outcome.complete, "{outcome:?}");
+    // Settlement marks the child Integrating in the durable projection.
+    assert_eq!(
+        outcome
+            .children
+            .iter()
+            .find(|c| c.child_id == "child-0")
+            .unwrap()
+            .execution_phase,
+        ExecutionPhase::Integrating
+    );
+    let parent = env.parent;
+    drop(env);
+    // Reopen: the task row is the single budget authority; every registry
+    // read derives the child view from it (no second durable truth).
+    let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let rows = OrchestratorRuntime::registry_rows(m.clone(), parent, "run-ack").unwrap();
+    assert_eq!(rows[0].budget_max_tokens, Some(2_000));
+    assert_eq!(rows[0].execution_phase, ExecutionPhase::Integrating);
+}
+
+#[tokio::test]
+async fn pause_and_cancel_persistence_failures_are_typed_and_claim_nothing() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), roundtrip_script(), 15));
+    let p = plan(
+        OwnershipModel::NoWrites,
+        vec![wi("analysis", WorkKind::Analysis, &[])],
+    );
+    let run = env.orchestrator.clone();
+    let owner = env.owner.clone();
+    let config = base_config(&env, "run-ctl-fail");
+    let handle = tokio::spawn(async move {
+        run.execute_task(p, owner, config, &[spec("analysis")])
+            .await
+            .unwrap()
+    });
+    wait_until(|| env.provider.count() >= 1, 300).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // A failing control-row INSERT: pause/cancel must refuse loudly.
+    env.manager
+        .store()
+        .sql_execute(
+            "CREATE TRIGGER fail_ctl_insert BEFORE INSERT ON memory_fact \
+             WHEN NEW.kind = 'orchestrator_ctl' \
+             BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END;",
+        )
+        .unwrap();
+    let pause_err = env.orchestrator.pause_child("child-0").unwrap_err();
+    assert!(
+        matches!(pause_err, ExecError::RetriablePersistence { .. }),
+        "{pause_err:?}"
+    );
+    let cancel_err = env.orchestrator.cancel_child("child-0").unwrap_err();
+    assert!(
+        matches!(cancel_err, ExecError::RetriablePersistence { .. }),
+        "{cancel_err:?}"
+    );
+    let child = env.orchestrator.child("child-0").unwrap().unwrap();
+    assert_eq!(
+        child.state,
+        ChildState::Running,
+        "no pause/cancel state may be claimed when the durable row was never written"
+    );
+    let child_session = env
+        .manager
+        .get_session(SessionId::new(child.session_id))
+        .unwrap()
+        .unwrap();
+    assert!(
+        child_session.orchestrator_ctl_all().unwrap().is_empty(),
+        "a failed enqueue must leave no control row"
+    );
+    // Remove the seam: the same calls succeed and the run completes.
+    env.manager
+        .store()
+        .sql_execute("DROP TRIGGER fail_ctl_insert;")
+        .unwrap();
+    env.orchestrator
+        .cancel_child("child-0")
+        .expect("cancel retry");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+        .await
+        .expect("cancel must reach the running prompt")
+        .expect("execute task panicked");
+    assert_eq!(outcome.cancelled, vec!["analysis".to_string()]);
+    assert!(!outcome.complete);
+}
+
+#[tokio::test]
+async fn registry_rows_reject_corrupt_blocker_rows_loudly() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    // Blocked WITHOUT a blocker.
+    craft_child_row(
+        &env,
+        "run-corrupt-a",
+        "child-0",
+        "a",
+        ChildState::Blocked,
+        None,
+    );
+    let err = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-corrupt-a")
+        .expect_err("Blocked without a blocker must fail decode");
+    assert!(
+        err.message.contains("Blocked without a blocker"),
+        "{}",
+        err.message
+    );
+    // Non-Blocked WITH blocker fields: mutate the durable row behind the API.
+    let parent = env.manager.get_session(env.parent).unwrap().unwrap();
+    let sid = craft_child_row(
+        &env,
+        "run-corrupt-b",
+        "child-1",
+        "a",
+        ChildState::Blocked,
+        Some(ChildBlocker::new(
+            BlockerKind::Budget,
+            "exhausted",
+            "raise the cap",
+        )),
+    );
+    let _ = sid;
+    let mut raw = None;
+    let mut after = None;
+    loop {
+        let page = parent.memory_facts_page(after.as_ref(), 200).unwrap();
+        for (kind, key, value) in &page.facts {
+            if kind == REGISTRY_ROW_KIND && key == "run-corrupt-b/child-1" {
+                raw = Some(value.clone());
+            }
+        }
+        match page.cursor {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    let corrupt = raw.expect("crafted row").replace("child-1", "child-2");
+    // Flip state to Running while KEEPING the blocker fields.
+    let corrupt = corrupt.replace("\"state\":\"Blocked\"", "\"state\":\"Running\"");
+    parent
+        .upsert_memory_fact(REGISTRY_ROW_KIND, "run-corrupt-b/child-2", &corrupt)
+        .unwrap();
+    let err = OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-corrupt-b")
+        .expect_err("running with a blocker must fail decode");
+    assert!(err.message.contains("carries a blocker"), "{}", err.message);
+    // A hostile execution phase is a loud decode failure too.
+    let sid = craft_child_row(
+        &env,
+        "run-corrupt-c",
+        "child-3",
+        "a",
+        ChildState::Running,
+        None,
+    );
+    let _ = sid;
+    let mut raw = None;
+    let mut after = None;
+    loop {
+        let page = parent.memory_facts_page(after.as_ref(), 200).unwrap();
+        for (kind, key, value) in &page.facts {
+            if kind == REGISTRY_ROW_KIND && key == "run-corrupt-c/child-3" {
+                raw = Some(value.clone());
+            }
+        }
+        match page.cursor {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    let corrupt = raw.expect("crafted row").replace(
+        "\"execution_phase\":\"planning\"",
+        "\"execution_phase\":\"zombie\"",
+    );
+    parent
+        .upsert_memory_fact(REGISTRY_ROW_KIND, "run-corrupt-c/child-3", &corrupt)
+        .unwrap();
+    OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-corrupt-c")
+        .expect_err("a hostile execution phase must fail decode");
+}
+
+#[tokio::test]
+async fn child_projection_derives_budget_and_phase_across_reopen() {
+    let _heavy = heavy_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(open_env(dir.path(), empty_script(), 1));
+    let sid = craft_child_row(
+        &env,
+        "run-derive",
+        "child-0",
+        "a",
+        ChildState::Running,
+        None,
+    );
+    // The registry JSON claims a stale budget; the task row is the truth.
+    env.agent
+        .seed_task_budget(
+            sid,
+            &TaskBudget {
+                max_tokens: Some(777),
+                max_turns: None,
+                spent_tokens: 0,
+                spent_turns: 0,
+            },
+        )
+        .unwrap();
+    let session = env.manager.get_session(sid).unwrap().unwrap();
+    session.set_execution_phase(ExecutionPhase::Coding).unwrap();
+    assert_eq!(
+        session.set_execution_phase(ExecutionPhase::Coding).unwrap(),
+        None,
+        "same-phase re-set is an idempotent no-op"
+    );
+    let rows =
+        OrchestratorRuntime::registry_rows(env.manager.clone(), env.parent, "run-derive").unwrap();
+    assert_eq!(rows[0].budget_max_tokens, Some(777));
+    assert_eq!(rows[0].execution_phase, ExecutionPhase::Coding);
+    let parent = env.parent;
+    drop(env);
+    let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+    let rows = OrchestratorRuntime::registry_rows(m.clone(), parent, "run-derive").unwrap();
+    assert_eq!(rows[0].budget_max_tokens, Some(777));
+    assert_eq!(rows[0].execution_phase, ExecutionPhase::Coding);
 }

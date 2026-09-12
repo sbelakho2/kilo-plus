@@ -20,6 +20,7 @@ import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentProgress
 import dev.faktor.shared.NativeBlocker
 import dev.faktor.shared.NativeChildResult
+import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativeOrchestratorGraph
 import dev.faktor.shared.NativeProjection
@@ -126,6 +127,32 @@ data class VerificationSummary(
     val recordStatus: String?
 )
 
+/** One completion-contract step as the tree renders it. */
+data class CompletionStepView(
+    val step: String,
+    val status: String,
+    val detail: String?
+)
+
+/**
+ * The Task-mode completion contract + per-step statuses. `source` names the
+ * provenance of the rows:
+ *  - `daemon`      — served by the daemon;
+ *  - `derived`     — projected from the durable task-run state and the
+ *                    submitted contract (pending, or all-succeeded only
+ *                    because the durable gate certified the task);
+ *  - `unavailable` — contract known but this daemon exposes no per-step
+ *                    read (terminal non-certified run). Never fabricated.
+ */
+data class CompletionView(
+    val includeCommit: Boolean,
+    val includePush: Boolean,
+    val includePr: Boolean,
+    val steps: List<CompletionStepView>,
+    val source: String,
+    val reason: String?
+)
+
 /** Durable spend of the session task (tokens + microUSD, remaining computed). */
 data class SpendSummary(
     val spentTokens: Long?,
@@ -193,7 +220,9 @@ data class TaskTreeModel(
     val verification: VerificationSummary,
     val evidence: List<EvidenceRef>,
     val spend: SpendSummary?,
-    val tournament: TournamentView?
+    val tournament: TournamentView?,
+    /** The Task-mode completion contract + durable step statuses. */
+    val completion: CompletionView? = null
 )
 
 /** Pure builder over the native DTOs. */
@@ -209,7 +238,9 @@ object TaskTree {
         taskVerification: NativeTaskVerification? = null,
         usage: NativeSessionUsage? = null,
         childUsage: Map<String, NativeSessionUsage> = emptyMap(),
-        tournament: NativeTournament? = null
+        tournament: NativeTournament? = null,
+        submittedCompletion: NativeCompletionContract? = null,
+        runState: String? = null
     ): TaskTreeModel {
         val children = agents
             .filter { it.kind == "child" }
@@ -243,8 +274,80 @@ object TaskTree {
             verification = verification(verification, taskVerification, task),
             evidence = evidence(task, taskVerification),
             spend = spend(usage, task),
-            tournament = tournament?.let { tournamentView(it) }
+            tournament = tournament?.let { tournamentView(it) },
+            completion = completion(task, submittedCompletion, runState)
         )
+    }
+
+    // ---------------------------------------------------------- completion
+
+    /**
+     * The Task-mode completion contract. The daemon-served rows win; without
+     * a served read the block is derived from the DURABLE run state and the
+     * submitted contract (pending / gate-certified / truthfully unknown).
+     * A missing read is never presented as success.
+     */
+    private fun completion(
+        task: NativeTaskView?,
+        submitted: NativeCompletionContract?,
+        runState: String?
+    ): CompletionView? {
+        val served = task?.completion
+        if (served != null) {
+            return CompletionView(
+                includeCommit = served.contract.includeCommit,
+                includePush = served.contract.includePush,
+                includePr = served.contract.includePr,
+                steps = served.steps.map {
+                    CompletionStepView(it.step, it.status, it.detail.takeIf { detail -> detail.isNotEmpty() })
+                },
+                source = "daemon",
+                reason = null
+            )
+        }
+        val contract = submitted?.takeIf { !it.isDefault } ?: return null
+        val state = (runState ?: task?.state ?: "").lowercase()
+        val requested = contract.requestedSteps()
+        return when (state) {
+            "done" -> CompletionView(
+                includeCommit = contract.includeCommit,
+                includePush = contract.includePush,
+                includePr = contract.includePr,
+                steps = requested.map {
+                    CompletionStepView(
+                        it,
+                        "succeeded",
+                        "certified by the durable completion gate (all requested steps succeeded)"
+                    )
+                },
+                source = "derived",
+                reason = null
+            )
+            "failed", "cancelled" -> CompletionView(
+                includeCommit = contract.includeCommit,
+                includePush = contract.includePush,
+                includePr = contract.includePr,
+                steps = requested.map {
+                    CompletionStepView(it, "unknown", "the run ended before certification")
+                },
+                source = "unavailable",
+                reason = "the serving daemon exposes no per-step completion read; exact statuses are not served"
+            )
+            else -> CompletionView(
+                includeCommit = contract.includeCommit,
+                includePush = contract.includePush,
+                includePr = contract.includePr,
+                steps = requested.map {
+                    CompletionStepView(
+                        it,
+                        "pending",
+                        "awaiting deterministic verification and the durable completion gate"
+                    )
+                },
+                source = "derived",
+                reason = null
+            )
+        }
     }
 
     // ------------------------------------------------------------ children

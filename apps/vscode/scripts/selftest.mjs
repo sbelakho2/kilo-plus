@@ -1220,6 +1220,282 @@ async function shadowDefaultTests() {
   });
 }
 
+// ------------------------- 7b. Task-mode completion contract + file forwarding
+
+async function completionContractTests() {
+  await test('completion contract parsing is strict; all-false is the default path', () => {
+    assertDeepEqual(ts.completionContractSetting(undefined), null);
+    assertDeepEqual(ts.completionContractSetting(null), null);
+    assertDeepEqual(
+      ts.completionContractSetting({
+        include_commit: false,
+        include_push: false,
+        include_pr: false,
+      }),
+      null,
+      'all-false is the default behavior and must not reach the wire',
+    );
+    assertDeepEqual(
+      ts.completionContractSetting({
+        include_commit: true,
+        include_push: false,
+        include_pr: true,
+      }),
+      { include_commit: true, include_push: false, include_pr: true },
+    );
+    // Hostile shapes are refused to null, never coerced or partially applied.
+    for (const hostile of [
+      'commit',
+      ['include_commit'],
+      true,
+      42,
+      {},
+      { include_commit: true },
+      { include_commit: 'yes', include_push: false, include_pr: false },
+      { include_commit: 1, include_push: 0, include_pr: 0 },
+      { include_commit: true, include_push: false, include_pr: false, include_release: true },
+      Object.assign(
+        Object.create({ include_commit: true, include_push: false, include_pr: false }),
+        { include_pr: true, include_commit: true },
+      ),
+    ]) {
+      assertDeepEqual(
+        ts.completionContractSetting(hostile),
+        null,
+        `hostile contract must be refused: ${JSON.stringify(hostile)}`,
+      );
+    }
+    // Inherited-only members cannot smuggle a contract through the parser.
+    const inherited = Object.create({
+      include_commit: true,
+      include_push: false,
+      include_pr: false,
+    });
+    assertDeepEqual(ts.completionContractSetting(inherited), null);
+  });
+
+  await test('a non-default contract starts an explicit work item; the default stays byte-identical', () => {
+    const base = ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 });
+    assertDeepEqual(base, { goal: 'goal' });
+    assert(
+      !('work_items' in base) && !('completion_contract' in base) && !('files' in base),
+      'the default path carries no contract seam and no files',
+    );
+    assertDeepEqual(
+      ts.startTaskRequest('goal', {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0,
+        files: ['src/a.ts', 'docs/b.md'],
+      }),
+      { goal: 'goal', files: ['src/a.ts', 'docs/b.md'] },
+      'files-only task keeps the plain-prompt shape',
+    );
+    const requested = ts.startTaskRequest('goal', {
+      mutationMode: 'shadow',
+      maxTokens: 10,
+      maxCostMicro: 5,
+      files: ['src/a.ts'],
+      completionContract: { include_commit: true, include_push: false, include_pr: true },
+    });
+    assertDeepEqual(requested, {
+      goal: 'goal',
+      max_tokens: 10,
+      max_cost_micro: 5,
+      files: ['src/a.ts'],
+      work_items: [
+        {
+          id: 'main',
+          kind: 'Implementation',
+          summary: 'goal',
+          ownership: 'isolated_worktree',
+        },
+      ],
+      completion_contract: { include_commit: true, include_push: false, include_pr: true },
+      mutation_mode: 'shadow',
+    });
+    assertDeepEqual(
+      ts.startTaskRequest('goal', {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0,
+        completionContract: { include_commit: false, include_push: false, include_pr: false },
+      }),
+      { goal: 'goal' },
+      'an all-false contract is still the default path',
+    );
+  });
+
+  await test('the task view parses the additive durable completion block and rejects malformed shapes', () => {
+    const absent = nc.validateTaskViews([clone(taskViewJson)])[0];
+    assertEqual(absent.completion, null, 'absent completion stays null, never fabricated');
+    const served = nc.validateTaskViews([
+      {
+        ...clone(taskViewJson),
+        completion: {
+          contract: { include_commit: true, include_push: true, include_pr: false },
+          steps: [
+            { step: 'commit', status: 'succeeded', detail: 'committed abc', seq: 7, at_ms: 11 },
+            { step: 'push', status: 'skipped', detail: 'no remote', seq: 8 },
+          ],
+        },
+      },
+    ])[0];
+    assertEqual(served.completion.contract.include_push, true);
+    assertEqual(served.completion.steps.length, 2);
+    assertEqual(served.completion.steps[0].status, 'succeeded');
+    assertEqual(served.completion.steps[0].detail, 'committed abc');
+    assertEqual(served.completion.steps[0].atMs, 11);
+    assertEqual(served.completion.steps[1].atMs, null);
+    for (const hostile of [
+      { completion: { contract: { include_commit: true, include_push: false }, steps: [] } },
+      {
+        completion: {
+          contract: { include_commit: 'yes', include_push: false, include_pr: false },
+          steps: [],
+        },
+      },
+      {
+        completion: {
+          contract: { include_commit: true, include_push: false, include_pr: false },
+          steps: 'none',
+        },
+      },
+      {
+        completion: {
+          contract: { include_commit: true, include_push: false, include_pr: false },
+          steps: [{ step: 'commit', status: 'failed' }],
+        },
+      },
+    ]) {
+      assertProtocol(() => nc.validateTaskViews([{ ...clone(taskViewJson), ...hostile }]));
+    }
+  });
+
+  await test('cockpit renders the completion contract with explicit provenance', () => {
+    const task = {
+      goal: 'ship it',
+      state: 'running',
+      completed: [],
+      open: ['main'],
+      testsRun: [],
+      testsFailed: [],
+      changedFiles: [],
+      budget: null,
+      acceptanceCriteria: [],
+      plan: [],
+      blockers: [],
+      evidenceRefs: [],
+      phase: null,
+      progress: null,
+      completion: {
+        includeCommit: true,
+        includePush: false,
+        includePr: true,
+        steps: [
+          { step: 'commit', status: 'pending', detail: 'awaiting the gate' },
+          { step: 'pr', status: 'pending', detail: null },
+        ],
+        source: 'derived',
+        reason: null,
+      },
+    };
+    const view = cp.buildCockpit({
+      task,
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const section = cp.cockpitSections(view).find((entry) => entry.key === 'completion');
+    assert(section && section.present, 'the completion section must be present');
+    assert(section.lines[0].includes('commit, pr'), JSON.stringify(section.lines));
+    assert(section.lines[1].includes('[pending] commit'), JSON.stringify(section.lines));
+    assert(section.lines[2].includes('[pending] pr'), JSON.stringify(section.lines));
+    assert(
+      section.lines.some((line) => line.includes('status source: derived')),
+      JSON.stringify(section.lines),
+    );
+    // No contract: the section is explicitly empty, never fabricated.
+    const bare = cp.buildCockpit({
+      task: { ...task, completion: null },
+      agents: [],
+      verification: null,
+      usage: null,
+      taskVerification: null,
+    });
+    const empty = cp.cockpitSections(bare).find((entry) => entry.key === 'completion');
+    assert(empty && empty.present === false && empty.lines[0].includes('none'));
+  });
+
+  await test('the built-in Task composer posts the checked contract and displays its statuses', () => {
+    const contractTask = {
+      goal: 'ship it',
+      state: 'running',
+      completed: [],
+      open: [],
+      testsRun: [],
+      testsFailed: [],
+      changedFiles: [],
+      budget: null,
+      acceptanceCriteria: [],
+      plan: [],
+      blockers: [],
+      evidenceRefs: [],
+      phase: null,
+      progress: null,
+      completion: {
+        includeCommit: true,
+        includePush: false,
+        includePr: false,
+        steps: [{ step: 'commit', status: 'unknown', detail: 'run ended' }],
+        source: 'unavailable',
+        reason: 'no native completion read',
+      },
+    };
+    const snapshot = { ...webviewSnapshot([]), task: contractTask };
+    const { posted, dom, deliver } = runChatWebview(snapshot);
+    // Plain start: no contract field at all (chat never carries one).
+    dom.document.getElementById('goal').value = 'plain goal';
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], { type: 'sendGoal', goal: 'plain goal' });
+    // Checked boxes: the exact strict contract rides this task start only.
+    dom.document.getElementById('goal').value = 'contracted goal';
+    dom.document.getElementById('contract-commit').checked = true;
+    dom.document.getElementById('contract-pr').checked = true;
+    dom.document.getElementById('composer').dispatch('submit', { preventDefault() {} });
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'sendGoal',
+      goal: 'contracted goal',
+      completionContract: { include_commit: true, include_push: false, include_pr: true },
+    });
+    // A successful start resets the controls (per-start contract).
+    deliver({
+      type: 'startResult',
+      goal: 'contracted goal',
+      ok: true,
+    });
+    assert(
+      dom.document.getElementById('contract-commit').checked === false &&
+        dom.document.getElementById('contract-pr').checked === false,
+      'a success ack clears the completion controls',
+    );
+    // The task card renders the durable status + its explicit source/reason.
+    const completionNode = dom.document.getElementById('task-completion');
+    assert(
+      findFake(completionNode, (node) => String(node.textContent).includes('[unknown] commit')),
+      JSON.stringify(completionNode.children.map((child) => child.textContent)),
+    );
+    assert(
+      findFake(completionNode, (node) => String(node.textContent).includes('status source: unavailable')),
+    );
+    assert(
+      findFake(completionNode, (node) => String(node.textContent).includes('no native completion read')),
+    );
+  });
+}
+
+
 async function draftPreservationTests() {
   await test('composer clears the draft only after a successful start', () => {
     assertEqual(composerPolicy.afterStart('my draft', 'my draft', false), 'my draft');
@@ -1597,7 +1873,7 @@ async function cockpitTests() {
     const sections = cp.cockpitSections(view);
     assertDeepEqual(
       sections.map((section) => section.key),
-      ['acceptance', 'plan', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
+      ['acceptance', 'plan', 'completion', 'children', 'tournament', 'phase', 'blockers', 'verification', 'evidence', 'spend'],
     );
     const byKey = Object.fromEntries(sections.map((section) => [section.key, section]));
     assert(byKey.acceptance.present && byKey.acceptance.lines.some((line) => line.includes('build passes')));
@@ -1861,7 +2137,11 @@ function runChatWebview(snapshot) {
   vm.runInContext(source, sandbox);
   assert(messageHandler, 'chat.js must register a window message listener');
   messageHandler({ data: { type: 'snapshot', snapshot } });
-  return { posted, dom };
+  return {
+    posted,
+    dom,
+    deliver: (message) => messageHandler({ data: message.data ? message.data : message }),
+  };
 }
 
 async function presentationWebviewTests() {
@@ -2619,6 +2899,7 @@ async function main() {
   await stateTests();
   await daemonTests();
   await shadowDefaultTests();
+  await completionContractTests();
   await draftPreservationTests();
   await runStateTests();
   await workspaceBindingTests();

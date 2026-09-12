@@ -130,6 +130,38 @@
     card.hidden = false;
     setText('task-state', task ? task.state : '—');
     setText('task-goal', task ? task.goal : '—');
+    renderCompletion(task);
+  }
+
+  /**
+   * The durable completion-contract block. The step rows are exactly what
+   * the host reports: `daemon` rows when the serving daemon exposes the
+   * read, `derived` rows projected from the durable task-run state, or an
+   * explicit `unavailable` (never fabricated as success).
+   */
+  function renderCompletion(task) {
+    var node = byId('task-completion');
+    if (!node) {
+      return;
+    }
+    clear(node);
+    var completion = task && task.completion ? task.completion : null;
+    if (!completion) {
+      return;
+    }
+    var head = document.createElement('div');
+    head.className = 'completion-head';
+    head.textContent = 'Completion contract · status source: ' + String(completion.source || 'unknown');
+    node.appendChild(head);
+    var steps = Array.isArray(completion.steps) ? completion.steps : [];
+    for (var i = 0; i < steps.length; i++) {
+      var step = steps[i];
+      var detail = step.detail ? ' — ' + String(step.detail) : '';
+      line(node, '[' + String(step.status) + '] ' + String(step.step) + detail, 'muted');
+    }
+    if (completion.reason) {
+      line(node, String(completion.reason), 'warn');
+    }
   }
 
   // -------------------------------------------------------- agent panel
@@ -510,10 +542,42 @@
           message.ok === true,
         );
       }
+      // The completion contract is per task start: a successful ack resets
+      // the checkboxes; a failure keeps them for the retry.
+      if (message.ok === true) {
+        clearCompletionControls();
+      }
     } else if (message.type === 'notice') {
       showNotice(message.level, message.message);
     }
   });
+
+  function completionContractFromControls() {
+    var commit = byId('contract-commit');
+    var push = byId('contract-push');
+    var pr = byId('contract-pr');
+    if (!commit || !push || !pr) {
+      return null;
+    }
+    if (!commit.checked && !push.checked && !pr.checked) {
+      return null;
+    }
+    return {
+      include_commit: commit.checked === true,
+      include_push: push.checked === true,
+      include_pr: pr.checked === true,
+    };
+  }
+
+  function clearCompletionControls() {
+    var ids = ['contract-commit', 'contract-push', 'contract-pr'];
+    for (var i = 0; i < ids.length; i++) {
+      var node = byId(ids[i]);
+      if (node) {
+        node.checked = false;
+      }
+    }
+  }
 
   byId('composer').addEventListener('submit', function (event) {
     event.preventDefault();
@@ -523,7 +587,14 @@
     }
     // Draft preservation: the goal is NOT cleared here. The extension posts
     // a startResult; only a successful start clears the (unchanged) draft.
-    vscode.postMessage({ type: 'sendGoal', goal: goal });
+    // The Task-mode completion contract rides only THIS task start; plain
+    // chat never carries it.
+    var contract = completionContractFromControls();
+    var message = { type: 'sendGoal', goal: goal };
+    if (contract) {
+      message.completionContract = contract;
+    }
+    vscode.postMessage(message);
   });
   byId('btn-new-task').addEventListener('click', function () {
     vscode.postMessage({ type: 'newTask' });

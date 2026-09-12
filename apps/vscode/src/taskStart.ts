@@ -11,7 +11,11 @@
 // with a fake client.
 
 import { NativeApiError } from './nativeClient.ts';
-import type { NativeTaskRunStarted, StartTaskRunRequest } from './nativeClient.ts';
+import type {
+  NativeCompletionContract,
+  NativeTaskRunStarted,
+  StartTaskRunRequest,
+} from './nativeClient.ts';
 
 /** The `faktor.mutationMode` setting vocabulary. `''` = inherit-daemon. */
 export type MutationModeSetting = '' | 'shadow' | 'direct_compat';
@@ -20,6 +24,10 @@ export interface StartTaskSettings {
   readonly mutationMode: string;
   readonly maxTokens: number;
   readonly maxCostMicro: number;
+  /** Workspace-relative attachment paths forwarded from the composer. */
+  readonly files?: readonly string[];
+  /** The Task-mode completion contract (null / all-false = default path). */
+  readonly completionContract?: NativeCompletionContract | null;
 }
 
 /** The typed classification of a refused task start. */
@@ -51,14 +59,76 @@ export interface StartRunClient {
 }
 
 /**
+ * Strictly parse one completion contract from a trusted-UI message. Only
+ * the three documented boolean members are accepted; anything else (a
+ * missing member, a typed string, an extra member, a non-object) is
+ * refused as `null` — never coerced, never partially applied. An all-false
+ * contract is the default behavior and returns `null` (no wire field).
+ */
+export function completionContractSetting(raw: unknown): NativeCompletionContract | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.some((key) => key !== 'include_commit' && key !== 'include_push' && key !== 'include_pr')) {
+    return null;
+  }
+  for (const key of ['include_commit', 'include_push', 'include_pr']) {
+    if (!Object.prototype.hasOwnProperty.call(record, key) || typeof record[key] !== 'boolean') {
+      return null;
+    }
+  }
+  const contract: NativeCompletionContract = {
+    include_commit: record.include_commit as boolean,
+    include_push: record.include_push as boolean,
+    include_pr: record.include_pr as boolean,
+  };
+  return hasCompletionSteps(contract) ? contract : null;
+}
+
+/** TRUE when the contract requests at least one conditional step. */
+export function hasCompletionSteps(contract: NativeCompletionContract | null): boolean {
+  return (
+    contract !== null &&
+    (contract.include_commit || contract.include_push || contract.include_pr)
+  );
+}
+
+/**
  * Build the strict request body. The empty setting (inherit-daemon) OMITS
  * `mutation_mode` entirely; only an explicit user/policy value is sent.
+ *
+ * A NON-DEFAULT completion contract is refused by the daemon on the plain
+ * prompt path, so the request pairs it with ONE explicit mutating work item
+ * (`main`) — the same in-session drive the plain prompt uses, with the
+ * durable contract seam. The default path stays byte-identical (no
+ * contract, no work item).
  */
 export function startTaskRequest(goal: string, settings: StartTaskSettings): StartTaskRunRequest {
+  const contract = hasCompletionSteps(settings.completionContract ?? null)
+    ? (settings.completionContract as NativeCompletionContract)
+    : null;
   const request: StartTaskRunRequest = {
     goal,
     ...(settings.maxTokens > 0 ? { max_tokens: settings.maxTokens } : {}),
     ...(settings.maxCostMicro > 0 ? { max_cost_micro: settings.maxCostMicro } : {}),
+    ...(settings.files !== undefined && settings.files.length > 0
+      ? { files: settings.files }
+      : {}),
+    ...(contract !== null
+      ? {
+          work_items: [
+            {
+              id: 'main',
+              kind: 'Implementation',
+              summary: goal,
+              ownership: 'isolated_worktree',
+            },
+          ],
+          completion_contract: contract,
+        }
+      : {}),
   };
   if (settings.mutationMode === 'shadow' || settings.mutationMode === 'direct_compat') {
     return { ...request, mutation_mode: settings.mutationMode };

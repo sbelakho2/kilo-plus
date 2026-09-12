@@ -1066,6 +1066,8 @@ pub fn run_command_tool() -> Tool {
                     // (commandment 6).
                     effect_status: EffectStatus::Unknown,
                     postcondition: None,
+                    // Command output is tool-class data, never policy.
+                    provenance: faktor_context::compiler::ProvenanceSource::Tool,
                 })
             })
         }),

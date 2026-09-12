@@ -50,6 +50,11 @@ use faktor_session::{SessionManager, TaskBudget};
 use crate::caps::{effective, CapabilitySet};
 use crate::{ChildState, OwnershipSpec, WorkItem, WorkKind, WorkState};
 
+// The child blocker vocabulary is the ONE shared core definition: the
+// orchestrator's historic `runtime::ChildBlocker` path re-exports it so
+// downstream callers keep resolving, while the kind is now a closed enum.
+pub use faktor_core::blocker::{BlockerKind, ChildBlocker, ExecutionPhase};
+
 pub mod ceilings {
     //! Audit 24 ceilings. The old `MAX_CHILDREN = 1000` literal is gone:
     //! 1000 was never a useful bound because children now hold REAL
@@ -183,6 +188,12 @@ pub enum ExecError {
     SemanticConflict(String),
     #[error("merge decision incomplete: {0}")]
     UndecidedPaths(String),
+    /// An AUTHORITATIVE durable write or control-queue ack failed. The
+    /// transition was NOT claimed applied, the effect is idempotent, and the
+    /// underlying failure classifies as retryable — the SAME call may be
+    /// safely retried (which is why `let _ =` on these paths is forbidden).
+    #[error("retriable persistence failure during {operation}: {message}")]
+    RetriablePersistence { operation: String, message: String },
     #[error("injected crash seam {0} (test seam; durable state left as-is for re-attach)")]
     InjectedCrashSeam(String),
     #[error("internal: {0}")]
@@ -190,6 +201,15 @@ pub enum ExecError {
 }
 
 impl ExecError {
+    /// Wrap a failed authoritative durable write/ack as a typed retriable
+    /// error: the caller may retry the whole (idempotent) control call.
+    pub(crate) fn retriable(operation: &str, e: impl std::fmt::Display) -> Self {
+        ExecError::RetriablePersistence {
+            operation: operation.to_string(),
+            message: e.to_string(),
+        }
+    }
+
     /// Map a faktor-fs layer error of a merge/snapshot/copy operation onto
     /// the typed orchestrator error space (typed mapping — the merge never
     /// swallows an fs failure).
@@ -329,105 +349,6 @@ pub const MAX_CHILD_BLOCKER_REASON_CHARS: usize = 512;
 pub const MAX_CHILD_BLOCKER_DEPENDENCY_CHARS: usize = 64;
 pub const MAX_CHILD_BLOCKER_RESOLUTION_CHARS: usize = 512;
 
-/// One typed durable child blocker: WHY a non-terminal child is not running.
-/// The kind is a machine tag (`dependency` | `permission` | `budget`), the
-/// reason is bounded prose, `dependency` names the work item for a
-/// dependency block, `resolution` names the bounded next action and
-/// `last_progress_ms` is the child's last observed progress stamp.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ChildBlocker {
-    pub kind: String,
-    pub reason: String,
-    pub dependency: Option<String>,
-    pub resolution: Option<String>,
-    pub last_progress_ms: Option<i64>,
-}
-
-impl ChildBlocker {
-    /// A blocker with a kind tag, bounded reason and suggested resolution.
-    pub fn new(kind: &str, reason: impl Into<String>, resolution: impl Into<String>) -> Self {
-        Self {
-            kind: kind.to_string(),
-            reason: reason.into(),
-            dependency: None,
-            resolution: Some(resolution.into()),
-            last_progress_ms: None,
-        }
-    }
-
-    /// A dependency blocker naming the work item it waits on.
-    pub fn dependency(
-        item_id: &str,
-        reason: impl Into<String>,
-        resolution: impl Into<String>,
-    ) -> Self {
-        Self {
-            kind: "dependency".into(),
-            reason: reason.into(),
-            dependency: Some(item_id.to_string()),
-            resolution: Some(resolution.into()),
-            last_progress_ms: None,
-        }
-    }
-
-    /// The durable ledger reason string this blocker records (bounded by
-    /// [`MAX_CHILD_BLOCKER_REASON_CHARS`], so every ledger append accepts it).
-    pub fn ledger_reason(&self) -> String {
-        self.reason.clone()
-    }
-
-    /// Structural validation with strict bounds (hostile text is a typed
-    /// reject BEFORE anything durable is written — never a silent truncate).
-    pub fn validate(&self) -> Result<(), ExecError> {
-        check_blocker_text("blocker kind", &self.kind, MAX_CHILD_BLOCKER_KIND_CHARS)?;
-        check_blocker_text(
-            "blocker reason",
-            &self.reason,
-            MAX_CHILD_BLOCKER_REASON_CHARS,
-        )?;
-        if let Some(dep) = &self.dependency {
-            check_blocker_text(
-                "blocker dependency",
-                dep,
-                MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
-            )?;
-        }
-        if let Some(res) = &self.resolution {
-            check_blocker_text(
-                "blocker resolution",
-                res,
-                MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
-            )?;
-        }
-        if self.last_progress_ms.is_some_and(|ms| ms < 0) {
-            return Err(ExecError::Malformed(
-                "blocker last_progress_ms must be non-negative".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn check_blocker_text(field: &str, value: &str, max: usize) -> Result<(), ExecError> {
-    if value.trim().is_empty() {
-        return Err(ExecError::Malformed(format!(
-            "{field} must not be empty or whitespace-only"
-        )));
-    }
-    if value.chars().count() > max {
-        return Err(ExecError::Oversized(format!(
-            "{field} of {} characters exceeds {max}",
-            value.chars().count()
-        )));
-    }
-    if value.chars().any(|c| c.is_control()) {
-        return Err(ExecError::Malformed(format!(
-            "{field} carries control characters"
-        )));
-    }
-    Ok(())
-}
-
 /// The durable runtime object of ONE child (audit: every field durable).
 /// `state` mirrors the child's [`AgentState`] through [`ChildState`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -483,6 +404,13 @@ pub struct ChildRuntime {
     /// loudly (no silent fallback to the live environment).
     #[serde(default)]
     pub env_snapshot_id: Option<String>,
+    /// The child's coarse execution phase (additive): persisted at safe
+    /// drive boundaries into the child's own durable drive-state row; every
+    /// registry read derives the freshest value. Old registry rows decode as
+    /// [`ExecutionPhase::Planning`]. Purely a projection — it never changes
+    /// lifecycle, scheduling or budget semantics.
+    #[serde(default)]
+    pub execution_phase: ExecutionPhase,
 }
 
 impl ChildRuntime {
@@ -494,9 +422,12 @@ impl ChildRuntime {
         self.kind.is_mutating()
     }
 
-    /// The typed blocker this row carries (None when not blocked).
+    /// The typed blocker this row carries (None when not blocked, or when a
+    /// hostile kind made it undecodable — durable decode validates first via
+    /// [`ChildRuntime::validate_durable`], so a `None` here is either a
+    /// genuine non-block or an in-memory construction).
     pub fn blocker(&self) -> Option<ChildBlocker> {
-        let kind = self.blocker_kind.clone()?;
+        let kind = BlockerKind::parse(self.blocker_kind.as_deref()?)?;
         Some(ChildBlocker {
             kind,
             reason: self.blocker_reason.clone().unwrap_or_default(),
@@ -506,13 +437,46 @@ impl ChildRuntime {
         })
     }
 
+    /// Strict durable-decode validation of one registry row: a known blocker
+    /// kind and the invariant `state == Blocked <=> a populated blocker`.
+    /// Corrupt/hostile rows are a loud typed error — never a fabricated
+    /// state.
+    pub fn validate_durable(&self) -> Result<(), ExecError> {
+        match self.blocker_kind.as_deref() {
+            None => {}
+            Some(raw) if BlockerKind::parse(raw).is_none() => {
+                return Err(ExecError::Malformed(format!(
+                    "registry row of child {} carries blocker kind {raw:?} outside the closed vocabulary",
+                    self.child_id
+                )));
+            }
+            Some(_) => {}
+        }
+        let blocked = self.state == ChildState::Blocked;
+        if blocked {
+            let blocker = self.blocker().ok_or_else(|| {
+                ExecError::Malformed(format!(
+                    "registry row of child {} is Blocked without a blocker",
+                    self.child_id
+                ))
+            })?;
+            blocker.validate()?;
+        } else if self.blocker_kind.is_some() {
+            return Err(ExecError::Malformed(format!(
+                "registry row of child {} is {:?} but carries a blocker",
+                self.child_id, self.state
+            )));
+        }
+        Ok(())
+    }
+
     /// Mark this row Blocked with the given (validated) blocker. The state
     /// and the blocker fields move together — a Blocked row without a
     /// populated blocker is unrepresentable through this path.
     pub fn set_blocker(&mut self, blocker: &ChildBlocker) -> Result<(), ExecError> {
         blocker.validate()?;
         self.state = ChildState::Blocked;
-        self.blocker_kind = Some(blocker.kind.clone());
+        self.blocker_kind = Some(blocker.kind.as_str().to_string());
         self.blocker_reason = Some(blocker.reason.clone());
         self.blocker_dependency = blocker.dependency.clone();
         self.blocker_resolution = blocker.resolution.clone();
@@ -764,9 +728,15 @@ impl OrchestratorRuntime {
                     .strip_prefix(run_id)
                     .is_some_and(|rest| rest.starts_with('/'))
             {
-                let row: ChildRuntime = serde_json::from_str(&value).map_err(|e| {
+                let mut row: ChildRuntime = serde_json::from_str(&value).map_err(|e| {
                     faktor_core::Error::internal(format!("registry row decode: {e}"))
                 })?;
+                // Strict durable decode: a corrupt/hostile row (unknown
+                // blocker kind, Blocked without a blocker, a non-Blocked row
+                // carrying one) fails loudly — never a fabricated state.
+                row.validate_durable()
+                    .map_err(|e| faktor_core::Error::malformed(e.to_string()))?;
+                Self::derive_child_projection(&manager, &mut row);
                 rows.push(row);
             }
         }
@@ -779,6 +749,29 @@ impl OrchestratorRuntime {
                 .then_with(|| a.child_id.cmp(&b.child_id))
         });
         Ok(rows)
+    }
+
+    /// Derive the child projection's mutable truth from its OWN durable
+    /// rows: the task row is the ONE budget authority (`budget_max_tokens`
+    /// is never trusted from the registry JSON once a task row exists) and
+    /// the child's drive-state row is the ONE execution-phase authority.
+    /// A missing session/task row leaves the stored value untouched.
+    ///
+    /// Public because EVERY registry-row reader (the runtime's own
+    /// `registry_rows` and the server's native projections) must apply it —
+    /// the registry JSON is deliberately not rewritten on control changes.
+    pub fn derive_child_projection(manager: &Arc<SessionManager>, row: &mut ChildRuntime) {
+        let Ok(Some(handle)) = manager.get_session(SessionId::new(row.session_id)) else {
+            return;
+        };
+        if let Ok(ds) = handle.orchestrator_drive_state_get() {
+            row.execution_phase = ds.execution_phase;
+        }
+        if let Ok(task_id) = handle.task_id() {
+            if let Ok(Some(task)) = handle.get_task(task_id) {
+                row.budget_max_tokens = task.budget.max_tokens;
+            }
+        }
     }
 
     /// The durable presentation projection of one child: the child
@@ -1604,14 +1597,24 @@ impl OrchestratorRuntime {
         // the truth the re-attached drive re-reads).
         match control {
             ChildControl::Cancel => {
-                let msg = session.orchestrator_ctl_enqueue(ChildControl::Cancel)?;
-                let _ = session.orchestrator_ctl_ack(msg.seq);
+                // Every authoritative step propagates: an enqueue/ack failure
+                // means the control was NOT claimed applied, and the call is
+                // safe to retry (the ack is idempotent).
+                let msg = session
+                    .orchestrator_ctl_enqueue(ChildControl::Cancel)
+                    .map_err(|e| ExecError::retriable("cancel control enqueue", e))?;
+                session
+                    .orchestrator_ctl_ack(msg.seq)
+                    .map_err(|e| ExecError::retriable("cancel control ack", e))?;
                 // The bounded abort path (existing semantics): fires the
                 // turn cancellation token; an abort on a session with no
                 // registered op is a no-op that leaves the session
-                // promptable.
+                // promptable. A failed abort is loud (the control row is
+                // already acked, so the caller retries the whole call).
                 if let Ok(Some(record)) = session.active_turn_record() {
-                    let _ = session.abort(Some(record.turn_op_id));
+                    session
+                        .abort(Some(record.turn_op_id))
+                        .map_err(|e| ExecError::retriable("cancel abort", e))?;
                 }
                 Ok(ControlAck {
                     queued_seq: msg.seq,
@@ -1619,6 +1622,11 @@ impl OrchestratorRuntime {
                 })
             }
             ChildControl::ChangeBudget { max_tokens } => {
+                // The CHILD TASK ROW is the single budget authority: patch it
+                // durably first, then deliver the control row. The child
+                // projection is DERIVED from the task row (never written
+                // independently), so there is no second budget truth to
+                // diverge across a crash/reopen.
                 self.agent
                     .seed_task_budget(
                         SessionId::new(row.session_id),
@@ -1629,11 +1637,17 @@ impl OrchestratorRuntime {
                             spent_turns: 0,
                         },
                     )
-                    .map_err(|e| ExecError::Internal(format!("budget patch: {}", e.message)))?;
-                let msg =
-                    session.orchestrator_ctl_enqueue(ChildControl::ChangeBudget { max_tokens })?;
-                let _ = session.orchestrator_ctl_ack(msg.seq);
-                // Reflect the durable cap on the registry row.
+                    .map_err(|e| ExecError::retriable("task budget patch", e))?;
+                let msg = session
+                    .orchestrator_ctl_enqueue(ChildControl::ChangeBudget { max_tokens })
+                    .map_err(|e| ExecError::retriable("budget control enqueue", e))?;
+                session
+                    .orchestrator_ctl_ack(msg.seq)
+                    .map_err(|e| ExecError::retriable("budget control ack", e))?;
+                // Project the task row's cap into the live mirror; the
+                // durable registry JSON is deliberately NOT rewritten (the
+                // task row is the truth and every registry read derives it).
+                let derived = child_task_budget_cap(&self.manager, row.session_id);
                 let owner_run = {
                     let guard = self.exec.lock().expect("exec lock");
                     guard
@@ -1644,10 +1658,11 @@ impl OrchestratorRuntime {
                     let mut guard = self.exec.lock().expect("exec lock");
                     if let Some(exec) = guard.get_mut(&run_id) {
                         if let Some(c) = exec.children.get_mut(child_id) {
-                            c.budget_max_tokens = Some(max_tokens);
-                        }
-                        if let Some(c) = exec.children.get(child_id) {
-                            let _ = self.persist_row(exec, c);
+                            c.budget_max_tokens = derived;
+                            // The phase projection also follows the child's
+                            // own durable rows.
+                            c.execution_phase =
+                                child_execution_phase(&self.manager, row.session_id);
                         }
                     }
                 }
@@ -1657,7 +1672,9 @@ impl OrchestratorRuntime {
                 })
             }
             other => {
-                let msg = session.orchestrator_ctl_enqueue(other)?;
+                let msg = session
+                    .orchestrator_ctl_enqueue(other)
+                    .map_err(|e| ExecError::retriable("control enqueue", e))?;
                 Ok(ControlAck {
                     queued_seq: msg.seq,
                     applied: None,
@@ -1954,8 +1971,9 @@ impl OrchestratorRuntime {
                 }
                 None => {}
             }
-            let _ = self.persist_row(state, &row);
-            self.persist_child_runtime_row(&row);
+            self.persist_row(state, &row)
+                .map_err(|e| ExecError::retriable("child registry persist at re-attach", e))?;
+            self.persist_child_runtime_row(&row)?;
             let item = row.item_id.clone();
             if !item_states.contains_key(&item) {
                 // Reviewer rows (plan-less children) own no plan-item
@@ -2034,14 +2052,18 @@ impl OrchestratorRuntime {
                 // A genuine end happened; close a turn record left active by
                 // a crash between TurnCompleted and finish_turn_record.
                 if let Ok(Some(record)) = session.active_turn_record() {
-                    let _ = session.finish_turn_record(record.turn_op_id, "completed");
+                    session
+                        .finish_turn_record(record.turn_op_id, "completed")
+                        .map_err(|e| ExecError::retriable("turn record close", e))?;
                 }
                 Ok((ChildState::Done, None))
             }
             AgentState::Cancelled => Ok((ChildState::Cancelled, None)),
             AgentState::FailedRecoverable | AgentState::FailedPermanent => {
                 if let Ok(Some(record)) = session.active_turn_record() {
-                    let _ = session.finish_turn_record(record.turn_op_id, "failed");
+                    session
+                        .finish_turn_record(record.turn_op_id, "failed")
+                        .map_err(|e| ExecError::retriable("turn record close", e))?;
                 }
                 Ok((ChildState::Failed, None))
             }
@@ -2050,7 +2072,7 @@ impl OrchestratorRuntime {
             AgentState::NeedsUserInput => Ok((
                 ChildState::Blocked,
                 Some(ChildBlocker::new(
-                    "permission",
+                    BlockerKind::Permission,
                     "waiting for a pending permission decision",
                     "resolve the pending permission request, then resume the child",
                 )),
@@ -2154,8 +2176,15 @@ impl OrchestratorRuntime {
                 if let Some(turn_op) = drive.turn_op_id {
                     row.operation_id = turn_op.raw();
                 }
-                let _ = self.persist_row(exec, &row);
-                self.persist_child_runtime_row(&row);
+                // Settlement is the integration boundary of a finished drive:
+                // persist the phase into the child's own durable row (best
+                // effort — a phase write never gates the settlement) and fold
+                // it into the projection the run returns.
+                self.note_child_phase(&row, ExecutionPhase::Integrating);
+                row.execution_phase = ExecutionPhase::Integrating;
+                self.persist_row(exec, &row)
+                    .map_err(|e| ExecError::retriable("child registry persist at settlement", e))?;
+                self.persist_child_runtime_row(&row)?;
                 exec.children.insert(child_id.clone(), row.clone());
                 exec.drive_ops.remove(&child_id);
                 done.push((child_id, row));
@@ -2261,11 +2290,13 @@ impl OrchestratorRuntime {
                 }
                 for (child_id, blocker) in dependency_blocks {
                     if let Some(c) = exec.children.get_mut(&child_id) {
-                        let _ = c.set_blocker(&blocker);
+                        c.set_blocker(&blocker)?;
                         c.updated_ms = self.manager.now_ms();
                         let blocked = c.clone();
-                        let _ = self.persist_row(exec, &blocked);
-                        self.persist_child_runtime_row(&blocked);
+                        self.persist_row(exec, &blocked).map_err(|e| {
+                            ExecError::retriable("dependency-block registry persist", e)
+                        })?;
+                        self.persist_child_runtime_row(&blocked)?;
                         self.record_blocker_audit(&blocked, &blocker);
                     }
                 }
@@ -2402,7 +2433,12 @@ impl OrchestratorRuntime {
                     ChildState::Failed => {
                         for r in &pending {
                             if matches!(r.control, ChildControl::Retry) {
-                                let _ = session.orchestrator_ctl_ack(r.seq);
+                                // The retry decision is durable BEFORE the
+                                // drive starts: an ack failure refuses the
+                                // admission (safe to retry the same call).
+                                session
+                                    .orchestrator_ctl_ack(r.seq)
+                                    .map_err(|e| ExecError::retriable("retry control ack", e))?;
                                 should_drive = true;
                                 break;
                             }
@@ -2414,9 +2450,10 @@ impl OrchestratorRuntime {
                     // budget/permission block waits for the operator — an
                     // automatic re-drive would spin on the same refusal.
                     ChildState::Blocked => {
-                        let dependency_recovered =
-                            child.blocker().is_some_and(|b| b.kind == "dependency")
-                                && dependencies_done(&exec.plan, &exec.item_states, &child.item_id);
+                        let dependency_recovered = child
+                            .blocker()
+                            .is_some_and(|b| b.kind == BlockerKind::Dependency)
+                            && dependencies_done(&exec.plan, &exec.item_states, &child.item_id);
                         let resume_requested = pending
                             .iter()
                             .any(|r| matches!(r.control, ChildControl::Resume));
@@ -2443,8 +2480,9 @@ impl OrchestratorRuntime {
                             exec.item_states
                                 .insert(row.item_id.clone(), WorkState::Running);
                         }
-                        let _ = self.persist_row(exec, &row);
-                        self.persist_child_runtime_row(&row);
+                        self.persist_row(exec, &row)
+                            .map_err(|e| ExecError::retriable("re-drive registry persist", e))?;
+                        self.persist_child_runtime_row(&row)?;
                     }
                     redrives.push(row);
                 }
@@ -2641,6 +2679,7 @@ impl OrchestratorRuntime {
             updated_ms: now,
             base_snapshot_id: None,
             env_snapshot_id: None,
+            execution_phase: ExecutionPhase::Planning,
         };
         let model = row
             .model_policy
@@ -2691,7 +2730,10 @@ impl OrchestratorRuntime {
             )
             .map_err(|e| ExecError::Internal(format!("create_child_session: {e}")))?;
         row.session_id = session.id().raw();
-        let _ = self.persist_row(exec, &row);
+        // The registry row is the durable anchor of the child session: a
+        // failed write is loud (never a silently unregistered child).
+        self.persist_row(exec, &row)
+            .map_err(|e| ExecError::retriable("spawn registry persist", e))?;
         Ok(row)
     }
     /// Register one child drive with the scheduler. The scheduler op is the
@@ -2901,6 +2943,33 @@ fn parent_facts(
     Ok(out)
 }
 
+/// The child session's durable Task-row token cap — the ONE budget
+/// authority the registry projection derives from (None when no task row or
+/// an unlimited cap).
+fn child_task_budget_cap(manager: &Arc<SessionManager>, session_id: u64) -> Option<u64> {
+    let handle = manager
+        .get_session(SessionId::new(session_id))
+        .ok()
+        .flatten()?;
+    let task_id = handle.task_id().ok()?;
+    handle
+        .get_task(task_id)
+        .ok()
+        .flatten()
+        .and_then(|t| t.budget.max_tokens)
+}
+
+/// The child session's durable execution phase (Planning when no drive-state
+/// row exists).
+fn child_execution_phase(manager: &Arc<SessionManager>, session_id: u64) -> ExecutionPhase {
+    manager
+        .get_session(SessionId::new(session_id))
+        .ok()
+        .flatten()
+        .and_then(|h| h.orchestrator_drive_state_get().ok())
+        .map(|ds| ds.execution_phase)
+        .unwrap_or_default()
+}
 fn validate_config(config: &ExecConfig) -> Result<(), ExecError> {
     config.ceilings.validate().map_err(ExecError::InvalidPlan)?;
     if config.run_id.is_empty()
@@ -3278,29 +3347,76 @@ fn drive_op_entry(
         )
         .await;
         // Record the child session's REAL op id durably (registry row +
-        // identity row) so re-attach maps the child to its op.
+        // identity row) so re-attach maps the child to its op. AUTHORITATIVE:
+        // a failed persist is collected and returned AFTER the outcome is
+        // recorded, so the scheduler always sees the drive result and the
+        // failure is loud (typed Store, retryable) instead of a silent
+        // mapping loss.
+        let mut op_id_error: Option<String> = None;
         if let Some(turn_op) = turn_op_id {
-            if let Ok(Some(parent)) = manager.get_session(parent_session) {
-                let key = format!("{run_id}/{child_id}");
-                if let Ok(facts) = parent_facts(&parent) {
-                    for (kind, k, value) in facts {
-                        if kind == REGISTRY_ROW_KIND && k == key {
-                            if let Ok(mut row) = serde_json::from_str::<ChildRuntime>(&value) {
-                                row.operation_id = turn_op.raw();
-                                if let Ok(value) = serde_json::to_string(&row) {
-                                    let _ =
-                                        parent.upsert_memory_fact(REGISTRY_ROW_KIND, &key, &value);
+            match manager.get_session(parent_session) {
+                Ok(Some(parent)) => {
+                    let key = format!("{run_id}/{child_id}");
+                    match parent_facts(&parent) {
+                        Ok(facts) => {
+                            for (kind, k, value) in facts {
+                                if kind == REGISTRY_ROW_KIND && k == key {
+                                    match serde_json::from_str::<ChildRuntime>(&value) {
+                                        Ok(mut row) => {
+                                            row.operation_id = turn_op.raw();
+                                            match serde_json::to_string(&row) {
+                                                Ok(value) => {
+                                                    if let Err(e) = parent.upsert_memory_fact(
+                                                        REGISTRY_ROW_KIND,
+                                                        &key,
+                                                        &value,
+                                                    ) {
+                                                        op_id_error = Some(format!(
+                                                            "child op-id registry persist: {e}"
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    op_id_error = Some(format!(
+                                                        "child op-id registry serialize: {e}"
+                                                    ))
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            op_id_error =
+                                                Some(format!("child op-id registry decode: {e}"))
+                                        }
+                                    }
+                                    break;
                                 }
                             }
-                            break;
                         }
+                        Err(e) => op_id_error = Some(format!("child op-id registry scan: {e}")),
                     }
                 }
+                Ok(None) => {}
+                Err(e) => op_id_error = Some(format!("child op-id parent session: {e}")),
             }
-            if let Ok(Some(child_handle)) = manager.get_session(session_id) {
-                if let Ok(Some(mut identity)) = child_handle.orchestrator_child_identity_get() {
-                    identity.operation_id = turn_op.raw();
-                    let _ = child_handle.orchestrator_child_identity_put(&identity);
+            if op_id_error.is_none() {
+                match manager.get_session(session_id) {
+                    Ok(Some(child_handle)) => {
+                        match child_handle.orchestrator_child_identity_get() {
+                            Ok(Some(mut identity)) => {
+                                identity.operation_id = turn_op.raw();
+                                if let Err(e) =
+                                    child_handle.orchestrator_child_identity_put(&identity)
+                                {
+                                    op_id_error =
+                                        Some(format!("child op-id identity persist: {e}"));
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => op_id_error = Some(format!("child op-id identity read: {e}")),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => op_id_error = Some(format!("child op-id session: {e}")),
                 }
             }
         }
@@ -3312,6 +3428,13 @@ fn drive_op_entry(
                 result: res,
             },
         );
+        drop(map);
+        if let Some(message) = op_id_error {
+            return Err(faktor_core::Error::new(
+                faktor_core::ErrorKind::Store,
+                message,
+            ));
+        }
         Ok(())
     })
 }
@@ -3379,7 +3502,7 @@ fn classify_outcome(res: Result<TurnOutcome, String>) -> (ChildState, Option<Chi
             return (
                 ChildState::Blocked,
                 Some(ChildBlocker::new(
-                    "budget",
+                    BlockerKind::Budget,
                     reason.detail.clone(),
                     "increase the child's token/cost budget or wait for the run budget, then resume",
                 )),
@@ -3391,7 +3514,7 @@ fn classify_outcome(res: Result<TurnOutcome, String>) -> (ChildState, Option<Chi
         AgentState::NeedsUserInput => (
             ChildState::Blocked,
             Some(ChildBlocker::new(
-                "permission",
+                BlockerKind::Permission,
                 "waiting for a pending permission decision",
                 "resolve the pending permission request, then resume the child",
             )),
@@ -3421,7 +3544,7 @@ fn classify_outcome(res: Result<TurnOutcome, String>) -> (ChildState, Option<Chi
                     return (
                         ChildState::Blocked,
                         Some(ChildBlocker::new(
-                            "budget",
+                            BlockerKind::Budget,
                             reason.detail.clone(),
                             "increase the child's token/cost budget or wait for the run budget, then resume",
                         )),
@@ -3430,7 +3553,7 @@ fn classify_outcome(res: Result<TurnOutcome, String>) -> (ChildState, Option<Chi
                 return (
                     ChildState::Blocked,
                     Some(ChildBlocker::new(
-                        "verification",
+                        BlockerKind::Verification,
                         reasons
                             .first()
                             .map(|r| r.detail.clone())
@@ -3496,27 +3619,49 @@ fn dependencies_done(
 impl OrchestratorRuntime {
     /// Persist the typed, bounded child-runtime projection (v23 table) on
     /// the CHILD session: the queryable blocker truth beside the registry
-    /// JSON row. Best effort at this layer (the JSON row remains the
-    /// durable truth); hostile text can never get here — every producer
-    /// validates first.
-    fn persist_child_runtime_row(&self, row: &ChildRuntime) {
-        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
-            return;
+    /// JSON row. AUTHORITATIVE: a failed write is a typed retriable error —
+    /// never a silent skip (hostile text can never get here; every producer
+    /// validates first). A missing child session is a no-op (re-attach
+    /// validates sessions separately and loudly).
+    fn persist_child_runtime_row(&self, row: &ChildRuntime) -> Result<(), ExecError> {
+        let Some(session) = self
+            .manager
+            .get_session(SessionId::new(row.session_id))
+            .map_err(|e| ExecError::retriable("child session read", e))?
+        else {
+            return Ok(());
         };
-        let session_blocker = row.blocker().map(|b| faktor_session::child::ChildBlocker {
-            kind: b.kind,
-            reason: b.reason,
-            dependency: b.dependency,
-            resolution: b.resolution,
-            last_progress_ms: b.last_progress_ms,
-        });
+        // Re-validate at the projection boundary: a Blocked row always rides
+        // a populated blocker (the shared decode invariant).
+        row.validate_durable()?;
         let typed = faktor_session::child::ChildRuntimeBlockerRow {
             child_id: row.child_id.clone(),
             state: child_state_tag(row.state).to_string(),
-            blocker: session_blocker,
+            blocker: row.blocker(),
             updated_ms: row.updated_ms,
         };
-        let _ = session.orchestrator_child_runtime_put(&typed);
+        session
+            .orchestrator_child_runtime_put(&typed)
+            .map_err(|e| ExecError::retriable("child runtime projection", e))?;
+        Ok(())
+    }
+
+    /// Best-effort persist of a child's execution phase at a safe boundary
+    /// (settlement/re-attach). The phase is a projection, never an
+    /// authoritative lifecycle transition, so a failure is logged and the
+    /// in-memory projection still carries the intended phase.
+    fn note_child_phase(&self, row: &ChildRuntime, phase: ExecutionPhase) {
+        let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
+            return;
+        };
+        if let Err(e) = session.set_execution_phase(phase) {
+            tracing::debug!(
+                child = %row.child_id,
+                phase = phase.as_str(),
+                error = %e.message,
+                "child execution phase persist failed"
+            );
+        }
     }
 
     /// Audit one blocker open in the child session's typed ledger. Opening
@@ -3526,7 +3671,7 @@ impl OrchestratorRuntime {
         let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
             return;
         };
-        if let Err(e) = session.ledger_blocker_opened(&blocker.ledger_reason()) {
+        if let Err(e) = session.ledger_child_blocker_opened(blocker) {
             tracing::debug!(
                 child = %row.child_id,
                 reason = %blocker.reason,
@@ -3541,7 +3686,7 @@ impl OrchestratorRuntime {
         let Ok(Some(session)) = self.manager.get_session(SessionId::new(row.session_id)) else {
             return;
         };
-        if let Err(e) = session.ledger_blocker_resolved(&blocker.ledger_reason()) {
+        if let Err(e) = session.ledger_child_blocker_resolved(blocker) {
             tracing::debug!(
                 child = %row.child_id,
                 reason = %blocker.reason,

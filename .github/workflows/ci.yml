@@ -19,8 +19,13 @@ name: CI
 #   vscode-build            npm ci + tsc build + offline extension selftest
 #                           + self-contained VSIX (vendored webview staged,
 #                             unzipped and hash-asserted; IDE launch recorded)
-#   vscode-visual-with-skip playwright visual gate; recorded skip when the
-#                           browser cannot be installed (never a silent pass)
+#   vscode-visual-render    REQUIRED render gate: playwright + chromium are
+#                           installed explicitly and the job fails unless
+#                           visual-report.json records render.status=passed
+#   vscode-visual-with-skip diagnostics-only twin; records an explicit skip
+#                           when the browser cannot be installed (never a
+#                           silent pass, and never a substitute for the
+#                           required render lane)
 #   jetbrains-build         java 17 + gradle buildPlugin (network allowed)
 #   jetbrains-smoke         kotlinc split-mode smokes against a real daemon
 #   security-static         static-authority scans + security + seeded fuzz
@@ -97,23 +102,21 @@ jobs:
       - name: Check (workspace; every crate compiles on Windows)
         run: cargo check --workspace
       - name: Test (workspace minus documented unix-only targets)
-        # The lane runs the WHOLE workspace except the packages below. Every
-        # exclusion is genuinely Windows-incompatible as written (unix-only
-        # symbols that fail to compile, or unix-only binaries/shells in
-        # un-gated tests); the platform-native crates (faktor-fs,
-        # faktor-pty, faktor-terminal, faktor-winjob, tests/static-authority,
-        # tests/accounting-modelcheck, tests/router-properties, tests/fault)
-        # are all included. A future crate with un-gated unix tests fails
-        # this lane by construction until it is fixed or listed here.
+        # The lane runs the WHOLE workspace except the packages below, now
+        # INCLUDING the previously-excluded faktor-agent, faktor-verify,
+        # faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (their
+        # unix-only tests are `cfg(unix)`-gated; the cross-platform tests run
+        # on Windows too). Every remaining exclusion is genuinely
+        # Windows-incompatible as written (unix-only symbols that fail to
+        # compile, or unix-only binaries/shells in un-gated tests); the
+        # platform-native crates (faktor-fs, faktor-pty, faktor-terminal,
+        # faktor-winjob, tests/static-authority, tests/accounting-modelcheck,
+        # tests/router-properties, tests/fault) are all included. A future
+        # crate with un-gated unix tests fails this lane by construction until
+        # it is fixed or listed here.
         #
         # faktor-cli        test helpers use /bin/sh and std::os::unix::fs::symlink
         # faktor-hooks      tests call libc::kill (unix-only symbol; no Windows binding)
-        # faktor-verify     tests call libc::kill + /bin/sh
-        # faktor-sandbox    test module imports std::os::unix::fs::symlink
-        # faktor-agent      runtime tests spawn unix `sleep`/`sh` without cfg gating
-        # faktor-index      cold-cache test spawns unix `sleep` without cfg gating
-        # faktor-cas        mtime-advisory tests shell out to `cp -p`/`touch -r`
-        # faktor-snapshot   same `cp -p`/`touch -r` mtime-advisory tests
         # faktor-tests-coding-benchmark  verify harness hardcodes /bin/sh + pgrep
         # faktor-tests-fuzz-seeds        supply-chain tests drive bash scripts
         # faktor-tests-performance       orphan probes call /bin/ps; linux-only lane
@@ -121,12 +124,6 @@ jobs:
           cargo test --workspace
           --exclude faktor-cli
           --exclude faktor-hooks
-          --exclude faktor-verify
-          --exclude faktor-sandbox
-          --exclude faktor-agent
-          --exclude faktor-index
-          --exclude faktor-cas
-          --exclude faktor-snapshot
           --exclude faktor-tests-coding-benchmark
           --exclude faktor-tests-fuzz-seeds
           --exclude faktor-tests-performance
@@ -237,8 +234,55 @@ jobs:
         working-directory: apps/vscode
         run: node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
 
+  vscode-visual-render:
+    name: vscode-visual-render (required; chromium render must pass)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Both the probe in webview-visual-check.mjs and the install below use
+      # one shared location so `browser_ready` sees the exact executable.
+      FAKTOR_PLAYWRIGHT: ${{ github.workspace }}/target/visual-playwright/node_modules/playwright
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/target/visual-playwright/browsers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Visual gate self-test (offline, adversarial)
+        run: node scripts/webview-visual-check.mjs --self-test
+      - name: Install playwright + chromium explicitly
+        # A browser is GUARANTEED on this lane: the install must succeed and
+        # `playwright install --with-deps` provisions every shared library the
+        # render needs. No silent fallback to the no-headless skip path.
+        run: |
+          npm install --prefix target/visual-playwright --no-save playwright
+          target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
+      - name: Render gate must PASS (never skip)
+        run: |
+          node scripts/webview-visual-check.mjs
+          node -e '
+            const fs = require("node:fs");
+            const report = JSON.parse(
+              fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
+            );
+            const status = report.render && report.render.status;
+            if (status !== "passed") {
+              console.error(`REQUIRED render gate did not pass: render.status=${status}`);
+              process.exit(1);
+            }
+            console.log(`render gate passed (${report.render.states ?? "?"} states, ${report.render.tool ?? "?"})`);
+          '
+      - name: Upload visual report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-visual-render-report
+          path: ui/kilo-v756-webview/dist/visual-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
   vscode-visual-with-skip:
-    name: vscode-visual-with-skip (playwright gate, recorded skip)
+    name: vscode-visual-with-skip (diagnostics, recorded skip)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -246,12 +290,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: Vendored-webview visual gate
-        # Runs the offline structural/manifest gate always; attempts a
-        # playwright + chromium install for the render section and records
-        # an explicit skip in ui/kilo-v756-webview/dist/visual-report.json
-        # when the browser cannot be installed. A real visual mismatch
-        # fails the job; a skip never reports as a pass.
+      - name: Vendored-webview visual gate (diagnostics)
+        # Diagnostics twin: runs the offline structural/manifest gate always;
+        # attempts a playwright + chromium install for the render section and
+        # records an explicit skip when the browser cannot be installed. The
+        # required verdict lives in vscode-visual-render above.
         run: bash scripts/ci-vscode-visual.sh
       - name: Upload visual report
         if: always()
@@ -359,6 +402,7 @@ jobs:
       - docs-drift
       - protocol-compat
       - vscode-build
+      - vscode-visual-render
       - vscode-visual-with-skip
       - jetbrains-build
       - jetbrains-smoke

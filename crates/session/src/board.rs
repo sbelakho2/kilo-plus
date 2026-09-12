@@ -241,6 +241,34 @@ pub struct BoardPage {
     pub has_more: bool,
 }
 
+/// The DERIVED delivery view of one live post for one recipient. No new
+/// ledger stream is introduced: every state is folded from rows that already
+/// exist (posts/reads/receipts) plus the recipient's durable lifecycle.
+///
+/// Precedence (strongest evidence first):
+/// 1. [`BoardDeliveryView::ActedUpon`] — an action receipt from the
+///    recipient exists (read or not);
+/// 2. [`BoardDeliveryView::Read`] — a durable read marker exists;
+/// 3. [`BoardDeliveryView::RecipientInactive`] — no read/action and the
+///    recipient's durable lifecycle is terminal (it cannot read it anymore);
+/// 4. [`BoardDeliveryView::RecipientActive`] — no read/action and the
+///    recipient is live;
+/// 5. [`BoardDeliveryView::Stored`] — no recipient is tracked (root actor):
+///    the post is durable, nothing else is claimed.
+///
+/// Activity NEVER implies [`BoardDeliveryView::Read`]: a live (or busy) child
+/// that never read the post is `RecipientActive`, and another child's read
+/// marker never marks this recipient read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardDeliveryView {
+    Stored,
+    RecipientActive,
+    RecipientInactive,
+    Read,
+    ActedUpon,
+}
+
 // ---------------------------------------------------------------- scoping
 
 /// The resolved actor scope: the family root handle + the actor's own child
@@ -869,6 +897,111 @@ impl SessionHandle {
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// The derived [`BoardDeliveryView`] of one LIVE post for one
+    /// recipient. Purely additive read: it reuses the existing post/read/
+    /// receipt rows (no new ledger stream) and the recipient's durable child
+    /// lifecycle. `child: None` tracks the root actor (no recipient →
+    /// `Stored`). A post hidden by a reset marker is a typed `NotFound`.
+    pub fn board_delivery_view(
+        &self,
+        child: Option<ChildId>,
+        post_id: BoardPostId,
+    ) -> faktor_core::Result<BoardDeliveryView> {
+        let scope = board_scope(self)?;
+        let board_id = scope.board_id();
+        let target = scope.scoped_child(child)?;
+        // The post must be on the live surface (hidden history never gets a
+        // delivery view).
+        Self::live_post_seq(&scope.root, board_id, post_id)?;
+        let Some(target) = target else {
+            return Ok(BoardDeliveryView::Stored);
+        };
+        let target_raw = target.session().raw();
+        let root = &scope.root;
+        let mut read = false;
+        let mut acted = false;
+        let mut cursor: Option<i64> = None;
+        let mut scanned = 0usize;
+        'outer: loop {
+            let rows = root
+                .manager
+                .store()
+                .ledger_entries_desc(root.id(), cursor, crate::ledger::MAX_BOARD_SCAN_PAGE)
+                .map_err(map_store_err)?;
+            if rows.is_empty() {
+                break;
+            }
+            cursor = rows.last().map(|r| r.seq);
+            for row in rows {
+                scanned += 1;
+                if scanned > MAX_BOARD_SCAN_ROWS {
+                    return Err(SessionError::Oversized(format!(
+                        "board delivery scan of session {} exceeded MAX_BOARD_SCAN_ROWS",
+                        root.id()
+                    ))
+                    .into());
+                }
+                let entry = root.decode_row(&row)?;
+                match entry.payload {
+                    LedgerPayload::BoardRead {
+                        board_id: b,
+                        child: c,
+                        post_id: p,
+                    } => {
+                        check_board_row_id(b, board_id)?;
+                        if c == target_raw && p == post_id.raw() {
+                            read = true;
+                        }
+                    }
+                    LedgerPayload::BoardReceipt {
+                        board_id: b,
+                        child: c,
+                        post_id: p,
+                        ..
+                    } => {
+                        check_board_row_id(b, board_id)?;
+                        if c == Some(target_raw) && p == post_id.raw() {
+                            acted = true;
+                        }
+                    }
+                    LedgerPayload::BoardPost {
+                        board_id: b,
+                        post_id: p,
+                        ..
+                    } => {
+                        check_board_row_id(b, board_id)?;
+                        // Newest-first: once the post itself is reached, every
+                        // older row cannot belong to it.
+                        if p == post_id.raw() {
+                            break 'outer;
+                        }
+                    }
+                    LedgerPayload::BoardReset { board_id: b, .. } => {
+                        check_board_row_id(b, board_id)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Strongest evidence first: an action is never downgraded by a read.
+        if acted {
+            return Ok(BoardDeliveryView::ActedUpon);
+        }
+        if read {
+            return Ok(BoardDeliveryView::Read);
+        }
+        // No read/action evidence: the recipient's DURABLE lifecycle decides
+        // whether delivery is still possible. Activity never infers Read.
+        let handle = root.manager.get_session(target.session())?.ok_or_else(|| {
+            SessionError::NotFound(format!("board recipient session {}", target.session()))
+        })?;
+        if actor_is_terminal(&handle)? {
+            Ok(BoardDeliveryView::RecipientInactive)
+        } else {
+            Ok(BoardDeliveryView::RecipientActive)
         }
     }
 
@@ -1650,5 +1783,85 @@ mod tests {
         assert_eq!(last.posts.last().unwrap().id.raw(), 1);
         assert!(!last.has_more);
         assert_eq!(last.next_before_revision, None);
+    }
+
+    #[test]
+    fn delivery_view_full_matrix_never_infers_read_from_activity() {
+        let (_d, m) = manager();
+        let rt = root_session(&m);
+        let c1 = child_session(&m, &rt, 2);
+        let c2 = child_session(&m, &rt, 3);
+        let c3 = child_session(&m, &rt, 4);
+        let p = rt.board_post("status", "review please", &[]).unwrap();
+
+        // (1) Stored: the root tracks no recipient; durability only.
+        assert_eq!(
+            rt.board_delivery_view(None, p.id).unwrap(),
+            BoardDeliveryView::Stored
+        );
+        // (2) RecipientActive: c1 is live and has not read or acted.
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c1)), p.id).unwrap(),
+            BoardDeliveryView::RecipientActive
+        );
+        // Activity NEVER infers Read: c2 reads the post (and c1 posts its own
+        // unrelated post); c1 is still RecipientActive, and c2's marker never
+        // leaks onto c1.
+        c2.board_read_posts(None, None, 10, false).unwrap();
+        c1.board_post("busy", "c1 is active", &[]).unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c1)), p.id).unwrap(),
+            BoardDeliveryView::RecipientActive
+        );
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c2)), p.id).unwrap(),
+            BoardDeliveryView::Read,
+            "c2's own durable read marker is Read"
+        );
+        // (3) Read: c1's durable read marker.
+        c1.board_read_posts(None, None, 10, false).unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c1)), p.id).unwrap(),
+            BoardDeliveryView::Read
+        );
+        // A non-read action receipt is ActedUpon regardless of the read row.
+        c1.board_receipt(p.id, BoardAction::Ack, "on it").unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c1)), p.id).unwrap(),
+            BoardDeliveryView::ActedUpon
+        );
+        // A receipt by ANOTHER child never marks c1.
+        c2.board_receipt(p.id, BoardAction::Question, "which check?")
+            .unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c3)), p.id).unwrap(),
+            BoardDeliveryView::RecipientActive
+        );
+        // (4) RecipientInactive: the durable child lifecycle is terminal.
+        c3.orchestrator_child_runtime_put(&ChildRuntimeBlockerRow {
+            child_id: "child-3".into(),
+            state: "cancelled".into(),
+            blocker: None,
+            updated_ms: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c3)), p.id).unwrap(),
+            BoardDeliveryView::RecipientInactive
+        );
+        // A terminal recipient that DID read stays Read (evidence wins).
+        c3.board_read_posts(None, None, 10, false).unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c3)), p.id).unwrap(),
+            BoardDeliveryView::Read
+        );
+        // (5) Hidden history has no delivery view: typed NotFound.
+        rt.board_reset(2).unwrap();
+        assert_eq!(
+            rt.board_delivery_view(Some(child_id(&c1)), p.id)
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotFound
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use faktor_context::compiler::ProvenanceSource;
 use faktor_core::capability::Capability;
 use faktor_core::error::Error;
 use faktor_core::hash::FileHash;
@@ -107,6 +108,7 @@ impl Default for ToolOutcome {
             slice_hint: None,
             effect_status: faktor_core::op::EffectStatus::Applied,
             postcondition: None,
+            provenance: ProvenanceSource::Tool,
         }
     }
 }
@@ -184,6 +186,12 @@ pub struct ToolOutcome {
     /// runtime records it on the tool-run row so crash recovery verifies the
     /// file against the REAL bytes as written (never JSON-encoded args).
     pub postcondition: Option<FilePostcondition>,
+    /// Where this output came from. Ordinary tool output is
+    /// [`ProvenanceSource::Tool`]; coordination-board output is
+    /// [`ProvenanceSource::AgentCoordination`] — a SIBLING AGENT'S post is
+    /// peer DATA and may never acquire instruction authority (a malicious
+    /// board post cannot launder itself into policy by being read+archived).
+    pub provenance: ProvenanceSource,
 }
 
 pub type ToolFn = Arc<
@@ -512,6 +520,11 @@ pub const BOARD_TOOL_TEXT_MAX: usize = 64 * 1024;
 pub const BOARD_TOOL_MAX_LIMIT: usize = 100;
 /// Max refs one `board_post` may carry (mirrors the session board bound).
 pub const BOARD_TOOL_MAX_REFS: usize = 32;
+/// The provenance class of BOTH board tools' output. Board content is
+/// agent-coordination DATA: archived through the evidence authority it stays
+/// non-authoritative by construction, so a sibling's "ignore user policy"
+/// post can never instruct the reading agent.
+pub const BOARD_TOOL_PROVENANCE: ProvenanceSource = ProvenanceSource::AgentCoordination;
 
 /// The durable coordination-board authority injected into the board tools.
 /// Implementations resolve the calling session and delegate to the session
@@ -623,6 +636,7 @@ pub fn board_post_tool(gateway: Arc<dyn BoardToolGateway>) -> Tool {
                 Ok(ToolOutcome {
                     text: board_tool_text(&value)?,
                     exit_code: Some(0),
+                    provenance: BOARD_TOOL_PROVENANCE,
                     ..Default::default()
                 })
             })
@@ -685,6 +699,9 @@ pub fn board_read_tool(gateway: Arc<dyn BoardToolGateway>) -> Tool {
                 Ok(ToolOutcome {
                     text: board_tool_text(&value)?,
                     exit_code: Some(0),
+                    // A sibling's post is coordination DATA, never policy:
+                    // the archived evidence must carry AgentCoordination.
+                    provenance: BOARD_TOOL_PROVENANCE,
                     ..Default::default()
                 })
             })

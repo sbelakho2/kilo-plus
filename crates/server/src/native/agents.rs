@@ -315,7 +315,14 @@ pub(crate) async fn native_orchestrator_graph(
         (a.0.unwrap_or(usize::MAX), a.2.clone()).cmp(&(b.0.unwrap_or(usize::MAX), b.2.clone()))
     });
     let mut out_children = Vec::with_capacity(children.len());
-    for (_idx, _created, child_id, row) in children {
+    for (_idx, _created, child_id, mut row) in children {
+        // The registry JSON is never rewritten by controls: derive the
+        // mutable truth (task-row budget, drive-state phase) from the
+        // child's OWN durable rows before projecting anything.
+        faktor_orchestrator::runtime::OrchestratorRuntime::derive_child_projection(
+            &state.deps.session,
+            &mut row,
+        );
         // Steering history from the child session's control rows.
         let sid_raw = row.session_id;
         let mut presentation: Option<faktor_session::child::PresentationState> = None;
@@ -467,6 +474,7 @@ pub(crate) async fn native_orchestrator_graph(
             "worktree_id": row.worktree_id,
             "ownership": row.ownership,
             "state": child_state,
+            "execution_phase": row.execution_phase.as_str(),
             "presentation": presentation,
             "blocker": blocker,
             "budget": row.budget_max_tokens,
@@ -687,9 +695,16 @@ pub(crate) fn native_child_entry(
     state: &AppState,
     facts: &[(String, String, String)],
     run: &str,
-    row: faktor_orchestrator::runtime::ChildRuntime,
+    mut row: faktor_orchestrator::runtime::ChildRuntime,
     default_model: Option<&str>,
 ) -> Result<serde_json::Value, ApiError> {
+    // The registry JSON is never rewritten by controls: derive the mutable
+    // truth (task-row budget, drive-state phase) from the child's OWN
+    // durable rows before projecting anything.
+    faktor_orchestrator::runtime::OrchestratorRuntime::derive_child_projection(
+        &state.deps.session,
+        &mut row,
+    );
     let session = match state
         .deps
         .session
@@ -759,6 +774,9 @@ pub(crate) fn native_child_entry(
         "item_id": row.item_id,
         "item_kind": row.kind,
         "state": state_tag,
+        // The coarse durable drive phase (additive projection; independent
+        // of lifecycle). Absent rows decode as planning.
+        "execution_phase": drive.execution_phase.as_str(),
         "blocker": blocker,
         "provider": child_row.provider,
         "model": child_model(&drive, identity.as_ref(), &row, default_model),
@@ -982,24 +1000,31 @@ pub(crate) fn native_agents_body(
 
 /// Shared error mapping of one orchestrator control into the wire.
 pub(crate) fn exec_error_response(e: &faktor_orchestrator::runtime::ExecError) -> Response {
-    let (code, status) = match e {
-        faktor_orchestrator::runtime::ExecError::NotFound(_) => ("not_found", 404),
-        faktor_orchestrator::runtime::ExecError::Conflict(_) => ("conflict", 409),
-        faktor_orchestrator::runtime::ExecError::InvalidState(_) => ("conflict", 409),
+    let (code, status, retryable) = match e {
+        faktor_orchestrator::runtime::ExecError::NotFound(_) => ("not_found", 404, false),
+        faktor_orchestrator::runtime::ExecError::Conflict(_) => ("conflict", 409, false),
+        faktor_orchestrator::runtime::ExecError::InvalidState(_) => ("conflict", 409, false),
         faktor_orchestrator::runtime::ExecError::CeilingExceeded { .. } => {
-            ("ceiling_exceeded", 429)
+            ("ceiling_exceeded", 429, false)
         }
         faktor_orchestrator::runtime::ExecError::Oversized(_)
         | faktor_orchestrator::runtime::ExecError::Malformed(_)
         | faktor_orchestrator::runtime::ExecError::InvalidPlan(_)
-        | faktor_orchestrator::runtime::ExecError::InvalidApproval(_) => ("malformed", 400),
-        _ => ("internal", 500),
+        | faktor_orchestrator::runtime::ExecError::InvalidApproval(_) => ("malformed", 400, false),
+        // An authoritative durable write / control ack failed. The control
+        // was NOT claimed applied and the same call may be safely retried:
+        // surface that as a typed RETRIABLE service failure, never a silent
+        // success and never a permanent internal error.
+        faktor_orchestrator::runtime::ExecError::RetriablePersistence { .. } => {
+            ("persistence_failed", 503, true)
+        }
+        _ => ("internal", 500, false),
     };
     let e = ApiError {
         code,
         message: e.to_string(),
         http_status: status,
-        retryable: false,
+        retryable,
     };
     wire_status(e)
 }

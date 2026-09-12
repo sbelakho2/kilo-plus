@@ -37,6 +37,7 @@
 //! too (the row is acked, the effect row — waiting phase, current note,
 //! current model — is the durable truth the drive re-reads).
 
+use faktor_core::blocker::validate_child_runtime_state;
 use faktor_core::id::SessionId;
 use serde::{Deserialize, Serialize};
 
@@ -160,78 +161,27 @@ pub struct DriveState {
     pub current_note: String,
     /// The currently applied model override (empty = session default).
     pub current_model: String,
+    /// The coarse execution phase of the drive, persisted additively at safe
+    /// boundaries ([`SessionHandle::set_execution_phase`]). Absent rows
+    /// decode as [`ExecutionPhase::Planning`]. Purely a projection: it never
+    /// changes lifecycle/scheduling semantics.
+    pub execution_phase: ExecutionPhase,
     pub updated_ms: i64,
 }
 
-/// Strict bounds of the durable child blocker text (v23 typed projection).
+// The child blocker vocabulary is the ONE shared core definition (typed
+// kind enum, bounded text, strict validate/decode); re-exported here so the
+// historic `faktor_session::child` paths keep resolving.
+pub use faktor_core::blocker::ChildBlocker;
+pub use faktor_core::blocker::{
+    BlockerKind, ExecutionPhase, MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
+    MAX_CHILD_BLOCKER_REASON_CHARS, MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
+};
+
+/// Strict bound of the historic blocker-kind text. The kind is now a closed
+/// enum ([`BlockerKind`]) — the constant is retained for API compatibility
+/// and bounds the largest enum tag.
 pub const MAX_CHILD_BLOCKER_KIND_CHARS: usize = 64;
-pub const MAX_CHILD_BLOCKER_REASON_CHARS: usize = 512;
-pub const MAX_CHILD_BLOCKER_DEPENDENCY_CHARS: usize = 64;
-pub const MAX_CHILD_BLOCKER_RESOLUTION_CHARS: usize = 512;
-
-/// The typed durable blocker of one blocked child: WHY it is not running.
-/// Bounded and validated — hostile oversized text is a typed reject before
-/// any durable write.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct ChildBlocker {
-    pub kind: String,
-    pub reason: String,
-    pub dependency: Option<String>,
-    pub resolution: Option<String>,
-    pub last_progress_ms: Option<i64>,
-}
-
-impl ChildBlocker {
-    pub fn validate(&self) -> Result<(), SessionError> {
-        check_blocker_text("blocker kind", &self.kind, MAX_CHILD_BLOCKER_KIND_CHARS)?;
-        check_blocker_text(
-            "blocker reason",
-            &self.reason,
-            MAX_CHILD_BLOCKER_REASON_CHARS,
-        )?;
-        if let Some(dep) = &self.dependency {
-            check_blocker_text(
-                "blocker dependency",
-                dep,
-                MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
-            )?;
-        }
-        if let Some(res) = &self.resolution {
-            check_blocker_text(
-                "blocker resolution",
-                res,
-                MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
-            )?;
-        }
-        if self.last_progress_ms.is_some_and(|ms| ms < 0) {
-            return Err(SessionError::Malformed(
-                "blocker last_progress_ms must be non-negative".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn check_blocker_text(field: &str, value: &str, max: usize) -> Result<(), SessionError> {
-    if value.trim().is_empty() {
-        return Err(SessionError::Malformed(format!(
-            "{field} must not be empty or whitespace-only"
-        )));
-    }
-    if value.chars().count() > max {
-        return Err(SessionError::Oversized(format!(
-            "{field} of {} characters exceeds {max}",
-            value.chars().count()
-        )));
-    }
-    if value.chars().any(|c| c.is_control()) {
-        return Err(SessionError::Malformed(format!(
-            "{field} carries control characters"
-        )));
-    }
-    Ok(())
-}
 
 /// Strict bounds of one presentation child id: 1..=64 printable ASCII bytes
 /// without path separators (never a path, never control text).
@@ -273,9 +223,10 @@ impl ChildRuntimeBlockerRow {
         if self.state.is_empty() || self.state.len() > 32 {
             return Err(SessionError::Malformed("state must be 1..=32 bytes".into()));
         }
-        if let Some(b) = &self.blocker {
-            b.validate()?;
-        }
+        // The durable invariant: a known lifecycle tag AND
+        // `state == "blocked" <=> blocker.is_some()` (both directions loud).
+        validate_child_runtime_state(&self.state, self.blocker.as_ref())
+            .map_err(SessionError::from)?;
         Ok(())
     }
 }
@@ -461,8 +412,38 @@ impl SessionHandle {
                 ..Default::default()
             });
         };
+        // A hostile phase/state value in the durable row is a loud Malformed
+        // decode (the enum vocabulary is closed), never a silent default.
         serde_json::from_str(&raw)
-            .map_err(|e| SessionError::Internal(format!("drive state decode: {e}")).into())
+            .map_err(|e| SessionError::Malformed(format!("drive state decode: {e}")).into())
+    }
+
+    // ------------------------------------------- execution phase boundaries
+
+    /// The durable execution phase of this child (Planning when no row
+    /// exists). Additive projection: it never participates in lifecycle or
+    /// scheduling decisions.
+    pub fn execution_phase(&self) -> faktor_core::Result<ExecutionPhase> {
+        Ok(self.orchestrator_drive_state_get()?.execution_phase)
+    }
+
+    /// Persist the child's execution phase at a safe boundary into its
+    /// durable drive-state row. Idempotent: re-setting the current phase
+    /// writes nothing (`Ok(None)`); otherwise the durable `updated_ms` is
+    /// returned. Non-orchestrated sessions carry no phase — the call is a
+    /// typed no-op for them, so standalone drives gain no durable rows.
+    pub fn set_execution_phase(&self, phase: ExecutionPhase) -> faktor_core::Result<Option<i64>> {
+        if self.orchestrator_child_identity_get()?.is_none() {
+            return Ok(None);
+        }
+        let mut ds = self.orchestrator_drive_state_get()?;
+        if ds.execution_phase == phase {
+            return Ok(None);
+        }
+        ds.execution_phase = phase;
+        ds.updated_ms = self.now_ms();
+        self.orchestrator_drive_state_put(&ds)?;
+        Ok(Some(ds.updated_ms))
     }
 
     // ------------------------------------------ durable blocker truth (v23)
@@ -480,7 +461,7 @@ impl SessionHandle {
             session_id: self.id,
             child_id: row.child_id.clone(),
             state: row.state.clone(),
-            blocker_kind: row.blocker.as_ref().map(|b| b.kind.clone()),
+            blocker_kind: row.blocker.as_ref().map(|b| b.kind.as_str().to_string()),
             blocker_reason: row.blocker.as_ref().map(|b| b.reason.clone()),
             blocker_dependency: row.blocker.as_ref().and_then(|b| b.dependency.clone()),
             blocker_resolution: row.blocker.as_ref().and_then(|b| b.resolution.clone()),
@@ -499,7 +480,10 @@ impl SessionHandle {
     }
 
     /// The typed child-runtime projection row of this session (None before
-    /// the first write).
+    /// the first write). DECODE IS STRICT: the kind column re-parses through
+    /// the closed [`BlockerKind`] enum, the blocked/non-blocked equivalence
+    /// is enforced, and a corrupt row is a loud typed error — never a
+    /// silently fabricated state.
     pub fn orchestrator_child_runtime_get(
         &self,
     ) -> faktor_core::Result<Option<ChildRuntimeBlockerRow>> {
@@ -511,19 +495,40 @@ impl SessionHandle {
         else {
             return Ok(None);
         };
-        let blocker = row.blocker_kind.map(|kind| ChildBlocker {
-            kind,
-            reason: row.blocker_reason.unwrap_or_default(),
-            dependency: row.blocker_dependency,
-            resolution: row.blocker_resolution,
-            last_progress_ms: row.last_progress_ms,
-        });
-        Ok(Some(ChildRuntimeBlockerRow {
+        let blocker = match row.blocker_kind.as_deref() {
+            None => None,
+            Some(raw_kind) => {
+                let kind = BlockerKind::parse(raw_kind).ok_or_else(|| {
+                    SessionError::Malformed(format!(
+                        "child runtime row of session {} carries blocker kind {raw_kind:?} \
+                         outside the closed vocabulary",
+                        self.id
+                    ))
+                })?;
+                let reason = row.blocker_reason.clone().ok_or_else(|| {
+                    SessionError::Malformed(format!(
+                        "child runtime row of session {} carries blocker kind {raw_kind:?} \
+                         without a reason",
+                        self.id
+                    ))
+                })?;
+                Some(ChildBlocker {
+                    kind,
+                    reason,
+                    dependency: row.blocker_dependency.clone(),
+                    resolution: row.blocker_resolution.clone(),
+                    last_progress_ms: row.last_progress_ms,
+                })
+            }
+        };
+        let typed = ChildRuntimeBlockerRow {
             child_id: row.child_id,
             state: row.state,
             blocker,
             updated_ms: row.updated_ms,
-        }))
+        };
+        typed.validate()?;
+        Ok(Some(typed))
     }
 
     /// Mark this child BLOCKED with the given blocker (validated, bounded).
@@ -841,6 +846,7 @@ mod tests {
                 phase: ChildPhase::Waiting,
                 current_note: "slower".into(),
                 current_model: String::new(),
+                execution_phase: ExecutionPhase::Reasoning,
                 updated_ms: 2,
             })
             .unwrap();
@@ -858,6 +864,7 @@ mod tests {
         let state = s.orchestrator_drive_state_get().unwrap();
         assert_eq!(state.phase, ChildPhase::Waiting);
         assert_eq!(state.current_note, "slower");
+        assert_eq!(state.execution_phase, ExecutionPhase::Reasoning);
     }
 
     #[test]
@@ -938,7 +945,7 @@ mod tests {
             let ws = m.create_workspace("/root").unwrap();
             let s = m.create_session(ws, "child", "fake", "m").unwrap();
             let blocker = ChildBlocker {
-                kind: "budget".into(),
+                kind: BlockerKind::Budget,
                 reason: "task budget exhausted: max_tokens=1 spent_tokens=5".into(),
                 dependency: None,
                 resolution: Some("raise the child budget, then resume".into()),
@@ -956,9 +963,11 @@ mod tests {
             // Hostile oversized text is typed-rejected BEFORE any write and
             // changes nothing.
             let huge = ChildBlocker {
-                kind: "budget".into(),
+                kind: BlockerKind::Budget,
                 reason: "x".repeat(MAX_CHILD_BLOCKER_REASON_CHARS + 1),
-                ..Default::default()
+                dependency: None,
+                resolution: Some("raise it".into()),
+                last_progress_ms: None,
             };
             let err = s
                 .orchestrator_child_blocker_put("child-0", &huge)
@@ -971,16 +980,9 @@ mod tests {
             );
             // Empty/whitespace/control text is Malformed.
             for hostile in [
-                ChildBlocker {
-                    kind: "  ".into(),
-                    reason: "x".into(),
-                    ..Default::default()
-                },
-                ChildBlocker {
-                    kind: "budget".into(),
-                    reason: "\t\n".into(),
-                    ..Default::default()
-                },
+                ChildBlocker::new(BlockerKind::Budget, "  ", "raise it"),
+                ChildBlocker::new(BlockerKind::Budget, "\t\n", "raise it"),
+                ChildBlocker::new(BlockerKind::Permission, "bad\u{0}text", "resolve it"),
             ] {
                 assert_eq!(
                     s.orchestrator_child_blocker_put("child-0", &hostile)
@@ -996,12 +998,176 @@ mod tests {
             SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
         let s = m.get_session(sid).unwrap().unwrap();
         let got = s.orchestrator_child_blocker_get().unwrap().unwrap();
-        assert_eq!(got.kind, "budget");
+        assert_eq!(got.kind, BlockerKind::Budget);
         assert_eq!(got.last_progress_ms, Some(7));
         // Running clears the durable blocker (row gone).
         s.orchestrator_child_blocker_clear().unwrap();
         assert!(s.orchestrator_child_blocker_get().unwrap().is_none());
         assert!(s.orchestrator_child_runtime_get().unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_child_runtime_rows_fail_loud_on_decode() {
+        let (_d, m, s) = fixture();
+        let sid = s.id().raw();
+        let bad = |sql: &str| {
+            m.store().sql_execute(sql).unwrap();
+        };
+        let decode = || s.orchestrator_child_runtime_get().unwrap_err();
+        // (a) Blocked WITHOUT a blocker: loud.
+        bad(&format!(
+            "INSERT INTO child_runtime(session_id, child_id, state, blocker_kind, blocker_reason,
+                 blocker_dependency, blocker_resolution, last_progress_ms, updated_ms)
+             VALUES ({sid}, 'child-0', 'blocked', NULL, NULL, NULL, NULL, NULL, 1);"
+        ));
+        assert_eq!(decode().kind, faktor_core::error::ErrorKind::Malformed);
+        // (b) Non-Blocked WITH blocker fields: loud.
+        bad(&format!(
+            "UPDATE child_runtime SET state='running', blocker_kind='budget',
+                 blocker_reason='exhausted' WHERE session_id={sid};"
+        ));
+        assert_eq!(decode().kind, faktor_core::error::ErrorKind::Malformed);
+        // (c) Unknown kind outside the closed vocabulary: loud.
+        bad(&format!(
+            "UPDATE child_runtime SET state='blocked', blocker_kind='zombie',
+                 blocker_reason='x' WHERE session_id={sid};"
+        ));
+        assert_eq!(decode().kind, faktor_core::error::ErrorKind::Malformed);
+        // (d) Unknown lifecycle tag: loud.
+        bad(&format!(
+            "UPDATE child_runtime SET state='sleepy', blocker_kind=NULL,
+                 blocker_reason=NULL WHERE session_id={sid};"
+        ));
+        assert_eq!(decode().kind, faktor_core::error::ErrorKind::Malformed);
+        // (e) Negative progress stamp on an otherwise valid blocker: loud.
+        bad(&format!(
+            "UPDATE child_runtime SET state='blocked', blocker_kind='budget',
+                 blocker_reason='exhausted', last_progress_ms=-5 WHERE session_id={sid};"
+        ));
+        assert_eq!(decode().kind, faktor_core::error::ErrorKind::Malformed);
+        // (f) The canonical valid row decodes with the typed kind.
+        bad(&format!(
+            "UPDATE child_runtime SET state='blocked', blocker_kind='budget',
+                 blocker_reason='exhausted', last_progress_ms=5 WHERE session_id={sid};"
+        ));
+        let row = s.orchestrator_child_runtime_get().unwrap().unwrap();
+        assert_eq!(row.state, "blocked");
+        assert_eq!(row.blocker.unwrap().kind, BlockerKind::Budget);
+    }
+
+    #[test]
+    fn legacy_string_kinds_decode_through_the_typed_shape_and_hostile_tags_stay_loud() {
+        // The pre-typed v23 rows stored the kind as a string. Every string
+        // tag the legacy writers produced (and the two bounded additions
+        // external/unknown) must decode to its typed variant — additively,
+        // with no migration. Anything else stays a loud Malformed refusal.
+        let (_d, m, s) = fixture();
+        let sid = s.id().raw();
+        for (tag, kind) in [
+            ("dependency", BlockerKind::Dependency),
+            ("permission", BlockerKind::Permission),
+            ("budget", BlockerKind::Budget),
+            ("verification", BlockerKind::Verification),
+            ("external", BlockerKind::External),
+            ("unknown", BlockerKind::Unknown),
+        ] {
+            m.store()
+                .sql_execute(&format!(
+                    "INSERT OR REPLACE INTO child_runtime(session_id, child_id, state, blocker_kind,
+                         blocker_reason, blocker_dependency, blocker_resolution, last_progress_ms, updated_ms)
+                     VALUES ({sid}, 'child-0', 'blocked', '{tag}', 'legacy reason', 'dep-1',
+                             'legacy resolution', 7, 1);"
+                ))
+                .unwrap();
+            let row = s
+                .orchestrator_child_runtime_get()
+                .unwrap()
+                .expect("legacy row decodes");
+            assert_eq!(row.state, "blocked", "{tag}");
+            let blocker = row.blocker.expect("typed blocker");
+            assert_eq!(
+                blocker.kind, kind,
+                "{tag} must delegate to its typed variant"
+            );
+            assert_eq!(blocker.reason, "legacy reason");
+            assert_eq!(blocker.dependency.as_deref(), Some("dep-1"));
+            assert_eq!(blocker.resolution.as_deref(), Some("legacy resolution"));
+            assert_eq!(blocker.last_progress_ms, Some(7));
+        }
+        // A case variant or any other tag is NOT a compat alias: loud.
+        for hostile in ["Budget", "EXTERNAL", "blocked", "zombie", "dependency "] {
+            m.store()
+                .sql_execute(&format!(
+                    "UPDATE child_runtime SET blocker_kind='{hostile}' WHERE session_id={sid};"
+                ))
+                .unwrap();
+            assert_eq!(
+                s.orchestrator_child_runtime_get().unwrap_err().kind,
+                faktor_core::error::ErrorKind::Malformed,
+                "{hostile:?} must be corrupt, not a silent fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_phase_persists_at_boundaries_and_hostile_values_fail_loud() {
+        let dir = tempdir().unwrap();
+        let sid = {
+            let m = SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+            let ws = m.create_workspace("/root").unwrap();
+            let s = m.create_session(ws, "child", "fake", "m").unwrap();
+            // A non-orchestrated session is a typed no-op (no new rows, no
+            // phase): lifecycle semantics are untouched for standalone drives.
+            assert_eq!(s.set_execution_phase(ExecutionPhase::Coding).unwrap(), None);
+            assert_eq!(s.execution_phase().unwrap(), ExecutionPhase::Planning);
+            s.orchestrator_child_identity_put(&ChildIdentity::default())
+                .unwrap();
+            // The phase is INDEPENDENT of lifecycle: record the per-turn state
+            // and lifetime before the writes and prove they never move.
+            let state_before = s.state().unwrap();
+            let lifecycle_before = s.lifecycle().unwrap();
+            let first = s
+                .set_execution_phase(ExecutionPhase::Context)
+                .unwrap()
+                .expect("child phase write");
+            assert!(first > 0);
+            assert_eq!(s.execution_phase().unwrap(), ExecutionPhase::Context);
+            assert_eq!(s.state().unwrap(), state_before);
+            assert_eq!(s.lifecycle().unwrap(), lifecycle_before);
+            // Same-phase re-set is an idempotent no-op.
+            assert_eq!(
+                s.set_execution_phase(ExecutionPhase::Context).unwrap(),
+                None
+            );
+            s.set_execution_phase(ExecutionPhase::Verifying).unwrap();
+            assert_eq!(s.execution_phase().unwrap(), ExecutionPhase::Verifying);
+            // A hostile durable value is a loud Malformed decode, never a
+            // silent default.
+            s.upsert_memory_fact(
+                "orchestrator",
+                "drive_state",
+                r#"{"phase":"running","current_note":"","current_model":"","execution_phase":"hostile","updated_ms":1}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                s.execution_phase().unwrap_err().kind,
+                faktor_core::error::ErrorKind::Malformed
+            );
+            // Restore a valid row for the reopen assertion.
+            s.upsert_memory_fact(
+                "orchestrator",
+                "drive_state",
+                r#"{"phase":"running","current_note":"","current_model":"","execution_phase":"verifying","updated_ms":1}"#,
+            )
+            .unwrap();
+            s.set_execution_phase(ExecutionPhase::Integrating).unwrap();
+            s.id()
+        };
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        let s = m.get_session(sid).unwrap().unwrap();
+        assert_eq!(s.execution_phase().unwrap(), ExecutionPhase::Integrating);
     }
 
     fn journal_entries(s: &SessionHandle) -> usize {

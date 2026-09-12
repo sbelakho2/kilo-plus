@@ -21,6 +21,7 @@ import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeEventPage
 import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
@@ -218,12 +219,14 @@ class NativeClient(
         maxTokens: Long? = null,
         maxCostMicro: Long? = null,
         mutationMode: String? = null,
-        files: List<String>? = null
+        files: List<String>? = null,
+        completionContract: NativeCompletionContract? = null
     ): NativeTaskRunStarted = parseNativeTaskRunStarted(
         request(
             "POST", "/native/session/" + encode(sessionId) + "/task-runs", null,
             NativeRequests.startTaskRun(
-                goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files
+                goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
+                completionContract
             )
         )
     )

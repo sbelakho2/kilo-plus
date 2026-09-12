@@ -350,6 +350,32 @@ export interface NativeTaskView {
   readonly blockers: NativeBlockerEntry[];
   readonly evidenceRefs: string[];
   readonly phase: string | null;
+  /** Additive durable PR/CI-fix completion contract + per-step statuses.
+   * `null` when the serving daemon exposes no completion read: the client
+   * never fabricates step statuses (a missing read is NOT "all succeeded"). */
+  readonly completion: NativeTaskCompletion | null;
+}
+
+/** The strict completion-contract vocabulary (wire snake_case). */
+export interface NativeCompletionContract {
+  readonly include_commit: boolean;
+  readonly include_push: boolean;
+  readonly include_pr: boolean;
+}
+
+/** One durable completion-step outcome as served on a task view. */
+export interface NativeCompletionStepStatus {
+  readonly step: string;
+  readonly status: string;
+  readonly detail: string;
+  readonly atMs: number | null;
+  readonly seq: number | null;
+}
+
+/** The durable completion surface of one task (contract + step rows). */
+export interface NativeTaskCompletion {
+  readonly contract: NativeCompletionContract;
+  readonly steps: readonly NativeCompletionStepStatus[];
 }
 
 /** One plan/DAG step of a native task view (additive). */
@@ -741,11 +767,18 @@ export interface StartTaskRunRequest {
     readonly summary?: string;
     readonly depends_on?: string[];
     readonly acceptance_checks?: string[];
+    /** The item's own write ownership (snake_case OwnershipSpec). */
+    readonly ownership?: Json;
   }>;
   readonly model?: string;
   readonly max_tokens?: number;
   readonly max_cost_micro?: number;
   readonly mutation_mode?: string;
+  /** Workspace-relative attachment paths (the same vocabulary as a prompt). */
+  readonly files?: readonly string[];
+  /** A non-default PR/CI-fix completion contract. The daemon refuses it on
+   * the plain-prompt path, so callers pair it with an explicit work item. */
+  readonly completion_contract?: NativeCompletionContract;
 }
 
 // -------------------------------------------------------------- validators
@@ -1114,6 +1147,48 @@ function optionalBlockers(object: JsonObject, path: string): NativeBlockerEntry[
   });
 }
 
+/** Parse the completion contract member strictly (three required booleans). */
+function completionContractOf(object: JsonObject, path: string): NativeCompletionContract {
+  checkResponseKeys(object, path, ['include_commit', 'include_push', 'include_pr']);
+  return {
+    include_commit: fBool(object, 'include_commit', path),
+    include_push: fBool(object, 'include_push', path),
+    include_pr: fBool(object, 'include_pr', path),
+  };
+}
+
+/**
+ * The additive durable completion surface of one task view. Absent or null
+ * stays null (never fabricated); when PRESENT the contract is strict and
+ * every step row must carry step/status/detail — a daemon that serves a
+ * malformed completion block is a loud protocol violation, not a silent
+ * empty section.
+ */
+function optionalCompletion(object: JsonObject, path: string): NativeTaskCompletion | null {
+  const value = optionalField(object, ['completion']);
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const completionPath = `${path}.completion`;
+  const completion = asObject(value, completionPath);
+  const contract = completionContractOf(
+    asObject(field(completion, 'contract', completionPath), `${completionPath}.contract`),
+    `${completionPath}.contract`,
+  );
+  const steps = fObjectArray(completion, 'steps', completionPath).map((entry, index) => {
+    const itemPath = `${completionPath}.steps[${index}]`;
+    checkResponseKeys(entry, itemPath, ['step', 'status', 'detail']);
+    return {
+      step: fString(entry, 'step', itemPath),
+      status: fString(entry, 'status', itemPath),
+      detail: fString(entry, 'detail', itemPath),
+      atMs: 'at_ms' in entry ? fNullableInt(entry, 'at_ms', itemPath) : null,
+      seq: 'seq' in entry ? fNullableInt(entry, 'seq', itemPath) : null,
+    };
+  });
+  return { contract, steps };
+}
+
 
 export function validateTaskViews(json: Json): NativeTaskView[] {
   const path = 'GET /native/session/{id}/tasks';
@@ -1172,6 +1247,7 @@ export function validateTaskViews(json: Json): NativeTaskView[] {
       blockers: optionalBlockers(object, itemPath),
       evidenceRefs: optionalStringArray(object, ['evidenceRefs', 'evidence_refs'], itemPath),
       phase: optionalString(object, ['phase'], itemPath),
+      completion: optionalCompletion(object, itemPath),
     };
   });
 }

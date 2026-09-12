@@ -47,6 +47,8 @@ class TaskTreePanel : JPanel(BorderLayout()) {
 
     private val verificationLabel = JLabel("verification: -")
 
+    private val completionLabel = JLabel("completion: -")
+
     private val treeModel = DefaultTreeModel(DefaultMutableTreeNode(TaskTreeNode.Plain("no task data")))
 
     private val tree = JTree(treeModel)
@@ -72,6 +74,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         summary.add(stateLabel)
         summary.add(phaseLabel)
         summary.add(verificationLabel)
+        summary.add(completionLabel)
         summary.add(spendLabel)
 
         val top = JPanel(BorderLayout(0, 4))
@@ -98,6 +101,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         verificationLabel.text = "verification: " + model.verification.status +
             " (criteria ${model.verification.criteriaPassed}/${model.verification.criteriaTotal}" +
             ", failed ${model.verification.failedChecks}, owed ${model.verification.owed})"
+        completionLabel.text = completionText(model.completion)
         spendLabel.text = spendText(model.spend)
 
         val root = DefaultMutableTreeNode(
@@ -105,6 +109,7 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         )
         root.add(criteriaNode(model))
         root.add(planNode(model))
+        root.add(completionNode(model))
         root.add(childrenNode(model))
         root.add(verificationNode(model))
         root.add(evidenceNode(model))
@@ -151,6 +156,26 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         }
         if (model.steps.isEmpty()) {
             node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none served)")))
+        }
+        return node
+    }
+
+    private fun completionNode(model: TaskTreeModel): DefaultMutableTreeNode {
+        val completion = model.completion
+        val node = DefaultMutableTreeNode(
+            TaskTreeNode.Plain(completionText(completion))
+        )
+        if (completion == null) {
+            node.add(DefaultMutableTreeNode(TaskTreeNode.Plain("(none: plain task, no commit/push/PR steps)")))
+        } else {
+            for (step in completion.steps) {
+                val detail = if (step.detail == null) "" else " - ${step.detail}"
+                node.add(
+                    DefaultMutableTreeNode(
+                        TaskTreeNode.Plain(bound("[${step.status}] ${step.step}$detail", 240))
+                    )
+                )
+            }
         }
         return node
     }
@@ -226,6 +251,34 @@ class TaskTreePanel : JPanel(BorderLayout()) {
         val open = if (spend.openReservedMicro > 0) " openReserved=${spend.openReservedMicro}" else ""
         return "spend (${if (spend.durable) "durable" else "estimate"}): tokens $tokens; cost $cost$open"
     }
+
+    /** One summary line naming what was requested and the status provenance. */
+    private fun completionText(completion: CompletionView?): String {
+        if (completion == null) {
+            return "completion: none (plain task)"
+        }
+        val requested = buildString {
+            if (completion.includeCommit) append("commit")
+            if (completion.includePush) {
+                if (isNotEmpty()) append(",")
+                append("push")
+            }
+            if (completion.includePr) {
+                if (isNotEmpty()) append(",")
+                append("pr")
+            }
+        }.ifEmpty { "none" }
+        val statuses = completion.steps.joinToString(", ") { "${it.step}=${it.status}" }
+        return "completion: $requested [$statuses] source=${completion.source}" +
+            (completion.reason?.let { " ($it)" } ?: "")
+    }
+
+    /** The completion steps as tree rows (status + detail, never fabricated). */
+    fun completionLabels(completion: CompletionView): List<String> =
+        completion.steps.map { step ->
+            val detail = if (step.detail == null) "" else " - ${step.detail}"
+            bound("[${step.status}] ${step.step}$detail", 240)
+        }
 
     /** The label of one child node, surfacing every native field. */
     fun childLabel(child: ChildNode): String {

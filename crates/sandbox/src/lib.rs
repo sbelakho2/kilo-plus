@@ -473,6 +473,7 @@ fn resolve_within(root: &Path, path: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn engine(root: &Path) -> PermissionEngine {
@@ -501,6 +502,7 @@ mod tests {
         assert!(e.is_within_workspace(&root));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_escape_rejected() {
         let (_d, root) = tmp_workspace();
@@ -523,6 +525,7 @@ mod tests {
         assert!(e.is_within_workspace(Path::new("alias.txt")));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlink_loop_terminates() {
         let (_d, root) = tmp_workspace();

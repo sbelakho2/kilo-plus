@@ -20,6 +20,7 @@ import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.JsonValue
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeApiException
+import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeMessage
 import dev.faktor.shared.NativeModelInfo
 import dev.faktor.shared.NativePermissionEntry
@@ -35,6 +36,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.swing.BorderFactory
 import javax.swing.DefaultComboBoxModel
 import javax.swing.JButton
+import javax.swing.JCheckBox
 import javax.swing.JComboBox
 import javax.swing.JFrame
 import javax.swing.JLabel
@@ -107,6 +109,17 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
     private val criteriaField = JTextField(24)
 
     private val attachments = AttachmentsPanel()
+
+    // Task-mode completion contract controls: shown ONLY in the Task tab
+    // (the chat composer never carries a contract). The submitted contract is
+    // tracked so the tree can report durable step provenance.
+    internal val completionCommit = JCheckBox("Commit when verified")
+
+    internal val completionPush = JCheckBox("Push")
+
+    internal val completionPr = JCheckBox("Create PR")
+
+    private var submittedCompletion: NativeCompletionContract? = null
 
     private val startTaskButton = JButton("Start task")
 
@@ -222,6 +235,11 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         form.add(goalField)
         form.add(JLabel("criteria (comma separated, optional)"))
         form.add(criteriaField)
+        val contractBox = JPanel(GridLayout(3, 1, 2, 2))
+        contractBox.add(completionCommit)
+        contractBox.add(completionPush)
+        contractBox.add(completionPr)
+        form.add(titledSection("completion contract (Task mode only)", contractBox))
         form.add(titledSection("attachments (submitted as files)", attachments))
         val startRow = JPanel(FlowLayout(FlowLayout.LEFT))
         startRow.add(startTaskButton)
@@ -307,11 +325,31 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
         return button
     }
 
+    /** The checked Task-mode contract, or null for today's default path. */
+    internal fun completionContractFromControls(): NativeCompletionContract? {
+        if (!completionCommit.isSelected && !completionPush.isSelected && !completionPr.isSelected) {
+            return null
+        }
+        return NativeCompletionContract(
+            includeCommit = completionCommit.isSelected,
+            includePush = completionPush.isSelected,
+            includePr = completionPr.isSelected
+        )
+    }
+
+    /** The completion contract is per task start: reset after a success ack. */
+    private fun resetCompletionControls() {
+        completionCommit.isSelected = false
+        completionPush.isSelected = false
+        completionPr.isSelected = false
+    }
+
     private fun wireActions() {
         startButton.addActionListener { startDaemon() }
         stopButton.addActionListener {
             runAsync("stop daemon") {
                 service.stop()
+                submittedCompletion = null
                 onEdt {
                     setControlsEnabled(false)
                     appendSystem("daemon stopped")
@@ -323,6 +361,7 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 val provider = providerField.text.trim().ifEmpty { "default" }
                 val model = modelField.text.trim().ifEmpty { "default" }
                 val created = service.createSession(provider, model, title = "JetBrains session")
+                submittedCompletion = null
                 onEdt { appendSystem("session ${created.id} created (${created.title})") }
                 service.watchSession(created.id, 0)
                 refreshAllBlocking()
@@ -348,19 +387,30 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
             val files = attachments.files()
+            val contract = completionContractFromControls()
             runAsync("start task") {
                 val started = service.startTaskRun(
                     goal,
                     if (criteria.isEmpty()) null else criteria,
-                    files = if (files.isEmpty()) null else files
+                    files = if (files.isEmpty()) null else files,
+                    completionContract = contract
                 )
+                submittedCompletion = contract
                 onEdt {
+                    val contractText = if (contract == null) {
+                        ""
+                    } else {
+                        " completion=" + contract.requestedSteps().joinToString(",")
+                    }
                     appendSystem(
                         "task run ${started.runId} started (${started.state})" +
-                            if (files.isEmpty()) "" else " with ${files.size} attachment(s)"
+                            if (files.isEmpty()) "" else " with ${files.size} attachment(s)" +
+                            contractText
                     )
+                    resetCompletionControls()
                 }
                 refreshTaskRunsBlocking()
+                refreshTaskTreeBlocking()
             }
         }
         cancelRunButton.addActionListener {
@@ -756,7 +806,9 @@ class FaktorChatPanel(private val service: FaktorFrontendService) :
             taskVerification = taskVerification,
             usage = sessionUsage,
             childUsage = childUsage,
-            tournament = tournament
+            tournament = tournament,
+            submittedCompletion = submittedCompletion,
+            runState = runs.firstOrNull()?.state
         )
         onEdt {
             currentTree = model

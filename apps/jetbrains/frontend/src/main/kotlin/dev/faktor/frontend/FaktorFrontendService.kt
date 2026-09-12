@@ -19,6 +19,7 @@ import dev.faktor.backend.NativeSseEvent
 import dev.faktor.shared.NativeAbortAck
 import dev.faktor.shared.NativeAgent
 import dev.faktor.shared.NativeAgentControlAck
+import dev.faktor.shared.NativeCompletionContract
 import dev.faktor.shared.NativeEvidence
 import dev.faktor.shared.NativeEvidenceRetrieval
 import dev.faktor.shared.NativeHealth
@@ -218,9 +219,11 @@ class FaktorFrontendService(
         maxTokens: Long? = null,
         maxCostMicro: Long? = null,
         mutationMode: String? = null,
-        files: List<String>? = null
+        files: List<String>? = null,
+        completionContract: NativeCompletionContract? = null
     ): NativeTaskRunStarted = clientOrThrow().startTaskRun(
-        requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files
+        requireSession(), goal, criteria, model, maxTokens, maxCostMicro, mutationMode, files,
+        completionContract
     )
 
     fun cancelTaskRun(runId: String): NativeTaskRunCancelled =

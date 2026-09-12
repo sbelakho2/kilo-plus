@@ -171,6 +171,55 @@ export interface BridgeFilesMapping {
   readonly refused: readonly BridgeAttachmentRefusal[];
 }
 
+/** The Task-mode completion contract accepted from the UI (wire snake_case). */
+export interface BridgeCompletionContract {
+  readonly include_commit: boolean;
+  readonly include_push: boolean;
+  readonly include_pr: boolean;
+}
+
+/**
+ * Strict parse of one `sendMessage.completionContract`. Returns `null` for
+ * an absent value or the all-false default (no contract: today's path),
+ * `{ contract }` for a valid non-default contract, or `{ reason }` for a
+ * malformed value — a malformed contract is a LOUD per-message drop, never
+ * a silently contract-free task start (that would claim a workflow the run
+ * never recorded).
+ */
+export function completionContractOf(
+  raw: unknown,
+): { readonly contract: BridgeCompletionContract | null } | { readonly reason: string } {
+  if (raw === undefined || raw === null) {
+    return { contract: null };
+  }
+  if (!isRecord(raw)) {
+    return { reason: 'completionContract must be an object' };
+  }
+  const keys = Object.keys(raw);
+  for (const key of keys) {
+    if (key !== 'include_commit' && key !== 'include_push' && key !== 'include_pr') {
+      return { reason: `completionContract.${key} is not a known member` };
+    }
+  }
+  for (const key of ['include_commit', 'include_push', 'include_pr'] as const) {
+    if (
+      !Object.prototype.hasOwnProperty.call(raw, key) ||
+      typeof raw[key] !== 'boolean'
+    ) {
+      return { reason: `completionContract.${key} must be a boolean` };
+    }
+  }
+  const contract: BridgeCompletionContract = {
+    include_commit: raw.include_commit as boolean,
+    include_push: raw.include_push as boolean,
+    include_pr: raw.include_pr as boolean,
+  };
+  if (!contract.include_commit && !contract.include_push && !contract.include_pr) {
+    return { contract: null };
+  }
+  return { contract };
+}
+
 export type BridgeCommand =
   | { readonly kind: 'ready' }
   | {
@@ -180,6 +229,8 @@ export type BridgeCommand =
       readonly files: readonly string[];
       readonly attachments: readonly BridgeAttachmentRef[];
       readonly refusedAttachments: readonly BridgeAttachmentRefusal[];
+      /** Task-mode completion contract (null = default path). */
+      readonly completionContract: BridgeCompletionContract | null;
     }
   | { readonly kind: 'abort'; readonly sessionId: string }
   | { readonly kind: 'createSession' }
@@ -589,6 +640,13 @@ export function ingestWebviewMessage(
     // workspace-relative daemon paths and/or content-addressed binary refs;
     // malformed entries are refused individually with a reason.
     const mapping = mapKiloFiles(message.files, options.workspaceDirectory ?? null);
+    // The Task-mode completion contract is strict: a malformed contract is
+    // a loud drop (starting the task contract-free would lie about the
+    // requested workflow); absent/all-false is the default path.
+    const completion = completionContractOf(message.completionContract);
+    if ('reason' in completion) {
+      return drop(rawType, completion.reason, bytes);
+    }
     return {
       kind: 'sendMessage',
       text: message.text,
@@ -596,6 +654,7 @@ export function ingestWebviewMessage(
       files: mapping.files,
       attachments: mapping.attachments,
       refusedAttachments: mapping.refused,
+      completionContract: completion.contract,
     };
   }
   if (rawType === 'abort') {
@@ -888,6 +947,9 @@ export function bridgeCommandToHostMessage(command: BridgeCommand): HostChatMess
         ...(command.attachments.length > 0 ? { attachments: command.attachments } : {}),
         ...(command.refusedAttachments.length > 0
           ? { refusedAttachments: command.refusedAttachments }
+          : {}),
+        ...(command.completionContract !== null
+          ? { completionContract: command.completionContract }
           : {}),
       };
     case 'abort':

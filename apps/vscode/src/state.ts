@@ -110,6 +110,34 @@ export interface BudgetSummary {
   readonly openReservedMicro: number;
 }
 
+/** One completion-contract step as the UI renders it. */
+export interface TaskCompletionStepSummary {
+  readonly step: string;
+  readonly status: string;
+  readonly detail: string | null;
+}
+
+/**
+ * The PR/CI-fix completion contract of the active task. `source` names the
+ * provenance of the step rows:
+ *   - `daemon`     — the daemon served the durable per-step rows;
+ *   - `derived`    — projected from the durable task-run state and the
+ *                    submitted contract (pending, or all-succeeded only
+ *                    because the durable gate certified the task);
+ *   - `unavailable`— the contract is known but the serving daemon exposes
+ *                    no per-step read (terminal non-certified run).
+ * Step statuses are NEVER fabricated: a missing read is reported as
+ * unavailable, not as success.
+ */
+export interface TaskCompletionSummary {
+  readonly includeCommit: boolean;
+  readonly includePush: boolean;
+  readonly includePr: boolean;
+  readonly steps: readonly TaskCompletionStepSummary[];
+  readonly source: 'daemon' | 'derived' | 'unavailable';
+  readonly reason: string | null;
+}
+
 export interface TaskSummary {
   readonly goal: string;
   readonly state: string;
@@ -126,6 +154,8 @@ export interface TaskSummary {
   readonly evidenceRefs: readonly string[];
   readonly phase: string | null;
   readonly progress: Json;
+  /** The Task-mode completion contract + its durable step statuses. */
+  readonly completion: TaskCompletionSummary | null;
 }
 
 

@@ -600,6 +600,73 @@ export const bridgeTests = [
     },
   },
   {
+    label: 'completion contract is strict, per-start, and maps onto sendGoal',
+    fn: () => {
+      const valid = ingestWebviewMessage({
+        type: 'sendMessage',
+        text: 'goal',
+        completionContract: { include_commit: true, include_push: false, include_pr: true },
+      });
+      if (isDrop(valid) || valid.kind !== 'sendMessage') {
+        throw new Error(`a valid contract must be accepted: ${JSON.stringify(valid)}`);
+      }
+      if (
+        JSON.stringify(valid.completionContract) !==
+        JSON.stringify({ include_commit: true, include_push: false, include_pr: true })
+      ) {
+        throw new Error(`contract must round-trip: ${JSON.stringify(valid.completionContract)}`);
+      }
+      const host = bridgeCommandToHostMessage(valid);
+      if (
+        JSON.stringify(host) !==
+        JSON.stringify({
+          type: 'sendGoal',
+          goal: 'goal',
+          completionContract: { include_commit: true, include_push: false, include_pr: true },
+        })
+      ) {
+        throw new Error(`completion contract mapping wrong: ${JSON.stringify(host)}`);
+      }
+      // The all-false default never reaches the host (byte-identical path).
+      const allFalse = ingestWebviewMessage({
+        type: 'sendMessage',
+        text: 'goal',
+        completionContract: { include_commit: false, include_push: false, include_pr: false },
+      });
+      if (isDrop(allFalse) || allFalse.completionContract !== null) {
+        throw new Error(`all-false must normalize to null: ${JSON.stringify(allFalse)}`);
+      }
+      if ('completionContract' in bridgeCommandToHostMessage(allFalse)) {
+        throw new Error('all-false must not add a host field');
+      }
+      // Hostile contracts are loud drops, never a silently contract-free task.
+      for (const bad of [
+        'commit',
+        ['include_commit'],
+        {},
+        { include_commit: true },
+        { include_commit: 'yes', include_push: false, include_pr: false },
+        { include_commit: true, include_push: false, include_pr: false, include_release: true },
+      ]) {
+        assertDrop(
+          ingestWebviewMessage({ type: 'sendMessage', text: 'goal', completionContract: bad }),
+          'completionContract',
+          `hostile contract ${JSON.stringify(bad)}`,
+        );
+      }
+      const inherited = Object.create({
+        include_commit: true,
+        include_push: false,
+        include_pr: false,
+      });
+      assertDrop(
+        ingestWebviewMessage({ type: 'sendMessage', text: 'goal', completionContract: inherited }),
+        'completionContract',
+        'inherited-only contract members',
+      );
+    },
+  },
+  {
     label: 'vendored shell mounts the companion overlay only when staged',
     fn: () => {
       const nonce = 'companionnonce';

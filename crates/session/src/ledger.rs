@@ -1946,6 +1946,29 @@ impl SessionHandle {
         })
     }
 
+    /// Typed delegation over [`Self::ledger_blocker_opened`]: the shared
+    /// [`faktor_core::blocker::ChildBlocker`] is validated first (bounded
+    /// text, closed kind) and its stable reason string rides the EXISTING
+    /// `BlockerOpened` payload — same durable row, same fold, no schema
+    /// change (additive compat with the historic string API).
+    pub fn ledger_child_blocker_opened(
+        &self,
+        blocker: &faktor_core::blocker::ChildBlocker,
+    ) -> faktor_core::Result<Option<i64>> {
+        blocker.validate()?;
+        self.ledger_blocker_opened(&blocker.ledger_reason())
+    }
+
+    /// Typed delegation over [`Self::ledger_blocker_resolved`] (same compat
+    /// contract as [`Self::ledger_child_blocker_opened`]).
+    pub fn ledger_child_blocker_resolved(
+        &self,
+        blocker: &faktor_core::blocker::ChildBlocker,
+    ) -> faktor_core::Result<Option<i64>> {
+        blocker.validate()?;
+        self.ledger_blocker_resolved(&blocker.ledger_reason())
+    }
+
     /// Append one `Decision {step, choice, rationale}`.
     pub fn ledger_decision(
         &self,
@@ -3089,6 +3112,60 @@ mod tests {
             head.is_some() && head.unwrap().checkpoint_seq > 0,
             "latest checkpoint head must be present"
         );
+    }
+
+    #[test]
+    fn typed_child_blocker_delegates_to_the_existing_string_payload() {
+        use faktor_core::blocker::{BlockerKind, ChildBlocker, MAX_CHILD_BLOCKER_REASON_CHARS};
+
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let blocker = ChildBlocker::new(
+            BlockerKind::External,
+            "remote deploy is pending",
+            "wait for the upstream deploy, then resume",
+        );
+        // Open through the TYPED delegation: the durable row is still the
+        // historic string `BlockerOpened` payload (additive compat).
+        let seq = s
+            .ledger_child_blocker_opened(&blocker)
+            .unwrap()
+            .expect("typed open writes the string row");
+        assert!(seq > 0);
+        let view = s.ledger_view().unwrap();
+        assert!(view
+            .head
+            .open_blockers
+            .iter()
+            .any(|r| r == &blocker.ledger_reason()));
+        let entries = collect_all(&s);
+        assert!(entries.iter().any(|e| matches!(
+            &e.payload,
+            LedgerPayload::BlockerOpened { reason } if reason == &blocker.reason
+        )));
+        // Re-opening the same typed reason is the idempotent no-op.
+        assert!(s.ledger_child_blocker_opened(&blocker).unwrap().is_none());
+        // A hostile typed blocker is refused by the shared validator BEFORE
+        // any ledger write.
+        let huge = ChildBlocker::new(
+            BlockerKind::Unknown,
+            "x".repeat(MAX_CHILD_BLOCKER_REASON_CHARS + 1),
+            "resolve",
+        );
+        assert!(s.ledger_child_blocker_opened(&huge).is_err());
+        // Resolve through the same typed delegation.
+        s.ledger_child_blocker_resolved(&blocker).unwrap();
+        assert!(!s
+            .ledger_view()
+            .unwrap()
+            .head
+            .open_blockers
+            .iter()
+            .any(|r| r == &blocker.ledger_reason()));
+        assert!(entries.iter().any(|e| matches!(
+            &e.payload,
+            LedgerPayload::BlockerOpened { reason } if reason == &blocker.reason
+        )));
     }
 
     #[test]

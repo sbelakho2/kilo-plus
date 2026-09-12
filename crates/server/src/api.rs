@@ -389,6 +389,14 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             get(native_session_terminal),
         )
         .route("/native/session/{id}/abort", post(native_session_abort))
+        // Native coordination board (additive): one bounded newest-first
+        // page of the path session's run-family board (GET) and one bounded
+        // post AS that session (POST). Strict DTOs; family scoping and
+        // terminal-child refusal stay in the session board authority.
+        .route(
+            "/native/session/{id}/board",
+            get(native_session_board).post(native_session_board_post),
+        )
         .route("/native/orchestrator/graph", get(native_orchestrator_graph))
         // Native agent state + control (audits P0-20/21/23/61): the real
         // child agents of the session's task runs (GET), and first-class
@@ -6614,7 +6622,7 @@ mod tests {
         let mut row: faktor_orchestrator::runtime::ChildRuntime =
             serde_json::from_str(&raw.expect("child-1 registry row")).unwrap();
         row.set_blocker(&faktor_orchestrator::runtime::ChildBlocker {
-            kind: "permission".into(),
+            kind: faktor_orchestrator::runtime::BlockerKind::Permission,
             reason: "waiting for a pending permission decision".into(),
             dependency: None,
             resolution: Some("resolve the pending permission request".into()),
@@ -12048,6 +12056,430 @@ mod tests {
         let _ = handle.shutdown.send(());
     }
 
+    #[tokio::test]
+    async fn native_board_endpoints_are_scoped_strict_and_hostile_inputs_are_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let manager = deps.session.clone();
+        let ws = manager.create_workspace("/tmp").unwrap();
+        let root = manager
+            .create_session(ws, "board-root", "fake", "m")
+            .unwrap();
+        let child = manager
+            .create_child_session(
+                root.id(),
+                ws,
+                faktor_core::id::WorktreeId::new(1),
+                faktor_core::id::TaskId::new(1),
+                "fake",
+                "m",
+                "board-child",
+                faktor_session::child::ChildOwnership::ReadOnlyShared,
+            )
+            .unwrap();
+        // A second family: its board must never leak into the first's.
+        let foreign = manager
+            .create_session(ws, "foreign-root", "fake", "m")
+            .unwrap();
+        let root_post = root.board_post("root post", "root body", &[]).unwrap();
+        let child_post = child.board_post("child post", "child body", &[]).unwrap();
+        foreign
+            .board_post("foreign post", "foreign body", &[])
+            .unwrap();
+        let pw = deps.server_password.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base = format!("http://{}", handle.addr);
+        let client = reqwest::Client::new();
+        let get = |path: &str, auth: Option<&str>| {
+            let mut rb = client.get(format!("{base}{path}"));
+            if let Some(pw) = auth {
+                rb = rb.header("x-faktor-server-password", pw);
+            }
+            rb.send()
+        };
+        let post = |path: &str, body: serde_json::Value| {
+            client
+                .post(format!("{base}{path}"))
+                .header("x-faktor-server-password", pw.as_str())
+                .json(&body)
+                .send()
+        };
+
+        // Auth is required for both verbs.
+        assert_eq!(
+            get(&format!("/native/session/{}/board", root.id().raw()), None)
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+
+        // The root reads its family board: both posts, newest first, and the
+        // board identity is the family root — there is no board-id input to
+        // forge.
+        let resp = get(
+            &format!("/native/session/{}/board", root.id().raw()),
+            Some(pw.as_str()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200);
+        let page: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(page["board_id"], root.id().raw());
+        assert_eq!(page["revision"], child_post.revision);
+        assert_eq!(page["posts"].as_array().unwrap().len(), 2);
+        assert_eq!(page["posts"][0]["id"], child_post.id.raw());
+        assert_eq!(page["posts"][1]["id"], root_post.id.raw());
+        assert_eq!(page["posts"][0]["author_session"], child.id().raw());
+        assert_eq!(page["has_more"], false);
+        assert!(page["next_before_revision"].is_null());
+
+        // The child reads the SAME family board (its own member view).
+        let resp = get(
+            &format!("/native/session/{}/board", child.id().raw()),
+            Some(pw.as_str()),
+        )
+        .await
+        .unwrap();
+        let child_page: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(child_page["board_id"], root.id().raw());
+        assert_eq!(child_page["posts"].as_array().unwrap().len(), 2);
+
+        // The foreign family sees ONLY its own single-post board: knowing the
+        // first family's session ids grants no board access.
+        let resp = get(
+            &format!("/native/session/{}/board", foreign.id().raw()),
+            Some(pw.as_str()),
+        )
+        .await
+        .unwrap();
+        let foreign_page: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(foreign_page["board_id"], foreign.id().raw());
+        assert_eq!(foreign_page["posts"].as_array().unwrap().len(), 1);
+        assert_eq!(foreign_page["posts"][0]["subject"], "foreign post");
+
+        // Cursor paging: limit=1 yields the newest post + the exclusive
+        // older cursor; `since` then returns the older page.
+        let resp = get(
+            &format!("/native/session/{}/board?limit=1", root.id().raw()),
+            Some(pw.as_str()),
+        )
+        .await
+        .unwrap();
+        let first: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(first["posts"].as_array().unwrap().len(), 1);
+        assert_eq!(first["posts"][0]["id"], child_post.id.raw());
+        assert_eq!(first["has_more"], true);
+        let cursor = first["next_before_revision"].as_u64().unwrap();
+        let resp = get(
+            &format!(
+                "/native/session/{}/board?since={cursor}&limit=1",
+                root.id().raw()
+            ),
+            Some(pw.as_str()),
+        )
+        .await
+        .unwrap();
+        let second: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(second["posts"].as_array().unwrap().len(), 1);
+        assert_eq!(second["posts"][0]["id"], root_post.id.raw());
+
+        // Hostile/malformed queries are typed 400s, never a silent default.
+        for query in [
+            "?since=0",
+            "?limit=0",
+            "?limit=101",
+            "?limit=abc",
+            "?since=-1",
+            "?bogus=1",
+            "?since=1&limit=1&bogus=1",
+        ] {
+            let resp = get(
+                &format!("/native/session/{}/board{query}", root.id().raw()),
+                Some(pw.as_str()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), 400, "{query}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "malformed", "{query}");
+        }
+
+        // Session path hostility: malformed id 400, unknown id 404 (no
+        // phantom empty board for a session that does not exist).
+        for (path, status) in [
+            ("/native/session/nope/board", 400),
+            ("/native/session/0/board", 400),
+            ("/native/session/999999/board", 404),
+        ] {
+            assert_eq!(
+                get(path, Some(pw.as_str())).await.unwrap().status(),
+                status,
+                "{path}"
+            );
+        }
+
+        // Hostile bodies: strict DTOs and the session bounds both hold.
+        for (body, status) in [
+            (
+                serde_json::json!({"subject": "s", "body": "b", "extra": 1}),
+                400,
+            ),
+            (serde_json::json!({"subject": "s"}), 400),
+            (serde_json::json!({"subject": "", "body": "b"}), 400),
+            (
+                serde_json::json!({"subject": "x".repeat(513), "body": "b"}),
+                413,
+            ),
+            (
+                serde_json::json!({"subject": "s", "body": "x".repeat(16 * 1024 + 1)}),
+                413,
+            ),
+            (
+                serde_json::json!({"subject": "s", "body": "b", "refs": "nope"}),
+                400,
+            ),
+        ] {
+            let resp = post(
+                &format!("/native/session/{}/board", root.id().raw()),
+                body.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), status, "{body}");
+        }
+
+        // A valid post is durable and immediately visible as the newest row.
+        let resp = post(
+            &format!("/native/session/{}/board", child.id().raw()),
+            serde_json::json!({"subject": "native post", "body": "from the child", "refs": ["evidence://1"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 201);
+        let created: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(created["author_session"], child.id().raw());
+        assert_eq!(created["subject"], "native post");
+        let resp = get(
+            &format!("/native/session/{}/board?limit=1", root.id().raw()),
+            Some(pw.as_str()),
+        )
+        .await
+        .unwrap();
+        let newest: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            newest["posts"][0]["id"].as_u64().unwrap(),
+            created["id"].as_u64().unwrap()
+        );
+
+        // A terminal child cannot post: the session-layer lifecycle rule
+        // refuses BEFORE any durable write (typed 403).
+        child
+            .orchestrator_child_runtime_put(&faktor_session::child::ChildRuntimeBlockerRow {
+                child_id: "board-child".into(),
+                state: "cancelled".into(),
+                blocker: None,
+                updated_ms: 1,
+            })
+            .unwrap();
+        let before = child.board_read_posts(None, None, 10, false).unwrap();
+        let resp = post(
+            &format!("/native/session/{}/board", child.id().raw()),
+            serde_json::json!({"subject": "late", "body": "should refuse"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 403);
+        let after = child.board_read_posts(None, None, 10, false).unwrap();
+        assert_eq!(
+            before.posts.len(),
+            after.posts.len(),
+            "a refused terminal post writes nothing"
+        );
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_budget_ack_failure_is_typed_retriable_and_never_claimed_applied() {
+        // ACK == durable at the wire: an authoritative control-ack failure
+        // must surface as a typed RETRIABLE failure (503 persistence_failed),
+        // never a silent 200 applied:false and never a permanent 500 — and
+        // the child mirror must not claim the change.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let orch = deps.orchestrator.clone();
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base = format!("http://{}", handle.addr);
+        let (_parent, owner, isolated) = orch_owner_env(&manager, dir.path());
+        let config = faktor_orchestrator::runtime::ExecConfig {
+            run_id: "run-ack-wire".into(),
+            ceilings: faktor_orchestrator::runtime::Ceilings::default(),
+            parent_caps: read_workspace_caps(),
+            provider: "fake".into(),
+            default_model: "m".into(),
+            isolated_root: isolated.clone(),
+            crash_seam: Some(faktor_orchestrator::runtime::CrashSeam::BeforeDrive),
+        };
+        let res = orch
+            .execute_task(
+                analysis_plan(&["a"]),
+                owner,
+                config,
+                &[read_child_spec("a")],
+            )
+            .await
+            .expect_err("the seam must fire");
+        assert!(
+            matches!(
+                res,
+                faktor_orchestrator::runtime::ExecError::InjectedCrashSeam(_)
+            ),
+            "{res:?}"
+        );
+        // The control-row ACK (an UPDATE of the orchestrator_ctl fact) fails
+        // while its INSERT succeeds.
+        manager
+            .store()
+            .sql_execute(
+                "CREATE TRIGGER fail_ctl_ack BEFORE UPDATE ON memory_fact \
+                 WHEN NEW.kind = 'orchestrator_ctl' \
+                 BEGIN SELECT RAISE(ABORT, 'injected ack failure'); END;",
+            )
+            .unwrap();
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/native/agents/child-0/budget"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"max_tokens": 5_000}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503, "a failed ack is a retriable failure");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "persistence_failed");
+        assert_eq!(body["error"]["retryable"], true);
+        // Nothing claimed applied: the mirror keeps the pre-change budget and
+        // the durable control row is still pending.
+        let child = orch.child("child-0").unwrap().unwrap();
+        assert_ne!(child.budget_max_tokens, Some(5_000));
+        let child_session = manager
+            .get_session(SessionId::new(child.session_id))
+            .unwrap()
+            .unwrap();
+        let pending = child_session.orchestrator_ctl_pending().unwrap();
+        assert!(
+            pending.iter().any(|r| matches!(
+                r.control,
+                faktor_session::child::ChildControl::ChangeBudget { max_tokens: 5_000 }
+            )),
+            "the failed change left its durable row unapplied"
+        );
+        // Remove the seam: the retried call is idempotent and reports applied.
+        manager
+            .store()
+            .sql_execute("DROP TRIGGER fail_ctl_ack;")
+            .unwrap();
+        let resp = client
+            .post(format!("{base}/native/agents/child-0/budget"))
+            .bearer_auth(token.as_str())
+            .json(&serde_json::json!({"max_tokens": 5_000}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ack: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(ack["applied"], true);
+        let _ = handle.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_child_payload_projects_the_durable_execution_phase() {
+        // The coarse durable drive phase is an additive projection: it rides
+        // both native child payloads (the agents listing and the graph) and
+        // is read from the child's durable drive-state row — lifecycle
+        // untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let deps = test_deps(dir.path());
+        let orch = deps.orchestrator.clone();
+        let token = deps.auth_token.clone();
+        let manager = deps.session.clone();
+        let handle = serve(deps, 0).await.unwrap();
+        let base = format!("http://{}", handle.addr);
+        let (parent, owner, isolated) = orch_owner_env(&manager, dir.path());
+        let config = faktor_orchestrator::runtime::ExecConfig {
+            run_id: "run-phase".into(),
+            ceilings: faktor_orchestrator::runtime::Ceilings::default(),
+            parent_caps: read_workspace_caps(),
+            provider: "fake".into(),
+            default_model: "m".into(),
+            isolated_root: isolated.clone(),
+            crash_seam: Some(faktor_orchestrator::runtime::CrashSeam::BeforeDrive),
+        };
+        let res = orch
+            .execute_task(
+                analysis_plan(&["a"]),
+                owner,
+                config,
+                &[read_child_spec("a")],
+            )
+            .await
+            .expect_err("the seam must fire");
+        assert!(
+            matches!(
+                res,
+                faktor_orchestrator::runtime::ExecError::InjectedCrashSeam(_)
+            ),
+            "{res:?}"
+        );
+        let child = orch.child("child-0").unwrap().unwrap();
+        let child_session = manager
+            .get_session(SessionId::new(child.session_id))
+            .unwrap()
+            .unwrap();
+        let state_before = child_session.state().unwrap();
+        child_session
+            .set_execution_phase(faktor_core::blocker::ExecutionPhase::Coding)
+            .unwrap();
+        assert_eq!(
+            child_session.state().unwrap(),
+            state_before,
+            "phase writes never move lifecycle"
+        );
+        // Agents listing.
+        let agents = get_agents(
+            &base,
+            token.as_str(),
+            &format!("/native/agents?session={parent}"),
+        )
+        .await;
+        let entry = agents
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["agent_id"] == "child-0")
+            .expect("child listed");
+        assert_eq!(entry["execution_phase"], "coding");
+        // Graph payload carries the same derived phase.
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/native/orchestrator/graph?session={parent}"))
+            .bearer_auth(token.as_str())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let graph: serde_json::Value = resp.json().await.unwrap();
+        let graph_child = graph["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["child_id"] == "child-0")
+            .expect("graph child listed");
+        assert_eq!(graph_child["execution_phase"], "coding");
+        let _ = handle.shutdown.send(());
+    }
+
     // ------------------------------------------------ split invariants
 
     #[test]
@@ -12055,12 +12487,13 @@ mod tests {
         // Dependency direction (audits 81-83): the native layer never
         // imports the v7.5.6 compatibility DTOs or the compat module; the
         // compat layer may import native's shared glue.
-        let sources: [(&str, &str); 11] = [
+        let sources: [(&str, &str); 12] = [
             ("native/mod.rs", include_str!("native/mod.rs")),
             ("native/prompt.rs", include_str!("native/prompt.rs")),
             ("native/session.rs", include_str!("native/session.rs")),
             ("native/task.rs", include_str!("native/task.rs")),
             ("native/agents.rs", include_str!("native/agents.rs")),
+            ("native/board.rs", include_str!("native/board.rs")),
             ("native/evidence.rs", include_str!("native/evidence.rs")),
             (
                 "native/verification.rs",

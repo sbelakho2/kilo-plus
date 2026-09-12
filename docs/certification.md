@@ -96,7 +96,9 @@ CI (`.github/workflows/ci.yml` and `nightly.yml`) runs exactly these lanes:
 | --- | --- | --- |
 | `pr-lane` | ubuntu | fmt; clippy `--all-features` `-D warnings`; tests `--all-features`; `cargo doc`; branding scan; docs-sync guard; VS Code extension build; JetBrains `compile-and-smoke.sh` |
 | `linux` / `macos` | ubuntu / macos | fmt; check; tests; clippy `-D warnings`; `doctor` smoke |
-| `windows` | windows | `cargo check --workspace`; tests for the process-tree and platform crates (unix-only tests are `cfg(unix)`-gated) |
+| `windows` | windows | `cargo check --workspace`; workspace tests INCLUDING faktor-agent, faktor-verify, faktor-sandbox, faktor-index, faktor-cas and faktor-snapshot (unix-only tests are `cfg(unix)`-gated); only faktor-cli, faktor-hooks, faktor-tests-coding-benchmark, faktor-tests-fuzz-seeds and faktor-tests-performance stay excluded for documented unix-only symbols/scripts |
+| `vscode-visual-render` | ubuntu | REQUIRED render gate: playwright + chromium installed explicitly, then fails unless `dist/visual-report.json` records `render.status == "passed"` (a skip is not a pass) |
+| `vscode-visual-with-skip` | ubuntu | diagnostics twin: offline structural/manifest gate + render attempt; records an explicit skip when chromium cannot be installed (never required) |
 | `fuzz-suite` | ubuntu | protocol/provider stream codecs |
 | `perf` | ubuntu | release `[perf]` gates |
 | `nightly: fault` | ubuntu | `[fault]` campaign + `doctor --deep` on a clean data dir |
@@ -118,8 +120,12 @@ release it must be run and recorded separately.
   webview bundle is **vendored** (`ui/kilo-v756-webview`, hashed by
   `ui/upstream.json`) and built (`dist/webview.js` + `dist/webview.css`),
   with the visual gate baseline recorded
-  (`dist/visual-baseline.json`). End-to-end screenshot parity against a
-  real IDE remains a CI-only lane.
+  (`dist/visual-baseline.json`). The `vscode-visual-render` lane installs
+  playwright + chromium explicitly and is required to record
+  `render.status == "passed"` for the built bundle; the
+  `vscode-visual-with-skip` twin is diagnostics only. A real-IDE screenshot
+  comparison against a launched VS Code remains a host/CI capability not
+  claimed by the offline certificate.
 - **JetBrains** (`apps/jetbrains`): `bash apps/jetbrains/compile-and-smoke.sh`
   green (`:shared` + `:backend` + `:frontend` Swing panel, real kotlinc,
   real daemon: v7.5.6 wire smoke plus native-protocol fake-server unit
@@ -132,9 +138,11 @@ release it must be run and recorded separately.
   Status: **native bridge
   IMPLEMENTED** — daemon lifecycle, protected-channel bearer auth, HTTP +
   SSE cursor-resume clients, and routing for task-runs, agents, usage,
-  verification and evidence. The upstream 7.1.2 UI sources are still not
-  vendored, so `jetbrains_frontend` is **PARTIAL** (Kotlin scaffold +
-  daemon smoke) and 7.1.2 UI parity remains **BLOCKED_EXTERNAL**. Only the
+  verification and evidence; the Faktor-owned Swing frontend renders the
+  task tree, blockers, tournament, evidence navigator and the Task-mode
+  completion-contract controls. The upstream 7.1.2 UI sources are still not
+  vendored, so `jetbrains_frontend` is **PARTIAL** (Faktor frontend + daemon
+  smoke) and 7.1.2 UI parity remains **BLOCKED_EXTERNAL**. Only the
   2024.1.7 distribution was verified; `until-build` stays unbounded, so
   newer-platform compatibility is not claimed.
 
@@ -324,7 +332,7 @@ update this table in the same commit.
 | `vscode_native_client` | IMPLEMENTED | `apps/vscode/src/nativeClient.ts` + `apps/vscode/scripts/selftest.mjs` |
 | `vscode_webview` | IMPLEMENTED | `apps/vscode/src/webview.ts` + pinned `ui/kilo-v756-webview/dist` bundle (`webview.js`, `webview.css`) + `dist/visual-baseline.json` |
 | `jetbrains_native_bridge` | IMPLEMENTED | `NativeClient.kt`, `NativeEventStream.kt`, `apps/jetbrains/compile-and-smoke.sh` |
-| `jetbrains_frontend` | PARTIAL | Kotlin scaffold (`FaktorChatPanel.kt`, `plugin.xml`, `build.gradle.kts`); upstream 7.1.2 UI not vendored |
+| `jetbrains_frontend` | PARTIAL | Faktor-owned Swing frontend (`FaktorChatPanel.kt`, `TaskTreePanel.kt`, `plugin.xml`, `build.gradle.kts`); upstream 7.1.2 UI not vendored |
 | `compat_v756` | IMPLEMENTED | `compat/kilo-v756` golden fixtures + `tests/compat` |
 | `ui_parity` | PARTIAL | vendored v7.5.6 webview + visual baseline; JetBrains 7.1.2 sources absent |
 | `acp_subset` | IMPLEMENTED | `crates/acp` + `tests/acp-official` official-client interop |
@@ -351,17 +359,17 @@ profile).
 | Installable artifacts (host) | daemon tar.gz + VSIX + JetBrains zip + `artifacts.json` | `full` profile (`scripts/package-artifacts.sh`, §2.9) | CERTIFIED per full run (recorded skips with exact errors when a tool/registry is absent) |
 | Installation matrix (host) | clean-prefix extract + `doctor`; VSIX/zip structure + entry points | `full` profile (`node scripts/install-matrix.mjs` → `install-matrix.json`, §2.9) | CERTIFIED per full run |
 | IDE-launched install | `code --install-extension` / JetBrains sandbox install | requires an IDE host; CI `pr-lane` owns it | NOT RUN HERE (residual, recorded in `install-matrix.json`) |
-| Windows lane | check + process-tree crate tests | CI `windows` job | CI-LANE |
+| Windows lane | check + workspace tests incl. agent/verify/sandbox/index/cas/snapshot | CI `windows` job | CI-LANE |
 | Linux lane | fmt/check/test/clippy/doctor | CI `linux` job | CI-LANE |
 | VS Code shell build | `npm ci && npm run build` + wire harness | CI `pr-lane` | CI-LANE (shell IMPLEMENTED) |
-| VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` / CI visual lane; §2.10 | PARTIAL (vendored, hashed and baselined; real-IDE screenshot parity stays CI-only) |
+| VS Code vendored webview | pinned v7.5.6 tree `ui/kilo-v756-webview` + `ui/upstream.json` hashes + built dist + visual baseline | `node scripts/webview-visual-check.mjs` + required CI `vscode-visual-render` lane (chromium render must pass); §2.10 | PARTIAL (vendored, hashed and render-gated; real-IDE screenshot parity stays a host/CI capability not claimed offline) |
 | JetBrains bridge | kotlinc `compile-and-smoke.sh` (wire + native smokes); Gradle plugin build + verifier vs IC-2024.1.7 | CI `pr-lane` / local script; §3.2 | CI-LANE (native bridge IMPLEMENTED; plugin verifier PASS locally 2026-09-10) |
 | JetBrains 7.1.2 UI parity | frozen 7.1.2 sources | not vendored | BLOCKED_EXTERNAL |
 | Compat fixtures v756 | golden suite + fixtures | `tests/compat` | CI-LANE / fast tests |
 | Compat fixtures jetbrains-712 | reserved corpus | absent (`false` in manifest) | BLOCKED_EXTERNAL |
 | Fuzz harnesses | seeded pseudo-fuzz | CI `fuzz-suite` / manual | CI-LANE |
 | Real-time soak (12–24h) | wall-clock soak | self-hosted hook (disabled by default) | NOT RUN HERE |
-| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate | gate + durable rows landed (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree (§3.3) | IMPLEMENTED (gate; step EXECUTION is a follow-up) |
+| PR/CI-fix completion contract | native DTO `completion_contract` + `CompletionContractSet`/`CompletionStepStatus` ledger rows + `VerifiedComplete` gate + ordered step executor | gate + durable rows + `crates/orchestrator/src/completion_steps.rs` runner (`crates/session/src/task.rs`, `crates/session/src/ledger.rs`, `crates/orchestrator/src/task_executor.rs`, `crates/agent/src/runtime.rs`); adversarial gate/step tests in-tree; Task-mode controls in both IDEs (§3.3) | IMPLEMENTED (gate + ordered/idempotent commit/push/PR execution) |
 | Coordination board | durable ledger rows (`board_post`/`board_read`/`board_receipt`/`board_reset`), CAS reset, scoped reads, board tools | `crates/session/src/board.rs` + `crates/session/src/ledger.rs`; base tests | IMPLEMENTED (fast tests green) |
 | Multi-candidate tournament | N = 2..=4 identical-criteria candidates, deterministic winner ordering, durable decide, loser cleanup | `crates/orchestrator/src/tournament.rs` + `crates/orchestrator/src/task_executor.rs`; native start/state/list endpoints | IMPLEMENTED (fast tests green; integration stays the explicit approved-merge path) |
 | Pixel agents | deterministic per-ChildId avatars (VS Code + JetBrains, identical FNV-1a hashes) | `apps/vscode/src/pixelAgents.ts`, `apps/jetbrains/frontend/src/main/kotlin/dev/faktor/frontend/PixelAgents.kt` | IMPLEMENTED (UI layers; daemon exposes the durable child ids/state they render) |
@@ -408,7 +416,7 @@ release certificate):
 - `bash apps/jetbrains/compile-and-smoke.sh` → exit 0, `SMOKE PASS` plus
   `NATIVE SMOKE PASS`.
 
-### 3.3 PR/CI-fix completion contract (gate IMPLEMENTED; step EXECUTION follow-up)
+### 3.3 PR/CI-fix completion contract (gate + ordered step execution IMPLEMENTED)
 
 The reviewed P2 item asks for a first-class PR/CI-fix completion contract so a
 native task can declare:
@@ -417,10 +425,12 @@ native task can declare:
 "completion_contract": { "include_commit": true, "include_push": true, "include_pr": true }
 ```
 
-Normative semantics (recorded so the follow-up cannot drift):
+Normative semantics (recorded so behavior cannot drift):
 
 - The native task-run start DTO parses `completion_contract` strictly (typed
-  400 on unknown fields or non-boolean members; never a silent default).
+  400 on unknown fields or non-boolean members; never a silent default). A
+  non-default contract requires an explicit work item: the plain-prompt path
+  refuses it with a typed 400 instead of dropping the contract.
 - The accepted contract is recorded durably as the typed ledger entry
   `CompletionContractSet` before the run is driven; the completion gate reads
   the durable record, never the request.
@@ -428,9 +438,18 @@ Normative semantics (recorded so the follow-up cannot drift):
   the completion path refuses `VerifiedComplete` with a typed error while any
   requested step has no succeeding durable step-status row. A missing row is
   "not done", never "probably fine".
+- `crates/orchestrator/src/completion_steps.rs` executes the requested steps
+  in gate order once the drive settles: commit (clean tree => honest
+  `Skipped` "nothing to commit"; unborn HEAD => `Skipped`), push (no remote
+  => `Skipped`; egress policy denial => typed refusal), then PR (executed
+  ONLY when the daemon has a configured `pr_command`; strict argv template
+  with no shell, `{branch}` required; unconfigured => `Skipped`). Success is
+  idempotent per `(task, revision)`, a failure stops everything after it and
+  records the remaining requested steps `Skipped` ("not attempted"), and
+  every outcome is written through the durable
+  `SessionHandle::set_completion_step_status` seam before the run settles.
 
-Status in this change: **the gate and its durable rows are IMPLEMENTED**;
-automatic step *execution* remains the follow-up.
+Implementation map:
 
 - DTO + strict validation: `crates/server/src/native/task.rs`
   (`StartTaskRunRequest::completion_contract`, `deny_unknown_fields`; a
@@ -453,23 +472,42 @@ automatic step *execution* remains the follow-up.
   producer (`crates/agent/src/runtime.rs`) surfaces that refusal.
 - Executor seam: `crates/orchestrator/src/task_executor.rs`
   (`TaskRunRequest.completion_contract`, `record_completion_contract`
-  recorded BEFORE the first model call).
+  recorded BEFORE the first model call; `run_completion_steps` drives the
+  runner after the shadow/in-session drive settles and before
+  `complete_verified_task`).
+
+Task-mode IDE controls (both IDEs):
+
+- VS Code: the built-in Task composer shows the Commit/Push/Create-PR
+  checkboxes and posts a strict `completionContract`; the host builds the
+  explicit `main` Implementation work item plus `completion_contract` in
+  `apps/vscode/src/taskStart.ts` and forwards composer `files`; the
+  `faktor.newTask` command offers the same multi-select for the vendored UI
+  path; the bridge accepts the contract only as three exact booleans (a
+  malformed contract is a loud drop, never a silently contract-free start)
+  and the cockpit/task card renders the step rows with their provenance.
+- JetBrains: the Task tab owns the same three checkboxes; the request
+  builder emits the explicit work item plus contract; the task tree renders
+  the contract and its step statuses.
+- Neither client fabricates statuses. When a daemon serves the additive
+  `completion` block on the task view the rows are `source=daemon`; without
+  it the block is derived from the DURABLE task-run state (pending, or
+  all-succeeded only because the durable gate certified the task) and a
+  terminal non-certified run is reported `unavailable` with its reason. The
+  exact per-step read remains an additive native surface; a missing read is
+  never rendered as success.
 
 Adversarial coverage in-tree: non-succeeded step refuses `VerifiedComplete`
 and succeeded steps do not gate (`crates/session/src/task.rs`), contract
 default parity is byte-identical and the immutable-per-revision Conflict is
 enforced (`crates/orchestrator/src/task_executor.rs`
-`completion_contract_executor_tests`), and the agent path refuses the
-verified completion until the step succeeds
-(`crates/agent/src/runtime.rs`
-`completion_contract_gate_refuses_verified_complete_until_step_succeeds`).
-
-The remaining follow-up is step EXECUTION only: this tree has no automatic
-commit/push/PR runner, so a requested step's outcome is recorded through
-`set_completion_step_status` by the caller/operator (or a future step
-executor). Until that lands, a requested-but-unrecorded step correctly blocks
-`VerifiedComplete` with a typed refusal — a missing row is never treated as
-done.
+`completion_contract_executor_tests`), the agent path refuses the verified
+completion until the step succeeds (`crates/agent/src/runtime.rs`
+`completion_contract_gate_refuses_verified_complete_until_step_succeeds`),
+the runner's ordering/idempotency/clean-tree/skipped-after-failure paths are
+covered in `crates/orchestrator/src/completion_steps.rs`, and the IDE
+surfaces are adversarially tested in `apps/vscode/scripts/selftest.mjs` +
+`scripts/bridge-selftest.mjs` and `FrontendSmoke.kt`.
 
 ---
 

@@ -14,6 +14,7 @@
 //! - sandbox capabilities and permission decisions
 //! - model capabilities (provider behavior lives here, not in the agent)
 
+pub mod blocker;
 pub mod cancellation;
 pub mod capability;
 pub mod command;
@@ -29,6 +30,11 @@ pub mod retry;
 pub mod state;
 pub mod time;
 
+pub use blocker::{
+    child_lifecycle_tag_is_known, validate_child_runtime_state, BlockerKind, ChildBlocker,
+    ExecutionPhase, CHILD_LIFECYCLE_TAGS, MAX_CHILD_BLOCKER_DEPENDENCY_CHARS,
+    MAX_CHILD_BLOCKER_REASON_CHARS, MAX_CHILD_BLOCKER_RESOLUTION_CHARS,
+};
 pub use cancellation::CancellationToken;
 pub use capability::{
     Capability, CapabilityKind, CapabilitySet, NetworkPolicy, PermissionDecision,

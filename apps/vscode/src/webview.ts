@@ -343,6 +343,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <h2>Task</h2>
     <div class="task-head"><span id="task-state" class="badge">—</span><button id="btn-cancel-run" type="button">Cancel run</button></div>
     <div id="task-goal" class="goal"></div>
+    <div id="task-completion" class="completion"></div>
     <div id="cockpit" class="cockpit"></div>
   </section>
   <section id="agents-card" class="card" hidden>
@@ -356,6 +357,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <section id="notices" aria-live="polite"></section>
   <form id="composer">
     <textarea id="goal" rows="3" placeholder="Describe the goal. It starts a task run."></textarea>
+    <fieldset id="completion-contract" class="completion-contract">
+      <legend>Task completion contract (Task mode; never sent by plain chat)</legend>
+      <label><input type="checkbox" id="contract-commit" /> Commit when verified</label>
+      <label><input type="checkbox" id="contract-push" /> Push</label>
+      <label><input type="checkbox" id="contract-pr" /> Create PR</label>
+    </fieldset>
     <div class="composer-actions">
       <button id="btn-send" type="submit">Run task</button>
       <button id="btn-new-task" type="button">New task…</button>

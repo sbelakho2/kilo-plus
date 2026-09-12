@@ -97,6 +97,24 @@ export interface CockpitView {
   readonly evidence: readonly CockpitEvidenceRef[];
   readonly spend: CockpitSpendView | null;
   readonly tournament: CockpitTournamentView | null;
+  /** The Task-mode completion contract + durable step statuses (null when
+   * the run carries no contract). Provenance is explicit (`daemon`,
+   * `derived` or `unavailable`) and never fabricated. */
+  readonly completion: CockpitCompletionView | null;
+}
+
+/** The completion-contract block as the cockpit renders it. */
+export interface CockpitCompletionView {
+  readonly includeCommit: boolean;
+  readonly includePush: boolean;
+  readonly includePr: boolean;
+  readonly steps: readonly {
+    readonly step: string;
+    readonly status: string;
+    readonly detail: string | null;
+  }[];
+  readonly source: string;
+  readonly reason: string | null;
 }
 
 /** One state-gated control a cockpit section renders. */
@@ -448,6 +466,7 @@ export function buildCockpit(input: CockpitInput): CockpitView | null {
     evidence,
     spend,
     tournament,
+    completion: task?.completion ?? null,
   };
 }
 
@@ -476,6 +495,35 @@ export function cockpitSections(view: CockpitView): CockpitSection[] {
             return `[${step.status}] ${step.id}: ${step.summary}${deps}${kids}`;
           })
         : ['none'],
+    evidence: [],
+  });
+  sections.push({
+    key: 'completion',
+    title: 'Completion contract',
+    present: view.completion !== null,
+    lines:
+      view.completion === null
+        ? ['none (plain task; no conditional commit/push/PR steps)']
+        : [
+            `requested: ${
+              [
+                view.completion.includeCommit ? 'commit' : null,
+                view.completion.includePush ? 'push' : null,
+                view.completion.includePr ? 'pr' : null,
+              ]
+                .filter((step): step is string => step !== null)
+                .join(', ') || 'none'
+            }`,
+            ...view.completion.steps.map(
+              (step) =>
+                `[${step.status}] ${step.step}${
+                  step.detail !== null && step.detail.length > 0 ? ` — ${step.detail}` : ''
+                }`,
+            ),
+            `status source: ${view.completion.source}${
+              view.completion.reason !== null ? ` (${view.completion.reason})` : ''
+            }`,
+          ],
     evidence: [],
   });
   sections.push({

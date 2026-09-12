@@ -581,6 +581,7 @@ mod tests {
             updated_ms: 1,
             base_snapshot_id: None,
             env_snapshot_id: None,
+            execution_phase: ExecutionPhase::default(),
         }
     }
 
@@ -708,42 +709,56 @@ mod tests {
 
 #[cfg(test)]
 mod blocker_tests {
-    use crate::runtime::{ChildBlocker, ExecError, MAX_CHILD_BLOCKER_REASON_CHARS};
+    use crate::runtime::{BlockerKind, ChildBlocker, MAX_CHILD_BLOCKER_REASON_CHARS};
 
     #[test]
     fn child_blocker_validate_rejects_hostile_text_with_typed_errors() {
+        // The kind vocabulary is a closed enum: the remaining hostile surface
+        // is the bounded text/negative stamps, and they stay typed.
         let huge = ChildBlocker {
-            kind: "budget".into(),
+            kind: BlockerKind::Budget,
             reason: "x".repeat(MAX_CHILD_BLOCKER_REASON_CHARS + 1),
             dependency: None,
             resolution: None,
             last_progress_ms: None,
         };
-        assert!(matches!(huge.validate(), Err(ExecError::Oversized(_))));
+        assert_eq!(
+            huge.validate().unwrap_err().kind,
+            faktor_core::ErrorKind::Oversized
+        );
         let blank = ChildBlocker {
-            kind: "  ".into(),
-            reason: "r".into(),
+            kind: BlockerKind::Permission,
+            reason: "  ".into(),
             dependency: None,
             resolution: None,
             last_progress_ms: None,
         };
-        assert!(matches!(blank.validate(), Err(ExecError::Malformed(_))));
+        assert_eq!(
+            blank.validate().unwrap_err().kind,
+            faktor_core::ErrorKind::Malformed
+        );
         let control = ChildBlocker {
-            kind: "permission".into(),
+            kind: BlockerKind::Permission,
             reason: "bad\u{0}text".into(),
             dependency: None,
             resolution: None,
             last_progress_ms: None,
         };
-        assert!(matches!(control.validate(), Err(ExecError::Malformed(_))));
+        assert_eq!(
+            control.validate().unwrap_err().kind,
+            faktor_core::ErrorKind::Malformed
+        );
         let negative = ChildBlocker {
-            kind: "dependency".into(),
+            kind: BlockerKind::Dependency,
             reason: "waiting".into(),
             dependency: Some("a".into()),
             resolution: Some("wait".into()),
             last_progress_ms: Some(-1),
         };
-        assert!(matches!(negative.validate(), Err(ExecError::Malformed(_))));
+        assert_eq!(
+            negative.validate().unwrap_err().kind,
+            faktor_core::ErrorKind::Malformed
+        );
         let ok = ChildBlocker::dependency("a", "waiting on work item \"a\"", "wait");
         assert!(ok.validate().is_ok());
     }

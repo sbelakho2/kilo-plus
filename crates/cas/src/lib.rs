@@ -1238,6 +1238,7 @@ mod tests {
     /// paths re-hash the content unconditionally and fail loudly — a
     /// recovery/snapshot path that relied on the cache would restore wrong
     /// content; the strict split makes that impossible.
+    #[cfg(unix)]
     #[test]
     fn has_cached_verified_is_advisory_verify_now_never_trusts_the_window() {
         let (_d, cas) = tmp_cas();

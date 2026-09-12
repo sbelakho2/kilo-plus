@@ -1175,6 +1175,7 @@ mod tests {
     /// past the 900 ms deadline) is killed by the supervisor deadline, no
     /// orphan survives (unix process-group probe), and the fallback
     /// evidence is returned.
+    #[cfg(unix)]
     #[test]
     fn slow_rg_is_killed_by_the_supervisor_deadline_and_leaves_no_orphan() {
         let _serial = TEST_SERIAL.lock().unwrap();
