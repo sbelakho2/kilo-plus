@@ -1498,6 +1498,40 @@ struct MessageRowLike {
     data: serde_json::Value,
 }
 
+/// Pure host-side grammar for a durable postcondition's workspace-relative
+/// path (write recovery): the value must be relative on EVERY host dialect.
+/// Absolute forms are refused exactly like Unix `/x` — Windows drive-letter
+/// (`C:\x`, `C:/x`, drive-relative `C:x`), UNC/device (`\\server\share`,
+/// `//server/share`, `\\?\...`, `\x`) — together with `..` traversal
+/// components and NUL bytes. Platform-independent (the separators are
+/// unified for classification), so the Windows shapes are refused on Unix
+/// hosts too and stay pinned by the Unix CI lanes. `None` = safe.
+fn workspace_relative_path_rejection(rel: &str) -> Option<&'static str> {
+    if rel.is_empty() {
+        return Some("empty path");
+    }
+    if rel.contains('\0') {
+        return Some("NUL byte");
+    }
+    // Classify on the unified spelling: a Windows absolute form must be
+    // rejected even where `Path::is_absolute` cannot see one.
+    let unified = rel.replace('\\', "/");
+    if unified.starts_with('/') {
+        return Some("absolute path (rooted, UNC or device form)");
+    }
+    let bytes = unified.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some("absolute path (drive-letter prefix)");
+    }
+    if std::path::Path::new(&unified)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Some("path traversal (..)");
+    }
+    None
+}
+
 impl AgentRuntime {
     pub fn new(deps: AgentDeps) -> faktor_core::Result<Arc<Self>> {
         if deps.model.is_empty() {
@@ -3044,7 +3078,17 @@ impl AgentRuntime {
             .open(pc.workspace_id, root)
             .map_err(|e| Error::malformed(format!("tool recovery workspace open: {e}")))?;
         // Traversal/symlink-unsafe relative paths are REJECTED loudly here —
-        // recovery never touches a file outside the workspace root.
+        // recovery never touches a file outside the workspace root. The
+        // host-side grammar runs FIRST: absolute Windows shapes (drive
+        // letters, UNC/device prefixes) are refused on every platform,
+        // exactly like Unix-absolute paths — the platform resolver must
+        // never be the only gate.
+        if let Some(reason) = workspace_relative_path_rejection(&pc.relative_path) {
+            return Err(Error::permission(format!(
+                "tool recovery path {:?} rejected: {reason}",
+                pc.relative_path
+            )));
+        }
         let resolved = ws
             .resolve(std::path::Path::new(&pc.relative_path))
             .map_err(|e| {
@@ -22371,6 +22415,28 @@ mod tests {
             })
             .unwrap();
             handle.record_tool_postcondition(evil_op, &pc).unwrap();
+            // (ii-b) A Windows-absolute postcondition (drive-letter, forward
+            // slash) is refused by the host-side grammar on EVERY platform:
+            // `Path::is_absolute` cannot see it on Unix, and the platform
+            // resolver must never be the only gate.
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            let win_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({"path": "C:/escape.txt", "content": "pwn"}),
+                "call_win",
+                meta,
+            );
+            let pc = serde_json::to_value(FilePostcondition {
+                workspace_id: ws_id,
+                worktree_id: WorktreeId::new(1),
+                relative_path: "C:/escape.txt".into(),
+                expected_hash: FileHash::from([0u8; 32]),
+            })
+            .unwrap();
+            handle.record_tool_postcondition(win_op, &pc).unwrap();
             // (iii) A symlink escape is rejected the same way (canonical
             // resolution through the workspace service).
             #[cfg(unix)]
@@ -22434,7 +22500,121 @@ mod tests {
             "the in-workspace write verified before the rejection"
         );
         let pending = handle2.pending_tool_runs().unwrap();
-        assert_eq!(pending.len(), 2, "hostile rows stay pending: {pending:?}");
+        // Traversal + windows-absolute on every host; the unix-only symlink
+        // escape adds the third. (The Windows lane saw only 1 of 2 hostile
+        // rows because the absolute shape was unix-gated: the windows shape
+        // is now cross-platform.)
+        let expected_hostile = if cfg!(unix) { 3 } else { 2 };
+        assert_eq!(
+            pending.len(),
+            expected_hostile,
+            "hostile rows stay pending: {pending:?}"
+        );
+    }
+
+    /// The host-side grammar refuses Windows-absolute shapes on EVERY host:
+    /// on Unix a literal `C:` directory under the workspace root makes the
+    /// filesystem resolver ACCEPT `C:/escape.txt` (it is just a relative
+    /// name there), so only the grammar can refuse it — exactly the shape
+    /// the durable recovery path must never hash into a completion.
+    #[tokio::test]
+    async fn workspace_write_recovery_rejects_windows_absolute_postconditions() {
+        let dir = fresh_store_dir();
+        let session: SessionId;
+        let root: std::path::PathBuf;
+        {
+            let (manager, wid, sid, root_path) = workspace_env(&dir);
+            session = sid;
+            root = root_path;
+            let handle = manager.get_session(session).unwrap().unwrap();
+            let receipt = handle.submit_prompt("write", &[]).unwrap();
+            chain_to_streaming(&handle, receipt.op_id);
+            // The decoy: a literal `C:` directory under the root. With a
+            // resolver-only implementation the row would verifiably COMPLETE
+            // against this file on Unix; the host grammar must refuse first.
+            #[cfg(not(windows))]
+            {
+                let decoy = root.join("C:");
+                std::fs::create_dir_all(&decoy).unwrap();
+                std::fs::write(decoy.join("escape.txt"), b"pwn").unwrap();
+            }
+            let meta = op_meta(&manager, session, RecoveryStrategy::MarkUnknown);
+            let win_op = meta.operation_id;
+            crash_tool_start(
+                &handle,
+                receipt.op_id,
+                "write_file",
+                serde_json::json!({"path": "C:/escape.txt", "content": "pwn"}),
+                "call_win",
+                meta,
+            );
+            let pc = serde_json::to_value(FilePostcondition {
+                workspace_id: wid,
+                worktree_id: WorktreeId::new(1),
+                relative_path: "C:/escape.txt".into(),
+                expected_hash: FileHash::from(blake3::hash(b"pwn").into()),
+            })
+            .unwrap();
+            handle.record_tool_postcondition(win_op, &pc).unwrap();
+        }
+        let (deps2, _keep2) = reopen_runtime(&dir, Arc::new(scripted_provider(vec![])), vec![]);
+        let runtime2 = AgentRuntime::new(deps2).unwrap();
+        let err = runtime2.recover().unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::Permission,
+            "a windows-absolute postcondition must be rejected loudly: {err}"
+        );
+        // The row stays running (visible), never silently completed.
+        let handle2 = runtime2
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle2.pending_tool_runs().unwrap().len(), 1);
+        // The decoy is untouched: recovery never hashed or wrote through it.
+        #[cfg(not(windows))]
+        assert_eq!(
+            std::fs::read(root.join("C:").join("escape.txt")).unwrap(),
+            b"pwn"
+        );
+    }
+
+    /// Every Windows-absolute dialect is refused by the pure host-side
+    /// grammar, which is compiled and asserted on every platform (darwin CI
+    /// included); ordinary relative names stay accepted.
+    #[test]
+    fn workspace_relative_path_grammar_rejects_windows_absolute_shapes() {
+        for hostile in [
+            r"C:\escape.txt",
+            "C:/escape.txt",
+            "c:/escape.txt",
+            r"c:\escape.txt",
+            "C:escape.txt",
+            r"\\server\share\escape.txt",
+            "//server/share/escape.txt",
+            r"\escape.txt",
+            "/escape.txt",
+            r"\\?\C:\escape.txt",
+            r"\\.\C:\escape.txt",
+            "../escape.txt",
+            "sub/../../escape.txt",
+            "a\\..\\b.txt",
+            "x\0y",
+        ] {
+            assert!(
+                workspace_relative_path_rejection(hostile).is_some(),
+                "{hostile:?} must be rejected"
+            );
+        }
+        for safe in ["./a.txt", "a.txt", "sub/dir/a.txt", "..hidden"] {
+            assert!(
+                workspace_relative_path_rejection(safe).is_none(),
+                "{safe:?} must stay accepted: {:?}",
+                workspace_relative_path_rejection(safe)
+            );
+        }
     }
 
     // ---- completion review (audit round 14: independent skepticism) ----

@@ -61,6 +61,15 @@ pub enum PushOutcome {
 /// (the 15 s bound stays for local git ops).
 const GIT_NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Deterministic committer identity for [`WorktreeManager::commit_all`]:
+/// the commit runs with `-c user.name=... -c user.email=...`, so a
+/// completion commit NEVER consults (or depends on) the host's global or
+/// system identity — a CI runner or fresh machine with no `user.name`/
+/// `user.email` configured still produces the same author/committer
+/// instead of failing with "author identity unknown".
+pub const COMMIT_IDENTITY_NAME: &str = "Faktor";
+pub const COMMIT_IDENTITY_EMAIL: &str = "faktor@faktor.local";
+
 /// Durable worktree metadata (spec §33): git knows nothing about session
 /// ownership, so the manager records it next to the repository's own
 /// bookkeeping (inside `.git/` — never user-visible, gitignored by
@@ -687,7 +696,10 @@ impl WorktreeManager {
     /// Stage every change in `repo` and commit it on the current branch.
     /// Truthful outcomes only: a clean tree is [`CommitOutcome::NothingToCommit`]
     /// and an unborn HEAD is [`CommitOutcome::EmptyRepository`] — an empty
-    /// commit is NEVER minted by this path.
+    /// commit is NEVER minted by this path. The commit always carries the
+    /// deterministic [`COMMIT_IDENTITY_NAME`]/[`COMMIT_IDENTITY_EMAIL`]
+    /// identity (`git -c ...`), so it never depends on the host's global
+    /// git identity.
     pub async fn commit_all(
         &self,
         repo: &Path,
@@ -709,6 +721,10 @@ impl WorktreeManager {
         self.git_mutate_os(
             repo,
             &[
+                OsString::from("-c"),
+                OsString::from(format!("user.name={COMMIT_IDENTITY_NAME}")),
+                OsString::from("-c"),
+                OsString::from(format!("user.email={COMMIT_IDENTITY_EMAIL}")),
                 OsString::from("commit"),
                 OsString::from("-m"),
                 OsString::from(message),
@@ -1886,22 +1902,9 @@ mod tests {
             PathBuf,
         ) {
             let (dir, sup, mgr, repo) = fixture().await;
-            // Pin a local identity so `commit_all` (which never invents one)
-            // succeeds in the fixture repo.
-            mgr.git_mutate(
-                &repo,
-                &["config", "user.email", "test@kilo.local"],
-                ProcessOwner::Daemon,
-            )
-            .await
-            .unwrap();
-            mgr.git_mutate(
-                &repo,
-                &["config", "user.name", "Kilo Test"],
-                ProcessOwner::Daemon,
-            )
-            .await
-            .unwrap();
+            // NO local/global git identity is pinned: `commit_all` passes
+            // its deterministic `-c user.name/-c user.email` identity, so a
+            // host with no configured identity (CI) still commits.
             let bare = dir.path().join("remote.git");
             mgr.git_mutate(
                 dir.path(),
@@ -1959,6 +1962,31 @@ mod tests {
                     .is_none(),
                 "an initial commit must never be minted"
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn commit_all_carries_the_deterministic_identity() {
+            // The repo carries NO identity at all (bare_fixture pins none):
+            // the commit must succeed AND record exactly the helper's
+            // deterministic `-c` author/committer — never a global one.
+            let (_d, _sup, mgr, repo, _bare) = bare_fixture().await;
+            std::fs::write(repo.join("ident.txt"), "x\n").unwrap();
+            let _ = mgr
+                .commit_all(&repo, "faktor: identity", ProcessOwner::Daemon)
+                .await
+                .unwrap();
+            let out = mgr
+                .git_read(
+                    &repo,
+                    &["log", "-1", "--pretty=format:%an <%ae>|%cn <%ce>"],
+                    ProcessOwner::Daemon,
+                )
+                .await
+                .unwrap();
+            let expected = format!(
+                "{COMMIT_IDENTITY_NAME} <{COMMIT_IDENTITY_EMAIL}>|{COMMIT_IDENTITY_NAME} <{COMMIT_IDENTITY_EMAIL}>"
+            );
+            assert_eq!(out.trim(), expected);
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

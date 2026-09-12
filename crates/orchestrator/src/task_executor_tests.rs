@@ -3661,13 +3661,31 @@ fn cs_git(cwd: &std::path::Path, args: &[&str]) {
     );
 }
 
+/// Commit with the SAME deterministic `-c user.name/-c user.email` identity
+/// the product's commit helper passes (faktor-git's `COMMIT_IDENTITY_*`):
+/// fixture commits never depend on a local/global git identity, so a CI
+/// runner with none still produces a real `git rev-parse HEAD` sha.
+fn cs_commit(cwd: &std::path::Path, message: &str) {
+    cs_git(
+        cwd,
+        &[
+            "-c",
+            &format!("user.name={}", faktor_git::COMMIT_IDENTITY_NAME),
+            "-c",
+            &format!("user.email={}", faktor_git::COMMIT_IDENTITY_EMAIL),
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ],
+    );
+}
+
 fn cs_seed_repo(root: &std::path::Path) {
     cs_git(root, &["init", "-q", "-b", "main"]);
-    cs_git(root, &["config", "user.email", "test@kilo.local"]);
-    cs_git(root, &["config", "user.name", "Kilo Test"]);
     std::fs::write(root.join("README.md"), "base\n").unwrap();
     cs_git(root, &["add", "-A"]);
-    cs_git(root, &["commit", "-q", "-m", "init"]);
+    cs_commit(root, "init");
 }
 
 /// Adversarial executor-level cover of the additive invocation: an
@@ -4186,10 +4204,7 @@ async fn settle_run_converges_after_the_commit_status_write_seam() {
     // durable status row landed.
     std::fs::write(env.owner_root.join("feature.txt"), "content\n").unwrap();
     cs_git(&env.owner_root, &["add", "-A"]);
-    cs_git(
-        &env.owner_root,
-        &["commit", "-q", "-m", &commit_message(goal)],
-    );
+    cs_commit(&env.owner_root, &commit_message(goal));
     let head = cs_head(&env.owner_root);
     assert!(h
         .ledger_completion_step_statuses(task_id.raw(), contract_rev.raw())
@@ -4275,10 +4290,7 @@ async fn settle_run_converges_after_the_push_status_write_seam() {
     // The crash window: commit + push landed externally, no status row.
     std::fs::write(env.owner_root.join("feature.txt"), "content\n").unwrap();
     cs_git(&env.owner_root, &["add", "-A"]);
-    cs_git(
-        &env.owner_root,
-        &["commit", "-q", "-m", &commit_message(goal)],
-    );
+    cs_commit(&env.owner_root, &commit_message(goal));
     cs_git(&env.owner_root, &["push", "-q", "-u", "origin", "main"]);
     let remote_head = cs_head(&remote);
     assert_eq!(remote_head, cs_head(&env.owner_root));
@@ -4551,11 +4563,9 @@ async fn orchestrated_contract_settles_only_after_succeeded_commit_and_never_com
     for row in &child_rows {
         let root = child_root(&env.manager, row);
         cs_git(&root, &["init", "-q", "-b", "main"]);
-        cs_git(&root, &["config", "user.email", "test@kilo.local"]);
-        cs_git(&root, &["config", "user.name", "Kilo Test"]);
         std::fs::write(root.join("candidate.txt"), "candidate\n").unwrap();
         cs_git(&root, &["add", "-A"]);
-        cs_git(&root, &["commit", "-q", "-m", "candidate work"]);
+        cs_commit(&root, "candidate work");
         let head = cs_head(&root);
         let porcelain = cs_porcelain(&root);
         spies.push((root, head, porcelain));

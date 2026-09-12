@@ -306,10 +306,13 @@ object TaskTree {
             )
         }
         val contract = submitted?.takeIf { !it.isDefault } ?: return null
-        val state = (runState ?: task?.state ?: "").lowercase()
+        // Case-insensitive state match without String.lowercase()/toLowerCase():
+        // both spellings are unusable across the supported kotlinc range
+        // (1.3 has no lowercase(); >= 1.5 errors on toLowerCase()).
+        val state = runState ?: task?.state ?: ""
         val requested = contract.requestedSteps()
-        return when (state) {
-            "done" -> CompletionView(
+        return when {
+            state.equals("done", ignoreCase = true) -> CompletionView(
                 includeCommit = contract.includeCommit,
                 includePush = contract.includePush,
                 includePr = contract.includePr,
@@ -323,7 +326,8 @@ object TaskTree {
                 source = "derived",
                 reason = null
             )
-            "failed", "cancelled" -> CompletionView(
+            state.equals("failed", ignoreCase = true) ||
+                state.equals("cancelled", ignoreCase = true) -> CompletionView(
                 includeCommit = contract.includeCommit,
                 includePush = contract.includePush,
                 includePr = contract.includePr,
