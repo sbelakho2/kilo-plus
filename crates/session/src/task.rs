@@ -59,6 +59,7 @@
 //! [`faktor_core::Error`], so `?` interop with core-`Result` callers is
 //! unchanged.
 
+use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
 };
@@ -927,6 +928,34 @@ pub enum TaskError {
     },
     #[error("completion accounting failed for task {task_id}: {detail} (nothing was transitioned; the task STAYS Verifying)")]
     AccountingFailure { task_id: TaskId, detail: String },
+    #[error("completion contract refused for task {task_id} revision {revision}: step {step:?} has no durable status row; missing is NOT done, and the task STAYS Verifying (record the step outcome via set_completion_step_status and retry completion)")]
+    CompletionStepMissing {
+        task_id: TaskId,
+        revision: TaskRevision,
+        step: CompletionStep,
+    },
+    #[error("completion contract refused for task {task_id} revision {revision}: step {step:?} is {status:?} ({detail}); only a Succeeded step satisfies the contract and the task STAYS Verifying")]
+    CompletionStepNotSucceeded {
+        task_id: TaskId,
+        revision: TaskRevision,
+        step: CompletionStep,
+        status: CompletionStepOutcome,
+        detail: String,
+    },
+    #[error("completion contract TERMINALLY refused for task {task_id} revision {revision}: step {step:?} FAILED ({detail}); a failed step can never certify under its contract revision")]
+    CompletionStepFailed {
+        task_id: TaskId,
+        revision: TaskRevision,
+        step: CompletionStep,
+        detail: String,
+    },
+    #[error("completion contract for task {task_id} revision {revision} is already recorded; a contract is immutable per task revision")]
+    CompletionContractImmutable {
+        task_id: TaskId,
+        revision: TaskRevision,
+    },
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("the mutating run left task {task_id}'s change budget: {violations:?}")]
     ChangeBudgetRefused {
         task_id: TaskId,
@@ -961,6 +990,32 @@ impl From<TaskError> for SessionError {
 impl From<TaskError> for faktor_core::Error {
     fn from(e: TaskError) -> Self {
         SessionError::from(e).into()
+    }
+}
+
+/// The outcome of the durable PR/CI-fix completion-contract gate.
+/// `Refused` carries the typed refusal (the task stays Verifying); `Err`
+/// from [`SessionHandle::completion_contract_gate`] is reserved for
+/// store/decode failures, which are corruption and never a semantic
+/// refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionContractGate {
+    /// No contract, a default contract, or every requested step carries a
+    /// durable `Succeeded` status row.
+    Satisfied,
+    /// A requested step is not done; the payload names the first unmet
+    /// step in gate order.
+    Refused(TaskError),
+}
+
+/// Map a ledger/store failure into the typed task error space (the gate
+/// helpers never hide a corrupt row behind a semantic refusal).
+fn task_error_from_core(e: faktor_core::Error) -> TaskError {
+    match e.kind {
+        faktor_core::ErrorKind::Malformed => TaskError::Malformed(e.message),
+        faktor_core::ErrorKind::Oversized => TaskError::Oversized(e.message),
+        faktor_core::ErrorKind::Conflict => TaskError::Conflict(e.message),
+        _ => TaskError::Store(e.message),
     }
 }
 
@@ -1245,6 +1300,14 @@ impl SessionHandle {
         if crash == Some(CompletionCrashPoint::AfterProofLoad) {
             return Ok(None);
         }
+        // ---- step 1b: the durable PR/CI-fix completion-contract gate
+        // (P2). Every requested commit/push/PR step of the run's accepted
+        // contract must carry a durable Succeeded step-status row; a missing
+        // or non-Succeeded step refuses here, BEFORE any monetary step, and
+        // the row stays Verifying. A Failed step is a terminal refusal.
+        if let CompletionContractGate::Refused(err) = self.completion_contract_gate(task_id)? {
+            return Err(err);
+        }
         // ---- step 2: accounting-before-completion (sync, idempotent).
         // A seam inside the pass stops the whole sequence there.
         if self.run_completion_accounting(task_id, crash)? {
@@ -1340,6 +1403,191 @@ impl SessionHandle {
                 },
             }),
         }
+    }
+
+    // ------------------------------------------- completion contract (P2)
+
+    /// Record the accepted PR/CI-fix completion contract of ONE task run at
+    /// `revision` (the task row's revision when the run started). Immutable
+    /// per task revision: a second set for the same `(task_id, revision)` is
+    /// a typed [`TaskError::CompletionContractImmutable`]. The task row must
+    /// exist; an all-false contract is refused (it is the default behavior,
+    /// expressed by the absence of a row). Record-first: callers append this
+    /// BEFORE the run's first model call.
+    pub fn set_completion_contract(
+        &self,
+        task_id: TaskId,
+        revision: TaskRevision,
+        contract: CompletionContract,
+    ) -> Result<Option<i64>, TaskError> {
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        if contract.is_default() {
+            return Err(TaskError::Malformed(
+                "an all-false completion contract is the default behavior; no row is recorded"
+                    .into(),
+            ));
+        }
+        let row = self
+            .manager
+            .store()
+            .get_task(self.id, task_id)?
+            .ok_or(TaskError::NotFound(task_id))?;
+        if row.revision != revision {
+            // The contract names the run's START revision; a stale or
+            // fabricated revision would record a contract the completion
+            // gate could never match to a real run.
+            return Err(TaskError::RevisionMismatch {
+                task_id,
+                expected: revision,
+                actual: row.revision,
+            });
+        }
+        match self.ledger_completion_contract_set(task_id.raw(), revision.raw(), &contract) {
+            Ok(seq) => Ok(seq),
+            Err(e) if e.kind == faktor_core::ErrorKind::Conflict => {
+                Err(TaskError::CompletionContractImmutable { task_id, revision })
+            }
+            Err(e) => Err(task_error_from_core(e)),
+        }
+    }
+
+    /// The task's ACCEPTED completion contract (the newest durable set row)
+    /// and the task revision it was recorded against; `None` when the task
+    /// never carried a non-default contract.
+    pub fn completion_contract(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<(TaskRevision, CompletionContract)>, TaskError> {
+        let row = self
+            .ledger_completion_contract(task_id.raw())
+            .map_err(task_error_from_core)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let revision = TaskRevision::try_from(row.revision).map_err(|e| {
+            TaskError::Malformed(format!(
+                "stored completion contract revision {} is invalid: {e}",
+                row.revision
+            ))
+        })?;
+        Ok(Some((revision, row.contract)))
+    }
+
+    /// Record one per-step outcome of the task's accepted run (the step
+    /// executor's durable seam, follow-up machinery). The row lands against
+    /// the contract's run revision so the gate can evaluate it after the
+    /// task row itself has moved revisions. A step outcome for a task with
+    /// no accepted contract is refused; a `Failed` row is a terminal gate
+    /// refusal.
+    ///
+    /// NOTE (P2 follow-up): commit/push/PR step EXECUTION does not exist in
+    /// this tree yet. Callers/tests record the outcomes through THIS setter;
+    /// the completion gate is what this change lands.
+    pub fn set_completion_step_status(
+        &self,
+        task_id: TaskId,
+        step: CompletionStep,
+        status: CompletionStepOutcome,
+        detail: &str,
+    ) -> Result<i64, TaskError> {
+        if task_id.raw() == 0 {
+            return Err(TaskError::Malformed("task_id must be non-zero".into()));
+        }
+        let Some((revision, _contract)) = self.completion_contract(task_id)? else {
+            return Err(TaskError::Malformed(format!(
+                "task {task_id} has no accepted completion contract; step outcomes need a contract revision"
+            )));
+        };
+        let seq = self
+            .ledger_completion_step_status(
+                task_id.raw(),
+                revision.raw(),
+                step,
+                status,
+                detail,
+                self.now_ms(),
+            )
+            .map_err(task_error_from_core)?
+            .ok_or_else(|| {
+                TaskError::Malformed("completion step status append returned no seq".into())
+            })?;
+        Ok(seq)
+    }
+
+    /// The durable completion-contract gate: loads the task's accepted
+    /// contract and requires, for every requested step in gate order
+    /// (commit, push, pr), a durable `Succeeded` step-status row at the
+    /// contract's revision. Missing or non-Succeeded steps are typed
+    /// refusals naming the unmet step; a `Failed` row is a terminal
+    /// refusal. With no contract (or the default) the gate is satisfied and
+    /// reads nothing further: the default completion path is byte-identical.
+    pub fn completion_contract_gate(
+        &self,
+        task_id: TaskId,
+    ) -> Result<CompletionContractGate, TaskError> {
+        let Some(row) = self
+            .ledger_completion_contract(task_id.raw())
+            .map_err(task_error_from_core)?
+        else {
+            return Ok(CompletionContractGate::Satisfied);
+        };
+        if row.contract.is_default() {
+            return Ok(CompletionContractGate::Satisfied);
+        }
+        let revision = TaskRevision::try_from(row.revision).map_err(|e| {
+            TaskError::Malformed(format!(
+                "stored completion contract revision {} is invalid: {e}",
+                row.revision
+            ))
+        })?;
+        let rows = self
+            .ledger_completion_step_statuses(task_id.raw(), row.revision)
+            .map_err(task_error_from_core)?;
+        for step in row.contract.requested_steps() {
+            let step_rows: Vec<&crate::ledger::CompletionStepStatusRow> =
+                rows.iter().filter(|r| r.step == step).collect();
+            if let Some(failed) = step_rows
+                .iter()
+                .find(|r| r.status == CompletionStepOutcome::Failed)
+            {
+                // A failed step is terminal: even a later Succeeded row
+                // cannot resurrect the run's contract revision.
+                return Ok(CompletionContractGate::Refused(
+                    TaskError::CompletionStepFailed {
+                        task_id,
+                        revision,
+                        step,
+                        detail: failed.detail.clone(),
+                    },
+                ));
+            }
+            match step_rows.last() {
+                Some(latest) if latest.status == CompletionStepOutcome::Succeeded => {}
+                Some(latest) => {
+                    return Ok(CompletionContractGate::Refused(
+                        TaskError::CompletionStepNotSucceeded {
+                            task_id,
+                            revision,
+                            step,
+                            status: latest.status,
+                            detail: latest.detail.clone(),
+                        },
+                    ))
+                }
+                None => {
+                    return Ok(CompletionContractGate::Refused(
+                        TaskError::CompletionStepMissing {
+                            task_id,
+                            revision,
+                            step,
+                        },
+                    ))
+                }
+            }
+        }
+        Ok(CompletionContractGate::Satisfied)
     }
 
     /// Read-only mirror of the store completion transaction's proof checks
@@ -4353,5 +4601,423 @@ mod tests {
             digest,
             "the candidate reference is immutable across completion"
         );
+    }
+
+    // ------------------------------------------------ completion contract (P2)
+
+    fn push_contract() -> CompletionContract {
+        CompletionContract {
+            include_commit: false,
+            include_push: true,
+            include_pr: false,
+        }
+    }
+
+    /// Default contract parity: no durable rows, no new gate, the completion
+    /// path behaves exactly as before and `VerifiedComplete` lands.
+    #[test]
+    fn default_contract_completion_is_byte_identical_and_writes_no_rows() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        let rec = passed_record(&s, tid, &["c1".into()]);
+        assert_eq!(
+            s.completion_contract_gate(tid).unwrap(),
+            CompletionContractGate::Satisfied,
+            "no contract means the gate reads nothing"
+        );
+        // An explicit all-false contract is never recorded.
+        let err = s
+            .set_completion_contract(tid, rev, CompletionContract::default())
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Malformed(_)), "{err:?}");
+        // A step status without any accepted contract is refused.
+        let err = s
+            .set_completion_step_status(
+                tid,
+                CompletionStep::Push,
+                CompletionStepOutcome::Succeeded,
+                "no run recorded this contract",
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Malformed(_)), "{err:?}");
+        let done = s.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+        // The default completion path wrote ZERO completion rows.
+        assert!(s.ledger_completion_contract(tid.raw()).unwrap().is_none());
+        assert!(s
+            .ledger_completion_step_statuses(tid.raw(), rev.raw())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A requested step without a Succeeded row refuses with the step named
+    /// and the task stays Verifying; recording Succeeded afterwards lets a
+    /// later completion pass converge.
+    #[test]
+    fn missing_requested_step_refuses_then_completes_after_status_lands() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        // The contract is recorded against the run's start revision; the
+        // task row then moves revisions through the machine.
+        let contract_rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, contract_rev, push_contract())
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        assert_ne!(rev, contract_rev);
+        let rec = passed_record(&s, tid, &["c1".into()]);
+        let refusal = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        match &refusal {
+            TaskError::CompletionStepMissing {
+                task_id,
+                revision,
+                step,
+            } => {
+                assert_eq!(*task_id, tid);
+                assert_eq!(*revision, contract_rev);
+                assert_eq!(*step, CompletionStep::Push);
+            }
+            other => panic!("expected a missing-step refusal, got {other:?}"),
+        }
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "a refused gate never moves the row"
+        );
+        // Record the durable success; the SAME revision/record now completes.
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Succeeded,
+            "pushed to origin/main",
+        )
+        .unwrap();
+        let done = s.complete_verified_task(tid, rev, rec).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+    }
+
+    /// A Failed step is terminal for its contract revision: even a later
+    /// Succeeded row cannot resurrect it, and the row stays Verifying.
+    #[test]
+    fn failed_step_is_a_terminal_refusal() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let contract_rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, contract_rev, push_contract())
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        let rec = passed_record(&s, tid, &["c1".into()]);
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Failed,
+            "remote rejected the push (non-fast-forward)",
+        )
+        .unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        assert_eq!(
+            err,
+            TaskError::CompletionStepFailed {
+                task_id: tid,
+                revision: contract_rev,
+                step: CompletionStep::Push,
+                detail: "remote rejected the push (non-fast-forward)".into(),
+            }
+        );
+        assert_eq!(
+            faktor_core::Error::from(err.clone()).kind,
+            ErrorKind::Conflict
+        );
+        // A later Succeeded row does not resurrect the failed run.
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Succeeded,
+            "retry succeeded",
+        )
+        .unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        assert!(matches!(
+            err,
+            TaskError::CompletionStepFailed {
+                step: CompletionStep::Push,
+                ..
+            }
+        ));
+        assert_eq!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::Verifying
+        );
+    }
+
+    /// Skipped is non-Succeeded: the refusal is typed, names the step and
+    /// stays retryable (unlike Failed).
+    #[test]
+    fn skipped_step_refuses_typed_and_stays_retryable() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let contract_rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, contract_rev, push_contract())
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        let rec = passed_record(&s, tid, &["c1".into()]);
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Skipped,
+            "no remote configured",
+        )
+        .unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        match err {
+            TaskError::CompletionStepNotSucceeded { step, status, .. } => {
+                assert_eq!(step, CompletionStep::Push);
+                assert_eq!(status, CompletionStepOutcome::Skipped);
+            }
+            other => panic!("expected a non-succeeded refusal, got {other:?}"),
+        }
+        // The same refusal is terminal only for Failed; a Succeeded row can
+        // still converge a Skipped step.
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Succeeded,
+            "remote configured and pushed",
+        )
+        .unwrap();
+        s.complete_verified_task(tid, rev, rec).unwrap();
+    }
+
+    /// Gate order: commit is satisfied, push is missing — the refusal names
+    /// push, never commit.
+    #[test]
+    fn multi_step_gate_names_the_first_missing_step_in_order() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let contract_rev = s.task_revision(tid).unwrap();
+        let contract = CompletionContract {
+            include_commit: true,
+            include_push: true,
+            include_pr: true,
+        };
+        s.set_completion_contract(tid, contract_rev, contract)
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        let rec = passed_record(&s, tid, &["c1".into()]);
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Commit,
+            CompletionStepOutcome::Succeeded,
+            "committed 0123abc",
+        )
+        .unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        match err {
+            TaskError::CompletionStepMissing { step, .. } => {
+                assert_eq!(step, CompletionStep::Push, "commit was satisfied")
+            }
+            other => panic!("expected a missing push refusal, got {other:?}"),
+        }
+        // Push now succeeds; the third requested step (pr) is the next
+        // named refusal, proving the gate walks commit → push → pr.
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Succeeded,
+            "pushed 0123abc",
+        )
+        .unwrap();
+        let err = s.complete_verified_task(tid, rev, rec).unwrap_err();
+        match err {
+            TaskError::CompletionStepMissing { step, .. } => {
+                assert_eq!(step, CompletionStep::Pr, "commit and push were satisfied")
+            }
+            other => panic!("expected a missing pr refusal, got {other:?}"),
+        }
+        // The final step lands and the claim certifies.
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Pr,
+            CompletionStepOutcome::Succeeded,
+            "opened PR #12",
+        )
+        .unwrap();
+        s.complete_verified_task(tid, rev, rec).unwrap();
+    }
+
+    /// Contract immutability at the task surface: a second set for the same
+    /// revision is the typed Conflict refusal (never a silent overwrite).
+    #[test]
+    fn completion_contract_is_immutable_per_revision() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, rev, push_contract())
+            .unwrap();
+        let replacement = CompletionContract {
+            include_commit: true,
+            include_push: false,
+            include_pr: false,
+        };
+        let err = s
+            .set_completion_contract(tid, rev, replacement)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            TaskError::CompletionContractImmutable {
+                task_id: tid,
+                revision: rev
+            }
+        );
+        assert_eq!(faktor_core::Error::from(err).kind, ErrorKind::Conflict);
+        // The accepted contract is unchanged.
+        assert_eq!(
+            s.completion_contract(tid).unwrap(),
+            Some((rev, push_contract()))
+        );
+        // A stale/fabricated revision never records a contract: the run's
+        // start revision is the task row's current revision.
+        let err = s
+            .set_completion_contract(tid, rev.checked_next().unwrap(), replacement)
+            .unwrap_err();
+        assert!(matches!(err, TaskError::RevisionMismatch { .. }), "{err:?}");
+        assert_eq!(
+            s.completion_contract(tid).unwrap(),
+            Some((rev, push_contract()))
+        );
+        // A contract for a task that does not exist is refused.
+        let err = s
+            .set_completion_contract(TaskId::new(999), rev, push_contract())
+            .unwrap_err();
+        assert_eq!(err, TaskError::NotFound(TaskId::new(999)));
+    }
+
+    /// The contract and its step rows are pinned across compaction, and a
+    /// reopened session re-evaluates the gate to the same verdict.
+    #[test]
+    fn completion_contract_survives_compaction_and_reopen() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let sid = s.id;
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let contract_rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, contract_rev, push_contract())
+            .unwrap();
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Succeeded,
+            "pushed before compaction",
+        )
+        .unwrap();
+        s.ledger_goal_set("compaction pressure").unwrap();
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(
+            report.pinned.len() >= 2,
+            "the contract row and its status row are pinned: {:?}",
+            report.pinned
+        );
+        assert_eq!(
+            s.completion_contract_gate(tid).unwrap(),
+            CompletionContractGate::Satisfied
+        );
+        // Reopen on the same store: the strict open passes and the gate
+        // still reads the durable contract + step outcome.
+        drop(s);
+        drop(m);
+        let m2 =
+            crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            s2.completion_contract(tid).unwrap(),
+            Some((contract_rev, push_contract()))
+        );
+        let rows = s2
+            .ledger_completion_step_statuses(tid.raw(), contract_rev.raw())
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, CompletionStepOutcome::Succeeded);
+        assert_eq!(
+            s2.completion_contract_gate(tid).unwrap(),
+            CompletionContractGate::Satisfied
+        );
+    }
+
+    /// Hostile shape at the task surface: oversized detail, zero revision
+    /// and a status for an unrecorded revision are typed refusals.
+    #[test]
+    fn completion_step_status_hostile_shapes_are_typed_refusals() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, rev, push_contract())
+            .unwrap();
+        let oversized = "x".repeat(crate::ledger::MAX_COMPLETION_STEP_DETAIL + 1);
+        let err = s
+            .set_completion_step_status(
+                tid,
+                CompletionStep::Push,
+                CompletionStepOutcome::Succeeded,
+                &oversized,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TaskError::Oversized(_)), "{err:?}");
+        // A raw append for a revision with no contract is a typed Conflict.
+        let err = s
+            .ledger_completion_step_status(
+                tid.raw(),
+                rev.raw() + 1,
+                CompletionStep::Push,
+                CompletionStepOutcome::Succeeded,
+                "orphan",
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{err}");
+        // at_ms <= 0 and revision 0 are malformed.
+        assert!(s
+            .ledger_completion_step_status(
+                tid.raw(),
+                rev.raw(),
+                CompletionStep::Push,
+                CompletionStepOutcome::Succeeded,
+                "ok",
+                0,
+            )
+            .is_err());
+        assert!(s
+            .ledger_completion_step_status(
+                tid.raw(),
+                0,
+                CompletionStep::Push,
+                CompletionStepOutcome::Succeeded,
+                "ok",
+                1,
+            )
+            .is_err());
     }
 }

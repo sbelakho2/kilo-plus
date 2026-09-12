@@ -62,8 +62,8 @@ use faktor_semantic::{
 use faktor_session::ops::PermissionRequest as SessionPermission;
 use faktor_session::task::{decode_criteria, encode_criteria, merge_derived_criteria, Criterion};
 use faktor_session::{
-    BudgetError as SessionBudgetError, RecoveredOp, RecoveryAction, RecoveryReport, SessionManager,
-    Task, TaskError, TaskPatch,
+    BudgetError as SessionBudgetError, CompletionContractGate, RecoveredOp, RecoveryAction,
+    RecoveryReport, SessionManager, Task, TaskError, TaskPatch,
 };
 use faktor_store::ToolRunRow;
 use faktor_verify::exec::{BudgetDecision, CheckRunStatus};
@@ -7672,6 +7672,17 @@ impl AgentRuntime {
                         actual: task.state,
                     })));
                 }
+                // P2 completion-contract gate: a run that declared
+                // commit/push/PR steps may not certify until every requested
+                // step has a durable Succeeded step-status row. This check
+                // runs BEFORE the row is routed to Verifying and before any
+                // attempt record exists, so an unmet contract refuses with
+                // the step named and the task row never moves.
+                if let CompletionContractGate::Refused(err) =
+                    handle.completion_contract_gate(task_id)?
+                {
+                    return Ok(Some(completion_refusal_gate(&err)));
+                }
                 let Some(proof) = proof else {
                     return Ok(Some(completion_refusal_gate(&TaskError::Malformed(
                         "VerifiedComplete without a verification proof (no executed checks)".into(),
@@ -14719,6 +14730,124 @@ mod tests {
             "{last}"
         );
         assert!(last["changed"][0] == "src/a.rs", "{last}");
+    }
+
+    /// P2: the only production `VerifiedComplete` producer refuses with a
+    /// typed gate while a requested completion step lacks a durable
+    /// Succeeded row, leaves the task row at Verifying and lands no attempt
+    /// record; recording the step success lets the same claim certify.
+    #[tokio::test]
+    async fn completion_contract_gate_refuses_verified_complete_until_step_succeeds() {
+        use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
+        let (deps, _dir) = deps(scripted_provider(vec![]), vec![]);
+        let runtime = AgentRuntime::new(deps).unwrap();
+        let session = new_session(runtime.deps());
+        let handle = runtime
+            .deps()
+            .session
+            .get_session(session)
+            .unwrap()
+            .unwrap();
+        let task_id = handle.task_id().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id,
+                session_id: session,
+                goal: "ship the PR".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: faktor_session::TaskBudget::default(),
+                state: TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        let contract_rev = handle.task_revision(task_id).unwrap();
+        handle
+            .set_completion_contract(
+                task_id,
+                contract_rev,
+                CompletionContract {
+                    include_commit: false,
+                    include_push: true,
+                    include_pr: false,
+                },
+            )
+            .unwrap();
+        // Drive the row to Verifying through the legal machine edges.
+        for transition in [
+            TaskTransition::StartRunning,
+            TaskTransition::RequestVerification,
+            TaskTransition::StartVerification,
+        ] {
+            let rev = handle.task_revision(task_id).unwrap();
+            handle
+                .transition_task(task_id, rev, transition, None)
+                .unwrap();
+        }
+        assert_eq!(
+            handle.get_task(task_id).unwrap().unwrap().state,
+            TaskState::Verifying
+        );
+        let proof = VerificationProof {
+            checks: vec![],
+            criteria: vec![],
+            changed_files: vec![],
+            review: None,
+        };
+        // The refusal names the unmet push step, BEFORE the row moves and
+        // BEFORE any attempt record is created.
+        let refusal = runtime
+            .apply_gate_to_task_row(
+                &handle,
+                Some(CompletionGate::VerifiedComplete),
+                Some(&proof),
+            )
+            .unwrap();
+        match refusal {
+            Some(CompletionGate::BlockedVerification { reasons }) => assert!(
+                reasons.iter().any(|r| r.detail.contains("Push")),
+                "the refusal must name the unmet Push step: {reasons:?}"
+            ),
+            other => panic!("expected a BlockedVerification refusal, got {other:?}"),
+        }
+        assert_eq!(
+            handle.get_task(task_id).unwrap().unwrap().state,
+            TaskState::Verifying,
+            "the task stays Verifying"
+        );
+        assert!(
+            handle
+                .list_verification_records(task_id)
+                .unwrap()
+                .is_empty(),
+            "an unmet contract must land no attempt record"
+        );
+        // Record the durable success: the same claim now certifies.
+        handle
+            .set_completion_step_status(
+                task_id,
+                CompletionStep::Push,
+                CompletionStepOutcome::Succeeded,
+                "pushed to origin/main",
+            )
+            .unwrap();
+        let landed = runtime
+            .apply_gate_to_task_row(
+                &handle,
+                Some(CompletionGate::VerifiedComplete),
+                Some(&proof),
+            )
+            .unwrap();
+        assert!(
+            landed.is_none(),
+            "the claim must land once the step succeeded: {landed:?}"
+        );
+        assert_eq!(
+            handle.get_task(task_id).unwrap().unwrap().state,
+            TaskState::VerifiedComplete
+        );
     }
 
     #[tokio::test]

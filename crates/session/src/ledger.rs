@@ -30,6 +30,7 @@
 
 use std::collections::BTreeMap;
 
+use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use serde::{Deserialize, Serialize};
 
 use crate::handle::SessionHandle;
@@ -172,6 +173,21 @@ pub const MAX_BOARD_SCAN_PAGE: u64 = 500;
 /// Hard cap on receipts returned for one `(child, post)` pair; beyond this
 /// the read refuses loudly instead of returning an unbounded list.
 pub const MAX_BOARD_RECEIPTS_PER_POST: usize = 256;
+
+// Durable PR/CI-fix completion-contract rows (P2): `completion_contract_set`
+// records the accepted contract of ONE task run (keyed by the task revision
+// the run started at; immutable per revision) and `completion_step_status`
+// records one per-step outcome (`succeeded|failed|skipped`) with a bounded
+// detail. Both rows are the durable authority the `VerifiedComplete` gate
+// reads; they fold nowhere in the head and are PINNED across compaction so a
+// compacted ledger can always re-evaluate the gate exactly.
+pub const ENTRY_COMPLETION_CONTRACT_SET: &str = "completion_contract_set";
+pub const ENTRY_COMPLETION_STEP_STATUS: &str = "completion_step_status";
+
+// ---------------------------------------------------------------- completion bounds
+
+/// Hard bound on the bounded detail text of one step-status row.
+pub const MAX_COMPLETION_STEP_DETAIL: usize = MAX_LEDGER_TEXT;
 
 // ---------------------------------------------------------------- edit txn bounds
 
@@ -469,6 +485,29 @@ pub enum LedgerPayload {
         previous_revision: u64,
         new_revision: u64,
     },
+    /// The accepted PR/CI-fix completion contract of ONE task run (P2):
+    /// `task_id` + the task `revision` the run started at, plus the
+    /// requested steps. A contract is immutable per (task, revision) — a
+    /// second set for the same revision is a typed Conflict. All-false is
+    /// never recorded (it is the default behavior and carries no row).
+    CompletionContractSet {
+        task_id: u64,
+        revision: u64,
+        contract: CompletionContract,
+    },
+    /// One durable outcome of ONE requested completion step: `step` is
+    /// `commit|push|pr`, `status` is `succeeded|failed|skipped`, `detail`
+    /// is bounded audit text, `at_ms` the record time. The completion gate
+    /// requires a `Succeeded` row for every requested step; a `Failed` row
+    /// is a terminal refusal.
+    CompletionStepStatus {
+        task_id: u64,
+        revision: u64,
+        step: CompletionStep,
+        status: CompletionStepOutcome,
+        detail: String,
+        at_ms: i64,
+    },
 }
 
 /// One decoded ledger row.
@@ -582,6 +621,28 @@ pub struct LearningRecordRow {
     pub payload: String,
 }
 
+/// One accepted completion contract read from the durable stream: the run's
+/// `(task_id, revision)` identity plus the requested steps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionContractRow {
+    pub seq: i64,
+    pub task_id: u64,
+    pub revision: u64,
+    pub contract: CompletionContract,
+}
+
+/// One durable per-step outcome read from the stream, ascending by seq.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionStepStatusRow {
+    pub seq: i64,
+    pub task_id: u64,
+    pub revision: u64,
+    pub step: CompletionStep,
+    pub status: CompletionStepOutcome,
+    pub detail: String,
+    pub at_ms: i64,
+}
+
 /// Report of one watermark compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerCompactReport {
@@ -624,6 +685,8 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::BoardRead { .. } => ENTRY_BOARD_READ,
         LedgerPayload::BoardReceipt { .. } => ENTRY_BOARD_RECEIPT,
         LedgerPayload::BoardReset { .. } => ENTRY_BOARD_RESET,
+        LedgerPayload::CompletionContractSet { .. } => ENTRY_COMPLETION_CONTRACT_SET,
+        LedgerPayload::CompletionStepStatus { .. } => ENTRY_COMPLETION_STEP_STATUS,
     }
 }
 
@@ -795,6 +858,32 @@ fn decode_payload(
             } = &decoded
             {
                 validate_board_reset(*board_id, *previous_revision, *new_revision)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_COMPLETION_CONTRACT_SET => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::CompletionContractSet {
+                task_id,
+                revision,
+                contract,
+            } = &decoded
+            {
+                validate_completion_contract_set(*task_id, *revision, contract)?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_COMPLETION_STEP_STATUS => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::CompletionStepStatus {
+                task_id,
+                revision,
+                detail,
+                at_ms,
+                ..
+            } = &decoded
+            {
+                validate_completion_step_status(*task_id, *revision, detail, *at_ms)?;
             }
             Ok(decoded)
         }
@@ -1176,6 +1265,68 @@ pub(crate) fn validate_board_reset(
     Ok(())
 }
 
+/// Shape bounds of one `completion_contract_set` row, shared by the appender
+/// and the strict decoder (a hostile raw row must fail loudly on read too).
+/// The default all-false contract is never durable: recording it would
+/// create a row whose meaning is "no gate", which the default path already
+/// expresses with no row at all.
+pub(crate) fn validate_completion_contract_set(
+    task_id: u64,
+    revision: u64,
+    contract: &CompletionContract,
+) -> Result<(), SessionError> {
+    if task_id == 0 {
+        return Err(SessionError::Malformed(
+            "ledger completion_contract_set task_id must be non-zero".into(),
+        ));
+    }
+    if revision == 0 {
+        return Err(SessionError::Malformed(
+            "ledger completion_contract_set revision must be >= 1".into(),
+        ));
+    }
+    if contract.is_default() {
+        return Err(SessionError::Malformed(
+            "ledger completion_contract_set refuses an all-false contract: the default behavior \
+             is expressed by the ABSENCE of a row, never by a durable no-op row"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Shape bounds of one `completion_step_status` row, shared by the appender
+/// and the strict decoder (a hostile raw row must fail loudly on read too).
+pub(crate) fn validate_completion_step_status(
+    task_id: u64,
+    revision: u64,
+    detail: &str,
+    at_ms: i64,
+) -> Result<(), SessionError> {
+    if task_id == 0 {
+        return Err(SessionError::Malformed(
+            "ledger completion_step_status task_id must be non-zero".into(),
+        ));
+    }
+    if revision == 0 {
+        return Err(SessionError::Malformed(
+            "ledger completion_step_status revision must be >= 1".into(),
+        ));
+    }
+    if detail.len() > MAX_COMPLETION_STEP_DETAIL {
+        return Err(SessionError::Oversized(format!(
+            "ledger completion_step_status detail of {} bytes exceeds MAX_COMPLETION_STEP_DETAIL",
+            detail.len()
+        )));
+    }
+    if at_ms <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger completion_step_status at_ms must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn check_payload_bytes(payload: &LedgerPayload) -> Result<(), SessionError> {
     let bytes = json_bytes(&serde_json::to_value(payload).unwrap_or_default());
     if bytes > MAX_LEDGER_ENTRY_BYTES {
@@ -1415,6 +1566,13 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
             head.board_revision = head.board_revision.max(*new_revision);
         }
         LedgerPayload::BoardRead { .. } | LedgerPayload::BoardReceipt { .. } => {}
+        // Completion-contract rows are the durable authority the
+        // `VerifiedComplete` gate reads (the accepted contract + the
+        // per-step outcomes). They fold nowhere in the head and are pinned
+        // across compaction, so the gate always evaluates the exact durable
+        // history, never a lossy head projection.
+        LedgerPayload::CompletionContractSet { .. }
+        | LedgerPayload::CompletionStepStatus { .. } => {}
     }
     Ok(())
 }
@@ -2336,6 +2494,164 @@ impl SessionHandle {
         Ok(out)
     }
 
+    // ---------------------------------------------------- completion contract
+
+    /// Record the accepted PR/CI-fix completion contract of ONE task run
+    /// (`task_id`, the task `revision` the run started at). Immutable per
+    /// revision: a second set for the same `(task_id, revision)` is a typed
+    /// Conflict, checked and appended under the session command lock so two
+    /// racing writers cannot both win. An all-false contract is refused (the
+    /// default path carries no row).
+    pub fn ledger_completion_contract_set(
+        &self,
+        task_id: u64,
+        revision: u64,
+        contract: &CompletionContract,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_completion_contract_set(task_id, revision, contract)?;
+        let _guard = self.command_guard();
+        if self
+            .ledger_completion_contract_at(task_id, revision)?
+            .is_some()
+        {
+            return Err(SessionError::Conflict(format!(
+                "completion contract for task {task_id} revision {revision} is already recorded; \
+                 a contract is immutable per task revision"
+            ))
+            .into());
+        }
+        self.append_entry(LedgerPayload::CompletionContractSet {
+            task_id,
+            revision,
+            contract: *contract,
+        })
+    }
+
+    /// The task's ACCEPTED contract: the newest `completion_contract_set`
+    /// row for `task_id` (contracts are keyed by the run's start revision;
+    /// a later run on a later revision supersedes an earlier one). `None`
+    /// when the task never carried a non-default contract.
+    pub fn ledger_completion_contract(
+        &self,
+        task_id: u64,
+    ) -> faktor_core::Result<Option<CompletionContractRow>> {
+        let mut latest: Option<CompletionContractRow> = None;
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::CompletionContractSet {
+                task_id: row_task,
+                revision,
+                contract,
+            } = entry.payload
+            {
+                if row_task == task_id {
+                    // Entries ascend by seq: the last match wins.
+                    latest = Some(CompletionContractRow {
+                        seq: entry.seq,
+                        task_id: row_task,
+                        revision,
+                        contract,
+                    });
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    /// The exact contract row of one `(task_id, revision)`, if any.
+    pub fn ledger_completion_contract_at(
+        &self,
+        task_id: u64,
+        revision: u64,
+    ) -> faktor_core::Result<Option<CompletionContractRow>> {
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::CompletionContractSet {
+                task_id: row_task,
+                revision: row_revision,
+                contract,
+            } = entry.payload
+            {
+                if row_task == task_id && row_revision == revision {
+                    return Ok(Some(CompletionContractRow {
+                        seq: entry.seq,
+                        task_id: row_task,
+                        revision: row_revision,
+                        contract,
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Append one per-step outcome row. The row must name a revision that
+    /// already carries a recorded contract (step statuses are evidence of an
+    /// accepted run, never free-floating claims), checked and appended under
+    /// the session command lock.
+    pub fn ledger_completion_step_status(
+        &self,
+        task_id: u64,
+        revision: u64,
+        step: CompletionStep,
+        status: CompletionStepOutcome,
+        detail: &str,
+        at_ms: i64,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_completion_step_status(task_id, revision, detail, at_ms)?;
+        let _guard = self.command_guard();
+        if self
+            .ledger_completion_contract_at(task_id, revision)?
+            .is_none()
+        {
+            return Err(SessionError::Conflict(format!(
+                "completion step status for task {task_id} revision {revision} has no recorded \
+                 contract; record the contract before its step outcomes"
+            ))
+            .into());
+        }
+        self.append_entry(LedgerPayload::CompletionStepStatus {
+            task_id,
+            revision,
+            step,
+            status,
+            detail: detail.to_string(),
+            at_ms,
+        })
+    }
+
+    /// Every durable step-status row of one `(task_id, revision)`, ascending
+    /// by seq.
+    pub fn ledger_completion_step_statuses(
+        &self,
+        task_id: u64,
+        revision: u64,
+    ) -> faktor_core::Result<Vec<CompletionStepStatusRow>> {
+        let mut out = Vec::new();
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::CompletionStepStatus {
+                task_id: row_task,
+                revision: row_revision,
+                step,
+                status,
+                detail,
+                at_ms,
+            } = entry.payload
+            {
+                if row_task == task_id && row_revision == revision {
+                    out.push(CompletionStepStatusRow {
+                        seq: entry.seq,
+                        task_id: row_task,
+                        revision: row_revision,
+                        step,
+                        status,
+                        detail,
+                        at_ms,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The shared typed append tail: bounds the payload, maps its entry
     /// type, and writes the single row (gapless, always above the head's
     /// checkpoint so the fold cursor never rewinds).
@@ -2428,6 +2744,11 @@ impl SessionHandle {
         // compacted ledger must still reconstruct every visible post and
         // every unread count exactly.
         let mut board_seqs: Vec<i64> = Vec::new();
+        // Completion-contract rows are pinned: the accepted contract and
+        // every per-step outcome are the durable authority the completion
+        // gate reads, so watermark compaction must never delete them (a
+        // pruned status row would silently turn "not done" into "done").
+        let mut completion_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -2453,6 +2774,8 @@ impl SessionHandle {
                 | LedgerPayload::BoardRead { .. }
                 | LedgerPayload::BoardReceipt { .. }
                 | LedgerPayload::BoardReset { .. } => board_seqs.push(entry.seq),
+                LedgerPayload::CompletionContractSet { .. }
+                | LedgerPayload::CompletionStepStatus { .. } => completion_seqs.push(entry.seq),
                 _ => {}
             }
         }
@@ -2490,6 +2813,7 @@ impl SessionHandle {
         pinned.extend(learning_seqs);
         pinned.extend(tournament_seqs);
         pinned.extend(board_seqs);
+        pinned.extend(completion_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;
@@ -3559,5 +3883,216 @@ mod tests {
         let rows = s2.ledger_learning_records().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].payload, "not json");
+    }
+
+    /// Adversarial completion-contract ledger surface (P2): immutability per
+    /// `(task, revision)`, latest-contract-wins across revisions, pinning
+    /// across watermark compaction, strict reopen, and hostile raw rows
+    /// failing every typed read loudly instead of being dropped.
+    #[test]
+    fn completion_contract_rows_are_immutable_pinned_and_reopen_stable() {
+        let (dir, m) = test_manager();
+        let s = session(&m);
+        let sid = s.id;
+        let contract_v3 = CompletionContract {
+            include_commit: true,
+            include_push: true,
+            include_pr: false,
+        };
+        let contract_v4 = CompletionContract {
+            include_commit: false,
+            include_push: false,
+            include_pr: true,
+        };
+        let seq_v3 = s
+            .ledger_completion_contract_set(7, 3, &contract_v3)
+            .unwrap()
+            .unwrap();
+        // Immutable per (task, revision).
+        let err = s
+            .ledger_completion_contract_set(7, 3, &contract_v4)
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err}");
+        // A later revision is a new run: accepted and the newest row wins.
+        let seq_v4 = s
+            .ledger_completion_contract_set(7, 4, &contract_v4)
+            .unwrap()
+            .unwrap();
+        let latest = s.ledger_completion_contract(7).unwrap().unwrap();
+        assert_eq!(latest.revision, 4);
+        assert_eq!(latest.contract, contract_v4);
+        assert!(latest.seq > seq_v3);
+        // The exact row of an older revision is still addressable.
+        let old = s.ledger_completion_contract_at(7, 3).unwrap().unwrap();
+        assert_eq!(old.contract, contract_v3);
+        // Step statuses require the recorded contract revision.
+        let status_seq = s
+            .ledger_completion_step_status(
+                7,
+                4,
+                CompletionStep::Pr,
+                CompletionStepOutcome::Succeeded,
+                "opened PR #12",
+                99,
+            )
+            .unwrap()
+            .unwrap();
+        let err = s
+            .ledger_completion_step_status(
+                7,
+                9,
+                CompletionStep::Pr,
+                CompletionStepOutcome::Succeeded,
+                "orphan",
+                99,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Conflict, "{err}");
+        let rows = s.ledger_completion_step_statuses(7, 4).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].step, CompletionStep::Pr);
+        assert_eq!(rows[0].status, CompletionStepOutcome::Succeeded);
+        assert_eq!(rows[0].detail, "opened PR #12");
+        assert_eq!(rows[0].at_ms, 99);
+
+        // Watermark compaction pins contract + status rows.
+        s.ledger_goal_set("compaction pressure").unwrap();
+        let report = s.compact_typed_ledger().unwrap();
+        assert!(report.pinned.contains(&seq_v3));
+        assert!(report.pinned.contains(&seq_v4));
+        assert!(report.pinned.contains(&status_seq));
+        assert!(collect_all(&s).iter().any(|e| matches!(
+            &e.payload,
+            LedgerPayload::CompletionContractSet { revision: 3, .. }
+        )));
+
+        // Reopen the exact store: the strict open verifies every row and the
+        // reads converge byte-identically.
+        drop(s);
+        drop(m);
+        let m2 =
+            crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            s2.ledger_completion_contract(7).unwrap().unwrap().contract,
+            contract_v4
+        );
+        assert_eq!(
+            s2.ledger_completion_contract_at(7, 3)
+                .unwrap()
+                .unwrap()
+                .contract,
+            contract_v3
+        );
+        assert_eq!(s2.ledger_completion_step_statuses(7, 4).unwrap().len(), 1);
+    }
+
+    /// Hostile completion rows fail the strict decode and the session-open
+    /// verification: an all-false contract row, an unknown step tag, an
+    /// unknown status tag, a non-positive `at_ms`, and an oversized detail.
+    #[test]
+    fn hostile_completion_rows_fail_loudly() {
+        let (_d, m) = test_manager();
+        let raw = |s: &SessionHandle, entry_type: &str, json: serde_json::Value| {
+            m.store()
+                .append_ledger_entry(s.id, entry_type, LEDGER_ENTRY_SCHEMA_V, json)
+                .unwrap();
+        };
+        // The appender refuses an all-false contract before journaling.
+        let s = session(&m);
+        assert!(s
+            .ledger_completion_contract_set(1, 1, &CompletionContract::default())
+            .is_err());
+        assert_eq!(collect_all(&s).len(), 0);
+        // A raw all-false contract row is corruption: loud on read + open.
+        raw(
+            &s,
+            ENTRY_COMPLETION_CONTRACT_SET,
+            serde_json::json!({
+                "kind": "completion_contract_set",
+                "task_id": 1,
+                "revision": 1,
+                "contract": {
+                    "include_commit": false,
+                    "include_push": false,
+                    "include_pr": false,
+                },
+            }),
+        );
+        let err = s.ledger_completion_contract(1).unwrap_err();
+        assert!(err.to_string().contains("all-false"), "{err}");
+        assert!(s.ledger_verify_open().is_err());
+
+        // Unknown step tag cannot even decode.
+        let s = session(&m);
+        raw(
+            &s,
+            ENTRY_COMPLETION_STEP_STATUS,
+            serde_json::json!({
+                "kind": "completion_step_status",
+                "task_id": 1,
+                "revision": 1,
+                "step": "deploy",
+                "status": "succeeded",
+                "detail": "",
+                "at_ms": 1,
+            }),
+        );
+        let err = s.ledger_completion_step_statuses(1, 1).unwrap_err();
+        assert!(err.to_string().contains("schema"), "{err}");
+
+        // Unknown status tag.
+        let s = session(&m);
+        raw(
+            &s,
+            ENTRY_COMPLETION_STEP_STATUS,
+            serde_json::json!({
+                "kind": "completion_step_status",
+                "task_id": 1,
+                "revision": 1,
+                "step": "push",
+                "status": "maybe",
+                "detail": "",
+                "at_ms": 1,
+            }),
+        );
+        assert!(s.ledger_completion_step_statuses(1, 1).is_err());
+
+        // Non-positive at_ms.
+        let s = session(&m);
+        raw(
+            &s,
+            ENTRY_COMPLETION_STEP_STATUS,
+            serde_json::json!({
+                "kind": "completion_step_status",
+                "task_id": 1,
+                "revision": 1,
+                "step": "push",
+                "status": "succeeded",
+                "detail": "",
+                "at_ms": 0,
+            }),
+        );
+        let err = s.ledger_completion_step_statuses(1, 1).unwrap_err();
+        assert!(err.to_string().contains("at_ms"), "{err}");
+
+        // Oversized detail.
+        let s = session(&m);
+        raw(
+            &s,
+            ENTRY_COMPLETION_STEP_STATUS,
+            serde_json::json!({
+                "kind": "completion_step_status",
+                "task_id": 1,
+                "revision": 1,
+                "step": "push",
+                "status": "succeeded",
+                "detail": "x".repeat(MAX_COMPLETION_STEP_DETAIL + 1),
+                "at_ms": 1,
+            }),
+        );
+        let err = s.ledger_completion_step_statuses(1, 1).unwrap_err();
+        assert_eq!(err.kind, faktor_core::ErrorKind::Oversized, "{err}");
     }
 }

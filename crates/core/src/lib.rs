@@ -17,6 +17,7 @@
 pub mod cancellation;
 pub mod capability;
 pub mod command;
+pub mod completion;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -33,6 +34,7 @@ pub use capability::{
     Capability, CapabilityKind, CapabilitySet, NetworkPolicy, PermissionDecision,
 };
 pub use command::{CommandSpec, EnvSpec, NetworkIsolationRequirement, ResolvedCommand, ShellKind};
+pub use completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 pub use error::{Error, ErrorKind, Result};
 pub use event::{Event, EventKind};
 pub use hash::FileHash;

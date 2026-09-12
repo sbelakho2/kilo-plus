@@ -51,6 +51,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use faktor_agent::AgentRuntime;
+use faktor_core::completion::CompletionContract;
 use faktor_core::id::{OpId, SessionId, TaskId, WorktreeId};
 use faktor_core::state::{TaskState, TaskTransition};
 use faktor_session::{
@@ -179,6 +180,13 @@ pub struct TaskRunRequest {
     /// Capability ceiling of the parent (children get parent ∩ policies).
     pub parent_caps: CapabilitySet,
     pub ceilings: super::Ceilings,
+    /// The PR/CI-fix completion contract of this run (P2). `None` (the
+    /// default) leaves the completion path byte-identical to every previous
+    /// wave: no durable contract row, no gate. `Some(non-default)` is
+    /// recorded durably as a `CompletionContractSet` row BEFORE the run's
+    /// first model call; `VerifiedComplete` then requires a durable
+    /// `Succeeded` step-status row for every requested step.
+    pub completion_contract: Option<CompletionContract>,
     /// Root under which isolated child workspaces are created. Empty on the
     /// wire (the DTO never carries a filesystem path): the executor
     /// allocates a daemon-owned candidate root through its
@@ -203,6 +211,7 @@ impl Default for TaskRunRequest {
             files: Vec::new(),
             parent_caps: CapabilitySet::new(),
             ceilings: super::Ceilings::default(),
+            completion_contract: None,
             isolated_root: PathBuf::new(),
             crash_seam: None,
         }
@@ -888,6 +897,9 @@ impl TaskExecutor {
                     .map_err(|e| ExecError::Internal(format!("task row seed: {e}")))?;
             }
         }
+        // P2 record-first: the accepted completion contract lands durably
+        // BEFORE the run's first model call (the submit below drives it).
+        record_completion_contract(&handle, task_id, req.completion_contract)?;
         // Durable monetary cap (audit 9/H): `TaskRunRequest.max_cost_micro`
         // flows to the task row's cost cap — the single authority every paid
         // model call of this drive is admitted against (the guarded ledger
@@ -1002,9 +1014,13 @@ impl TaskExecutor {
         // path, re-goaling/patching a live row; a terminal row is frozen).
         // Child budget scopes enroll under THIS row, so the run's cap bounds
         // its children's collective spend once children carry their own cost
-        // caps. Without a cap and without criteria no root row is created —
-        // previous-wave behavior stays byte-identical.
-        if req.max_cost_micro.is_some() || !req.criteria.is_empty() {
+        // caps. Without a cap, criteria or a non-default completion contract
+        // no root row is created — previous-wave behavior stays
+        // byte-identical.
+        if req.max_cost_micro.is_some()
+            || !req.criteria.is_empty()
+            || req.completion_contract.is_some_and(|c| !c.is_default())
+        {
             let task_id = handle.task_id()?;
             let now = handle.now_ms();
             let goal = truncate_bytes(&req.goal, MAX_TASK_GOAL_BYTES);
@@ -1052,6 +1068,9 @@ impl TaskExecutor {
                     .set_task_max_cost(parent, task_id, Some(max_cost_micro))
                     .map_err(|e| ExecError::Conflict(format!("root task cost cap seed: {e}")))?;
             }
+            // P2 record-first: the run's contract lands durably BEFORE any
+            // child session (its first model call) is spawned.
+            record_completion_contract(&handle, task_id, req.completion_contract)?;
         }
         let plan = req.plan_for_validation();
         let mut specs = Vec::with_capacity(req.work_items.len());
@@ -1980,6 +1999,34 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Record one run's accepted completion contract before its first model
+/// call (P2 record-first): the durable `CompletionContractSet` row lands at
+/// the task row's CURRENT revision and is immutable per revision. `None`
+/// and the explicit all-false contract write nothing — the default
+/// completion path stays byte-identical.
+fn record_completion_contract(
+    handle: &faktor_session::SessionHandle,
+    task_id: TaskId,
+    contract: Option<CompletionContract>,
+) -> Result<(), ExecError> {
+    let Some(contract) = contract.filter(|c| !c.is_default()) else {
+        return Ok(());
+    };
+    let revision = handle
+        .task_revision(task_id)
+        .map_err(|e| ExecError::Internal(format!("task revision read: {e}")))?;
+    handle
+        .set_completion_contract(task_id, revision, contract)
+        .map(|_seq| ())
+        .map_err(|e| match e {
+            faktor_session::TaskError::CompletionContractImmutable { .. }
+            | faktor_session::TaskError::RevisionMismatch { .. } => {
+                ExecError::Conflict(format!("completion contract: {e}"))
+            }
+            other => ExecError::Internal(format!("completion contract seed: {other}")),
+        })
+}
+
 fn truncate_bytes(s: &str, max: usize) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -1994,3 +2041,77 @@ fn truncate_bytes(s: &str, max: usize) -> String {
 #[cfg(test)]
 #[path = "task_executor_tests.rs"]
 mod task_executor_tests;
+
+#[cfg(test)]
+mod completion_contract_executor_tests {
+    //! Adversarial covers of the executor's record-first contract seam:
+    //! the default contract writes nothing, a non-default contract lands at
+    //! the task's start revision BEFORE any run exists, and a second set for
+    //! the same revision is a typed Conflict.
+    use super::*;
+    use faktor_session::{SessionHandle, SessionManager};
+
+    fn manager() -> (tempfile::TempDir, Arc<SessionManager>) {
+        let dir = tempfile::tempdir().unwrap();
+        let m =
+            SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true).unwrap();
+        (dir, m)
+    }
+
+    fn session(m: &Arc<SessionManager>) -> SessionHandle {
+        let ws = m.create_workspace("/w").unwrap();
+        m.create_session(ws, "t", "ollama", "qwen3.8").unwrap()
+    }
+
+    #[test]
+    fn record_first_contract_is_default_silent_and_immutable_per_revision() {
+        let (_d, m) = manager();
+        let handle = session(&m);
+        let task_id = handle.task_id().unwrap();
+        let now = handle.now_ms();
+        handle
+            .create_task(faktor_session::Task {
+                task_id,
+                session_id: handle.id(),
+                goal: "g".into(),
+                acceptance_criteria: vec![],
+                plan: vec![],
+                budget: TaskBudget::default(),
+                state: TaskState::Pending,
+                created_ms: now,
+                updated_ms: now,
+            })
+            .unwrap();
+        // `None` and the explicit all-false contract write NOTHING.
+        record_completion_contract(&handle, task_id, None).unwrap();
+        record_completion_contract(&handle, task_id, Some(CompletionContract::default())).unwrap();
+        assert!(handle
+            .ledger_completion_contract(task_id.raw())
+            .unwrap()
+            .is_none());
+        // A non-default contract lands durably at the start revision.
+        let contract = CompletionContract {
+            include_commit: true,
+            include_push: true,
+            include_pr: false,
+        };
+        record_completion_contract(&handle, task_id, Some(contract)).unwrap();
+        let rev = handle.task_revision(task_id).unwrap();
+        assert_eq!(
+            handle.completion_contract(task_id).unwrap(),
+            Some((rev, contract))
+        );
+        // A second set for the same revision is a typed Conflict.
+        let err = record_completion_contract(
+            &handle,
+            task_id,
+            Some(CompletionContract {
+                include_commit: false,
+                include_push: false,
+                include_pr: true,
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExecError::Conflict(_)), "{err}");
+    }
+}

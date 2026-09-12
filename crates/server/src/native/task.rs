@@ -173,6 +173,13 @@ pub(crate) struct StartTaskRunRequest {
     /// attachment-free; the daemon never reads the filesystem at THIS
     /// boundary (the drive's own permission requester gates every tool).
     files: Option<Vec<String>>,
+    /// The PR/CI-fix completion contract of this run (P2): when present with
+    /// at least one requested step, the executor records it durably BEFORE
+    /// the first model call and `VerifiedComplete` requires a durable
+    /// `Succeeded` step-status row for every requested step. Parsed
+    /// STRICTLY (`deny_unknown_fields`; missing or non-boolean members are
+    /// a plain 400 — never a silent default). Absent = today's behavior.
+    completion_contract: Option<faktor_core::completion::CompletionContract>,
 }
 
 /// One wire work item of [`StartTaskRunRequest`]. `kind` speaks the
@@ -207,6 +214,17 @@ pub(crate) fn native_run_parent_caps() -> faktor_orchestrator::caps::CapabilityS
         ScopePattern::new("*").expect("wildcard pattern"),
     )])
     .expect("wildcard grant is sane")
+}
+
+/// True when a task-start body must be refused with a typed 400 because a
+/// non-default completion contract arrived on the plain-prompt path (no
+/// explicit `work_items`): that path carries no contract seam, so dropping
+/// the contract silently would claim steps the run never recorded.
+fn completion_contract_needs_work_items(
+    has_work_items: bool,
+    completion_contract: Option<faktor_core::completion::CompletionContract>,
+) -> bool {
+    !has_work_items && completion_contract.is_some_and(|c| !c.is_default())
 }
 
 /// `POST /native/session/{id}/task-runs` — start ONE task through the
@@ -280,6 +298,19 @@ pub(crate) async fn native_task_run_start(
     }
     let prompts = PromptExecutionService::from_state(&state);
     let files = req.files.take().unwrap_or_default();
+    // P2: the plain-prompt path (`work_items` absent) carries no completion
+    // contract seam; a non-default contract is refused loudly here, never
+    // silently dropped. The default all-false contract is accepted and
+    // changes nothing.
+    if completion_contract_needs_work_items(req.work_items.is_none(), req.completion_contract) {
+        return wire_status(ApiError {
+            code: "unsupported",
+            message: "completion_contract requires explicit work_items; the plain-prompt path carries no contract seam"
+                .into(),
+            http_status: 400,
+            retryable: false,
+        });
+    }
     let receipt = match req.work_items {
         Some(items) => {
             let mut work_items: Vec<faktor_orchestrator::WorkItem> = items
@@ -313,6 +344,7 @@ pub(crate) async fn native_task_run_start(
                 mutation_mode: req.mutation_mode,
                 files,
                 parent_caps: native_run_parent_caps(),
+                completion_contract: req.completion_contract,
                 ..Default::default()
             };
             match prompts.start_task(sid, request) {
@@ -532,5 +564,130 @@ pub(crate) async fn native_tournament_state(
     {
         Ok(tournament) => Json(tournament).into_response(),
         Err(e) => exec_error_response(&e),
+    }
+}
+
+#[cfg(test)]
+mod completion_contract_dto_tests {
+    //! Adversarial strict-DTO covers for the additive `completion_contract`
+    //! field. Every `Err` below is mapped to a plain 400 by
+    //! [`native_task_run_start`]'s uniform body-rejection handling (never a
+    //! 422, never a silent default).
+    use super::{completion_contract_needs_work_items, StartTaskRunRequest};
+    use faktor_core::completion::CompletionContract;
+
+    fn parse(value: serde_json::Value) -> Result<StartTaskRunRequest, String> {
+        serde_json::from_value(value).map_err(|e| e.to_string())
+    }
+
+    /// The rejection message of a hostile body (the DTO itself is not
+    /// `Debug`; only the error shape matters here).
+    fn expect_err(value: serde_json::Value) -> String {
+        match parse(value.clone()) {
+            Ok(_) => panic!("hostile DTO must be rejected: {value}"),
+            Err(e) => e,
+        }
+    }
+
+    /// The plain-prompt path (no `work_items`) refuses a non-default
+    /// contract with a typed 400 instead of silently dropping it; the
+    /// default contract and the explicit-work-items path are accepted.
+    #[test]
+    fn non_default_contract_on_the_plain_prompt_path_is_a_typed_400() {
+        let push = CompletionContract {
+            include_commit: false,
+            include_push: true,
+            include_pr: false,
+        };
+        assert!(completion_contract_needs_work_items(false, Some(push)));
+        assert!(!completion_contract_needs_work_items(true, Some(push)));
+        assert!(!completion_contract_needs_work_items(
+            false,
+            Some(CompletionContract::default())
+        ));
+        assert!(!completion_contract_needs_work_items(false, None));
+    }
+
+    #[test]
+    fn completion_contract_is_strict_typed_and_never_defaults_silently() {
+        // Absent = today's behavior (no contract, no durable row, no gate).
+        let req = parse(serde_json::json!({"goal": "g"})).unwrap();
+        assert!(req.completion_contract.is_none());
+        // An explicit all-false contract parses and IS the default behavior.
+        let req = parse(serde_json::json!({
+            "goal": "g",
+            "completion_contract": {
+                "include_commit": false,
+                "include_push": false,
+                "include_pr": false,
+            },
+        }))
+        .unwrap();
+        assert_eq!(req.completion_contract, Some(CompletionContract::default()));
+        // A full non-default contract parses.
+        let req = parse(serde_json::json!({
+            "goal": "g",
+            "completion_contract": {
+                "include_commit": true,
+                "include_push": true,
+                "include_pr": true,
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            req.completion_contract,
+            Some(CompletionContract {
+                include_commit: true,
+                include_push: true,
+                include_pr: true,
+            })
+        );
+
+        // A missing member is a 400, never a silent false.
+        let err = expect_err(serde_json::json!({
+            "goal": "g",
+            "completion_contract": {"include_commit": true},
+        }));
+        assert!(err.contains("missing field"), "{err}");
+        // A non-boolean member is a 400.
+        let err = expect_err(serde_json::json!({
+            "goal": "g",
+            "completion_contract": {
+                "include_commit": "yes",
+                "include_push": false,
+                "include_pr": false,
+            },
+        }));
+        assert!(err.contains("invalid type"), "{err}");
+        // An unknown member inside the contract is a 400.
+        let err = expect_err(serde_json::json!({
+            "goal": "g",
+            "completion_contract": {
+                "include_commit": true,
+                "include_push": false,
+                "include_pr": false,
+                "include_release": true,
+            },
+        }));
+        assert!(err.contains("unknown field"), "{err}");
+        // A non-object contract (string / bool / array) is a 400.
+        for hostile in [
+            serde_json::json!("include_push"),
+            serde_json::json!(true),
+            serde_json::json!([true, true, true]),
+        ] {
+            let err = expect_err(serde_json::json!({
+                "goal": "g",
+                "completion_contract": hostile,
+            }));
+            assert!(err.contains("invalid type"), "{err}");
+        }
+        // An unknown TOP-LEVEL field is still a 400 (the DTO strictness is
+        // unchanged by the additive field).
+        let err = expect_err(serde_json::json!({
+            "goal": "g",
+            "completion_contracts": {"include_commit": true},
+        }));
+        assert!(err.contains("unknown field"), "{err}");
     }
 }
