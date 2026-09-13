@@ -30,6 +30,10 @@
   var MAX_BODY_CHARS = 4096;
   var MAX_SUBJECT_CHARS = 256;
   var MAX_REF_CHARS = 512;
+  // Mirrors the runtime's steering-note bound (apps/vscode BRIDGE_LIMITS
+  // and faktor_session::MAX_CHILD_CONTROL_NOTE_CHARS): the inline textbox
+  // can never emit a note the host/daemon would refuse.
+  var MAX_STEER_CHARS = 500;
 
   var state = {
     task: null,
@@ -284,6 +288,32 @@
       button(actions, 'Budget', 'faktor-btn', function () {
         post({ type: 'faktorAgentAction', agentId: agent.agentId, action: 'budget' });
       });
+      // Steer (P2 UI parity): a BOUNDED inline note posts the exact
+      // `faktorAgentAction` body; an empty box posts the bare action and
+      // the host prompts instead. The runtime keeps the non-empty/<=500
+      // guard, so a hostile/oversized note is refused typed on both the
+      // bridge and the host path.
+      var steerRow = el('div', 'faktor-steer');
+      var steerInput = el('input', 'faktor-input');
+      steerInput.type = 'text';
+      steerInput.placeholder = 'steer note (optional)';
+      steerInput.setAttribute('aria-label', 'steer note');
+      steerInput.maxLength = MAX_STEER_CHARS;
+      steerRow.appendChild(steerInput);
+      button(steerRow, 'Steer', 'faktor-btn', function () {
+        var note = typeof steerInput.value === 'string' ? steerInput.value.trim() : '';
+        if (note.length === 0) {
+          post({ type: 'faktorAgentAction', agentId: agent.agentId, action: 'steer' });
+          return;
+        }
+        post({
+          type: 'faktorAgentAction',
+          agentId: agent.agentId,
+          action: 'steer',
+          text: note.slice(0, MAX_STEER_CHARS)
+        });
+      });
+      actions.appendChild(steerRow);
     }
     var next = agent.presentation === 'background' ? 'foreground' : 'background';
     button(

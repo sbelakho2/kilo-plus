@@ -79,6 +79,7 @@ import {
   pruneBindings,
   withBinding,
 } from './workspaceBinding';
+import { BRIDGE_LIMITS, normalizeSteerText } from './kilo-bridge';
 import { ChatMessage, ChatViewProvider } from './webview';
 
 const HISTORY_PAGE_LIMIT = 100;
@@ -1119,15 +1120,39 @@ async function controlAgent(message: ChatMessage): Promise<void> {
       // exactly like the JetBrains client controls.
       await client.retryAgent(agentId);
     } else if (action === 'steer') {
-      const text = await vscode.window.showInputBox({
-        title: `Faktor: steer ${agentId}`,
-        prompt: 'Instruction delivered at the agent’s next safe boundary',
-        ignoreFocusOut: true,
-      });
-      if (text === undefined || text.trim().length === 0) {
-        return;
+      // Inline note from the companion panel, or the host prompt when the
+      // panel/fallback control sends the bare action. BOTH layers run the
+      // same non-empty/<=500 guard (the daemon re-validates): a refused
+      // value is surfaced TYPED and never sent.
+      let note: string | null = null;
+      if (typeof message.text === 'string') {
+        const guard = normalizeSteerText(message.text);
+        if (!guard.ok) {
+          reportError(new Error(guard.reason));
+          return;
+        }
+        note = guard.text;
+      } else {
+        const entered = await vscode.window.showInputBox({
+          title: `Faktor: steer ${agentId}`,
+          prompt: `Instruction delivered at the agent’s next safe boundary (max ${BRIDGE_LIMITS.maxSteerChars} chars)`,
+          ignoreFocusOut: true,
+          validateInput: (value) => {
+            const guard = normalizeSteerText(value);
+            return guard.ok ? undefined : guard.reason;
+          },
+        });
+        if (entered === undefined) {
+          return;
+        }
+        const guard = normalizeSteerText(entered);
+        if (!guard.ok) {
+          reportError(new Error(guard.reason));
+          return;
+        }
+        note = guard.text;
       }
-      await client.steerAgent(agentId, text.trim());
+      await client.steerAgent(agentId, note);
     } else if (action === 'model') {
       const model = await vscode.window.showInputBox({
         title: `Faktor: model for ${agentId}`,

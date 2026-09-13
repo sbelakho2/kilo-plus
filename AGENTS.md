@@ -39,9 +39,10 @@ This workspace is a Rust implementation of the Faktor architecture spec
 
 ## Verification
 
-CI (`.woodpecker.yml`; Woodpecker 3.x — the linux jobs run on hosted or
-self-hosted linux agents, the macOS/Windows jobs on self-hosted agents)
-runs exactly these commands; they must pass locally before pushing:
+CI (the event-scoped workflows in `.woodpecker/`; Woodpecker 3.x — the linux
+jobs run on hosted or self-hosted linux agents, the macOS/Windows jobs on
+self-hosted agents) runs exactly these commands; they must pass locally
+before pushing:
 
 - `cargo fmt --check`
 - `cargo check --workspace`

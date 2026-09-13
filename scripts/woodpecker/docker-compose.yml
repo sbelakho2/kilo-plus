@@ -1,5 +1,5 @@
 # Woodpecker CI server + docker agent for the Faktor pipelines
-# (`.woodpecker.yml` at the repository root). See setup.md for the full
+# (the workflow files in `.woodpecker/`). See setup.md for the full
 # walkthrough, agent labels and cloud/self-hosted notes.
 #
 #   cd scripts/woodpecker
@@ -26,6 +26,10 @@ services:
       WOODPECKER_GITHUB: "true"
       WOODPECKER_GITHUB_CLIENT: ${WOODPECKER_GITHUB_CLIENT:-}
       WOODPECKER_GITHUB_SECRET: ${WOODPECKER_GITHUB_SECRET:-}
+      # Cap for repo-level pipeline timeouts (minutes). 1560 = 26h so the
+      # weekly `soak` 24h lane can be admitted; see setup.md §6. Hosted
+      # instances fix this value, so soak needs a self-hosted server.
+      WOODPECKER_MAX_PIPELINE_TIMEOUT: ${WOODPECKER_MAX_PIPELINE_TIMEOUT:-1560}
     volumes:
       - woodpecker-data:/var/lib/woodpecker
 
@@ -39,8 +43,8 @@ services:
       WOODPECKER_AGENT_SECRET: ${WOODPECKER_AGENT_SECRET:?set WOODPECKER_AGENT_SECRET to the server value}
       WOODPECKER_BACKEND: docker
       WOODPECKER_MAX_WORKFLOWS: "2"
-      # Must match the matrix `platform` value in .woodpecker.yml; an
-      # arm64 host needs platform=linux/arm64 there.
+      # Must match the matrix `platform` value in .woodpecker/trusted.yaml;
+      # an arm64 host needs platform=linux/arm64 there.
       WOODPECKER_AGENT_LABELS: "platform=linux/amd64,hostname=faktor-linux-agent"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -61,7 +65,7 @@ services:
   #     WOODPECKER_BACKEND: local
   #     WOODPECKER_MAX_WORKFLOWS: "1"
   #     # macOS Apple Silicon; use darwin/amd64 on Intel or windows/amd64 on
-  #     # Windows (and keep .woodpecker.yml's matrix value in sync).
+  #     # Windows (and keep .woodpecker/trusted.yaml's matrix value in sync).
   #     WOODPECKER_AGENT_LABELS: "platform=darwin/arm64,hostname=faktor-darwin-agent"
   #   volumes:
   #     - woodpecker-agent-config:/etc/woodpecker

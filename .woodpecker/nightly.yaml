@@ -1,0 +1,258 @@
+# Faktor CI — nightly campaign (Woodpecker cron event, job name `nightly`).
+#
+# REGISTRATION: a cron workflow only runs after the matching cron job exists
+# in the repository settings. Register it with
+#   bash scripts/woodpecker/activate.sh <owner/repo> --run-now
+# or via the API `POST /api/repos/{repo_id}/cron` with
+#   {"name":"nightly","schedule":"0 3 * * *","branch":"main","timezone":"UTC","enabled":true}
+# (or Repository Settings → Cron Jobs in the UI). See setup.md §6.
+#
+# STORAGE POLICY: cron events are trusted (server-owned, default-branch
+# config), so this workflow uses its own `faktor-nightly-*` named volumes.
+# It never mounts the `faktor-trusted-*` caches, and `pr.yaml` never mounts
+# these. Every lane has its own target volume so the parallel cargo invocations
+# do not fight over a target-dir lock.
+#
+# Coverage: [fault] campaigns at scale, the longrun suite (release), the
+# efficiency harness, the economy suite, the coding-benchmark smoke, the
+# provider-key real-model run (recorded as an explicit skip unless keys are
+# supplied out-of-band — CI requires NO secrets by default), and the
+# supply-chain evidence job (missing advisory tools stay loud recorded skips
+# inside target/certification/supply-chain-status.json).
+#
+# Timeout: Woodpecker has no per-step timeout; the repository pipeline timeout
+# applies (default 60 min, max settable 120 min). Raise it (setup.md §6):
+#   server:  WOODPECKER_MAX_PIPELINE_TIMEOUT=1560
+#   repo:    PATCH /api/repos/{repo_id} {"timeout":1560}
+# Commit-status context (default format): ci/woodpecker/cron/nightly
+
+labels:
+  platform: linux/amd64
+
+when:
+  - event: cron
+    cron: nightly
+
+steps:
+  # ----------------------------------------------------------- fault-scale --
+  # The ignored [fault] accounting campaign at full seed scale.
+  - name: fault-scale
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-fault:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-fault --release -- --ignored
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"fault-scale","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/fault-scale.json
+
+  # --------------------------------------------------------------- longrun --
+  # The long-run durability suite in release mode (the 24h wall-clock test
+  # stays #[ignore] and is owned by soak.yaml).
+  - name: longrun
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-longrun:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-longrun --release
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"longrun","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/longrun.json
+
+  # ------------------------------------------------------------ efficiency --
+  - name: efficiency
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-efficiency:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-efficiency
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"efficiency","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/efficiency.json
+
+  # --------------------------------------------------------------- economy --
+  - name: economy
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-economy:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-economy
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"economy","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/economy.json
+
+  # ------------------------------------------------------- coding-benchmark --
+  # Harness smoke (no provider keys, no network).
+  - name: coding-benchmark
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-bench:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-coding-benchmark --test smoke
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"coding-benchmark","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/coding-benchmark.json
+
+  # -------------------------------------------------- coding-benchmark-real --
+  # Provider-key run. NO secret is required and none is referenced: secrets
+  # referenced via `from_secret` that do not exist are a config error, so the
+  # opt-in happens through the agent/step environment instead. Without
+  # FAKTOR_BENCH_PROVIDER/MODEL/API_KEY the step records an explicit,
+  # reviewable SKIP marker (the rust test itself is also skip-safe); with the
+  # three variables present it runs the real-model corpus.
+  - name: coding-benchmark-real-model
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-real:/woodpecker-cache/target
+    commands:
+      - |
+        set -u
+        mkdir -p target/certification/lanes
+        if [ -n "${FAKTOR_BENCH_API_KEY:-}" ] && [ -n "${FAKTOR_BENCH_PROVIDER:-}" ] && [ -n "${FAKTOR_BENCH_MODEL:-}" ]; then
+          cargo test -p faktor-tests-coding-benchmark --test real -- --ignored
+          status="passed"; reason=""
+        else
+          status="skipped"
+          reason="provider-key run recorded as a skip: FAKTOR_BENCH_PROVIDER/FAKTOR_BENCH_MODEL/FAKTOR_BENCH_API_KEY are not configured; nightly never spends by default"
+        fi
+        printf '{"schema":"faktor-woodpecker-lane/v1","lane":"coding-benchmark-real-model","status":"%s","reason":"%s","commit":"%s"}\n' \
+          "$status" "$reason" "$CI_COMMIT_SHA" > target/certification/lanes/coding-benchmark-real-model.json
+        echo "coding-benchmark-real-model: $status ${reason:+(recorded skip)}"
+
+  # ----------------------------------------------------------- supply-chain --
+  - name: supply-chain
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-nightly-cargo-registry:/usr/local/cargo/registry
+      - faktor-nightly-cargo-git:/usr/local/cargo/git
+      - faktor-nightly-target-supply:/woodpecker-cache/target
+    commands:
+      - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"supply-chain","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/supply-chain.json
+
+  # --------------------------------------------------- certificate-nightly --
+  # Same marker mechanism as the push/PR certificates. `skipped` is accepted
+  # ONLY for coding-benchmark-real-model and only with a recorded reason;
+  # every other lane must be `passed` for this exact commit.
+  - name: certificate-nightly
+    image: python:3.13-slim
+    depends_on:
+      - fault-scale
+      - longrun
+      - efficiency
+      - economy
+      - coding-benchmark
+      - coding-benchmark-real-model
+      - supply-chain
+    when:
+      status: [success, failure]
+    commands:
+      - |
+        python3 - <<'PY'
+        import json, os, pathlib, sys
+
+        EXPECTED = [
+            "fault-scale",
+            "longrun",
+            "efficiency",
+            "economy",
+            "coding-benchmark",
+            "coding-benchmark-real-model",
+            "supply-chain",
+        ]
+        SKIPPABLE_WITH_REASON = {"coding-benchmark-real-model"}
+        SCHEMA = "faktor-woodpecker-lane/v1"
+        commit = os.environ.get("CI_COMMIT_SHA", "")
+        lanes_dir = pathlib.Path("target/certification/lanes")
+        out_dir = pathlib.Path("target/certification")
+        results = {}
+        problems = []
+
+        for lane in EXPECTED:
+            path = lanes_dir / (lane + ".json")
+            if not path.is_file():
+                results[lane] = "missing"
+                problems.append("lane " + lane + " wrote no marker (skipped, failed, or killed before its evidence step)")
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                results[lane] = "unreadable"
+                problems.append("lane " + lane + " marker is not valid JSON: " + str(exc))
+                continue
+            status = str(record.get("status", "unknown"))
+            if record.get("schema") != SCHEMA:
+                results[lane] = "wrong-schema"
+                problems.append("lane " + lane + " marker schema=" + str(record.get("schema")))
+            elif status == "skipped" and lane in SKIPPABLE_WITH_REASON:
+                if not str(record.get("reason", "")).strip():
+                    results[lane] = "silent-skip"
+                    problems.append("lane " + lane + " recorded a skip without a reason")
+                else:
+                    results[lane] = "skipped"
+            elif status != "passed":
+                results[lane] = status
+                problems.append("lane " + lane + " marker status=" + status)
+            elif commit and record.get("commit") != commit:
+                results[lane] = "stale"
+                problems.append("lane " + lane + " marker commit=" + str(record.get("commit")) + " != " + commit)
+            else:
+                results[lane] = "passed"
+
+        unexpected = sorted(
+            p.stem for p in lanes_dir.glob("*.json") if p.stem not in EXPECTED
+        ) if lanes_dir.is_dir() else []
+        for lane in unexpected:
+            problems.append("unexpected marker for lane " + lane)
+
+        pipeline_status = os.environ.get("CI_PIPELINE_STATUS", "unknown")
+        if pipeline_status != "success":
+            problems.append("workflow status before this step is " + pipeline_status + " (a campaign lane failed)")
+
+        status = "pass" if not problems else "fail"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema": "faktor-ci-certification/v1",
+            "platform": "linux-nightly",
+            "workflow": "nightly",
+            "commit": commit,
+            "pipeline": os.environ.get("CI_PIPELINE_NUMBER", ""),
+            "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
+            "status": status,
+            "lanes": results,
+        }
+        (out_dir / "ci-certification.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        for lane in EXPECTED:
+            print("passed " + lane) if results.get(lane) == "passed" else print(str(results.get(lane)).upper() + " " + lane)
+        if problems:
+            for problem in problems:
+                print("certification problem: " + problem, file=sys.stderr)
+            sys.exit(1)
+        print("certification: PASS (nightly campaign lanes verified)")
+        PY

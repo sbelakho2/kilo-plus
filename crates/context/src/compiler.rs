@@ -1396,6 +1396,64 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
     out
 }
 
+// ------------------------------------------------- coordination notice (P2)
+
+/// The fixed lead of the ONE coordination notice injected at a child's
+/// context boundary. The notice names only the unread COUNT and the
+/// `board_read` tool; post bodies never enter the prompt automatically.
+pub const COORDINATION_NOTICE_PREFIX: &str = "coordination: ";
+/// The fixed tail of the coordination notice.
+pub const COORDINATION_NOTICE_SUFFIX: &str = " unread; use board_read";
+/// Hard bound on one rendered notice. `u64` has 20 decimal digits and the
+/// fixed text is 34 bytes, so 64 leaves deterministic headroom; the exact
+/// bound is asserted by the tests.
+pub const MAX_COORDINATION_NOTICE_BYTES: usize = 64;
+
+/// The single-line coordination notice for `unread` messages, or `None`
+/// when nothing is unread. O(1) in the board size: `1` and `10_000` render
+/// byte-identical notices modulo the digits of `N` (never a body).
+pub fn coordination_notice(unread: u64) -> Option<String> {
+    if unread == 0 {
+        return None;
+    }
+    Some(format!(
+        "{COORDINATION_NOTICE_PREFIX}{unread}{COORDINATION_NOTICE_SUFFIX}"
+    ))
+}
+
+/// Revision-keyed memo of the coordination notice. `revision` is the board
+/// revision the unread counts were folded from: while the revision is
+/// UNCHANGED the cached bytes are returned WITHOUT running the counter
+/// closure again (no board rescan, no prompt change); a revision change
+/// recomputes exactly once, coalescing every intermediate change into the
+/// current single line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CoordinationNoticeMemo {
+    revision: Option<u64>,
+    notice: Option<String>,
+}
+
+impl CoordinationNoticeMemo {
+    /// The notice for `revision`, computed by `count` ONLY when the revision
+    /// moved; `None` when that revision has zero unread. An unchanged
+    /// revision returns the cached bytes and never calls `count`.
+    pub fn notice_for<F>(&mut self, revision: u64, count: F) -> Option<&str>
+    where
+        F: FnOnce() -> u64,
+    {
+        if self.revision != Some(revision) {
+            self.revision = Some(revision);
+            self.notice = coordination_notice(count());
+        }
+        self.notice.as_deref()
+    }
+
+    /// The revision the memo currently holds (`None` before the first call).
+    pub fn revision(&self) -> Option<u64> {
+        self.revision
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2307,5 +2365,103 @@ mod tests {
             before = page.next_before;
         }
         assert_eq!(seen, vec![7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    // ------------------------------------------------ coordination notice
+
+    /// The notice is ONE bounded line whose growth is only the digits of
+    /// `N`: 1 and 10 000 unread are byte-identical modulo the number, and
+    /// no body/newline can ever ride it (the API takes only a count).
+    #[test]
+    fn coordination_notice_grows_only_by_the_count_digits() {
+        let one = coordination_notice(1).expect("one unread renders");
+        let many = coordination_notice(10_000).expect("ten thousand unread renders");
+        let carve = |notice: &str, digits: &str| {
+            assert!(notice.starts_with(COORDINATION_NOTICE_PREFIX), "{notice}");
+            assert!(notice.ends_with(COORDINATION_NOTICE_SUFFIX), "{notice}");
+            let number = notice
+                .strip_prefix(COORDINATION_NOTICE_PREFIX)
+                .and_then(|rest| rest.strip_suffix(COORDINATION_NOTICE_SUFFIX))
+                .expect("the notice is exactly prefix + N + suffix");
+            assert_eq!(number, digits, "{notice}");
+            assert!(!notice.contains('\n'), "a single line, never a block");
+            assert!(
+                notice.len() <= MAX_COORDINATION_NOTICE_BYTES,
+                "bounded notice: {} bytes",
+                notice.len()
+            );
+        };
+        carve(&one, "1");
+        carve(&many, "10000");
+        assert_eq!(
+            one.replace('1', "N"),
+            many.replace("10000", "N"),
+            "the notices are byte-identical modulo the count"
+        );
+        assert_eq!(coordination_notice(0), None, "nothing unread => no notice");
+        // The exact template the audit specifies (count only, never bodies).
+        assert_eq!(one, "coordination: 1 unread; use board_read");
+    }
+
+    /// The memo recomputes ONLY when the board revision moved: an unchanged
+    /// revision returns byte-identical cached bytes without touching the
+    /// counter, and a revision bump recomputes exactly once.
+    #[test]
+    fn coordination_notice_memo_caches_by_revision() {
+        let calls = std::cell::Cell::new(0u32);
+        let mut memo = CoordinationNoticeMemo::default();
+        assert_eq!(memo.revision(), None);
+
+        let first = memo
+            .notice_for(7, || {
+                calls.set(calls.get() + 1);
+                1
+            })
+            .expect("one unread renders")
+            .to_string();
+        assert_eq!(first, "coordination: 1 unread; use board_read");
+        assert_eq!(calls.get(), 1, "first revision computes once");
+        assert_eq!(memo.revision(), Some(7));
+
+        // Unchanged revision: no recompute, byte-identical notice.
+        let again = memo
+            .notice_for(7, || {
+                calls.set(calls.get() + 1);
+                999
+            })
+            .expect("the cached notice is served")
+            .to_string();
+        assert_eq!(again, first, "unchanged revision => no prompt change");
+        assert_eq!(calls.get(), 1, "unchanged revision => no recompute");
+
+        // A revision bump recomputes exactly once with the new count.
+        let second = memo
+            .notice_for(8, || {
+                calls.set(calls.get() + 1);
+                10_000
+            })
+            .expect("ten thousand unread renders")
+            .to_string();
+        assert_eq!(second, "coordination: 10000 unread; use board_read");
+        assert_eq!(calls.get(), 2, "a revision bump computes once");
+        // Zero unread at a new revision: no notice, and the revision is
+        // still cached so the same revision stays silent without a rescan.
+        assert_eq!(
+            memo.notice_for(9, || {
+                calls.set(calls.get() + 1);
+                0
+            }),
+            None
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            memo.notice_for(9, || {
+                calls.set(calls.get() + 1);
+                5
+            }),
+            None,
+            "zero-unread revision stays cached"
+        );
+        assert_eq!(calls.get(), 3, "no recompute within the same revision");
     }
 }

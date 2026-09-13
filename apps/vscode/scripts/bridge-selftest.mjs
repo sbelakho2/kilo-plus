@@ -16,6 +16,7 @@ import {
   messageFromEntry,
   messagesLoadedMessage,
   nativeEventToWebviewMessages,
+  normalizeSteerText,
   readyMessage,
   sendMessageFailedMessage,
   sessionToUpstream,
@@ -392,7 +393,27 @@ export const bridgeTests = [
         throw new Error(`presentation mapped wrong: ${JSON.stringify(presentation)}`);
       }
       const steer = ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer', text: 'focus' });
-      if (steer.kind !== 'faktorAgentAction') throw new Error('steer not accepted');
+      if (steer.kind !== 'faktorAgentAction' || steer.text !== 'focus') {
+        throw new Error(`steer text not carried: ${JSON.stringify(steer)}`);
+      }
+      const steerHost = bridgeCommandToHostMessage(steer);
+      if (
+        JSON.stringify(steerHost) !==
+        JSON.stringify({ type: 'agentControl', agentId: 'c1', action: 'steer', text: 'focus' })
+      ) {
+        throw new Error(`steer host mapping wrong: ${JSON.stringify(steerHost)}`);
+      }
+      // The bare action is the HOST-PROMPT request: accepted, no text.
+      const steerPrompt = ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer' });
+      if (steerPrompt.kind !== 'faktorAgentAction' || steerPrompt.text !== null) {
+        throw new Error(`bare steer must map to the host prompt: ${JSON.stringify(steerPrompt)}`);
+      }
+      if (
+        JSON.stringify(bridgeCommandToHostMessage(steerPrompt)) !==
+        JSON.stringify({ type: 'agentControl', agentId: 'c1', action: 'steer' })
+      ) {
+        throw new Error('bare steer host mapping must omit text');
+      }
       if (ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'model' }).kind !== 'faktorAgentAction') {
         throw new Error('model action requires no inline value (the host prompts)');
       }
@@ -452,9 +473,14 @@ export const bridgeTests = [
         'bad presentation state',
       );
       assertDrop(
-        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer' }),
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer', text: '   ' }),
         'non-empty string for steer',
-        'steer without text',
+        'whitespace-only steer',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'steer', text: 7 }),
+        'non-empty string for steer',
+        'non-string steer text',
       );
       assertDrop(
         ingestWebviewMessage({
@@ -465,6 +491,11 @@ export const bridgeTests = [
         }),
         'character bound',
         'oversized steer',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'retry', text: 'focus' }),
+        'not valid for action',
+        'text smuggled onto a non-steer action',
       );
       assertDrop(
         ingestWebviewMessage({ type: 'faktorAgentAction', agentId: 'c1', action: 'retry', state: 'background' }),
@@ -517,6 +548,30 @@ export const bridgeTests = [
         'bytes',
         'oversized ref',
       );
+    },
+  },
+  {
+    label: 'host steer guard refuses hostile/oversized notes typed (mirror of the runtime rule)',
+    fn: () => {
+      const ok = normalizeSteerText('  tighten the loop  ');
+      if (!ok.ok || ok.text !== 'tighten the loop') {
+        throw new Error(`normalization wrong: ${JSON.stringify(ok)}`);
+      }
+      const atBound = normalizeSteerText('n'.repeat(BRIDGE_LIMITS.maxSteerChars));
+      if (!atBound.ok || atBound.text.length !== BRIDGE_LIMITS.maxSteerChars) {
+        throw new Error('the exact bound must be accepted');
+      }
+      for (const [label, value, needle] of [
+        ['empty', '', 'non-empty'],
+        ['whitespace', ' \t ', 'non-empty'],
+        ['non-string', 7, 'non-empty'],
+        ['oversized', `n`.repeat(BRIDGE_LIMITS.maxSteerChars + 1), 'character bound'],
+      ]) {
+        const refused = normalizeSteerText(value);
+        if (refused.ok || !refused.reason.includes(needle)) {
+          throw new Error(`${label}: expected a typed refusal mentioning ${needle}, got ${JSON.stringify(refused)}`);
+        }
+      }
     },
   },
   {

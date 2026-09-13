@@ -26,9 +26,9 @@ use faktor_context::assembler::{Evidence, RecentTurn};
 use faktor_context::budget::ContextBudget;
 use faktor_context::compactor::{CompactionPlan, CompactionRequest, Compactor, Summarizer};
 use faktor_context::compiler::{
-    CompilerError, CompilerInput, ContextCompiler, CriterionFact, DurableEvidenceAuthority,
-    EvidenceId, EvidenceKind, ProvenanceSource, TaskFacts, VerificationState, VolatileClaims,
-    WorkItem,
+    CompilerError, CompilerInput, ContextCompiler, CoordinationNoticeMemo, CriterionFact,
+    DurableEvidenceAuthority, EvidenceId, EvidenceKind, ProvenanceSource, TaskFacts,
+    VerificationState, VolatileClaims, WorkItem,
 };
 use faktor_context::ledger::TaskLedger;
 use faktor_context::wire_plan::WirePlan;
@@ -1278,6 +1278,12 @@ pub struct AgentRuntime {
     /// last_op_completed_at}` per live session, fed from op completions,
     /// tool events and output chunks.
     progress: std::sync::Mutex<std::collections::HashMap<SessionId, StallTracker>>,
+    /// Per-child coordination-notice memo, keyed by child session and folded
+    /// by the run-family BOARD REVISION (P2): the unread scan runs once per
+    /// revision, and intermediate board changes coalesce into the single
+    /// "coordination: N unread; use board_read" line — automatic prompt
+    /// growth is O(1) in the board size, and a body can never ride it.
+    coordination: std::sync::Mutex<std::collections::HashMap<SessionId, CoordinationNoticeMemo>>,
     /// The runtime's token-count cache (P0-81): bounded LRU keyed by
     /// (model tokenizer identity, content hash), shared by every session
     /// this runtime plans for. Interior mutex: wire planning holds it
@@ -1562,6 +1568,7 @@ impl AgentRuntime {
             deps: Arc::new(deps),
             runners: std::sync::Mutex::new(std::collections::HashSet::new()),
             progress: std::sync::Mutex::new(std::collections::HashMap::new()),
+            coordination: std::sync::Mutex::new(std::collections::HashMap::new()),
             token_cache: TokenCache::new(),
             stall_silence_ms: std::sync::atomic::AtomicU64::new(DEFAULT_STALL_SILENCE_MS),
             quality_mode: std::sync::atomic::AtomicU8::new(0),
@@ -2489,6 +2496,57 @@ impl AgentRuntime {
                 continue;
             }
         }
+    }
+
+    /// The ONE bounded coordination notice of this child's context boundary
+    /// (P2): `coordination: N unread; use board_read`, folded from the
+    /// child's durable unread counts and memoized by the run-family board
+    /// REVISION. Only orchestrated children are served; post bodies never
+    /// enter the notice (the count is the only value), an unchanged revision
+    /// never rescans nor changes the prompt bytes, and any read failure
+    /// (absent root, oversize board scan, store error) is neutral — no
+    /// notice, never a turn error.
+    fn child_coordination_notice(
+        &self,
+        handle: &faktor_session::SessionHandle,
+    ) -> faktor_core::Result<Option<String>> {
+        if handle.orchestrator_child_identity_get()?.is_none() {
+            return Ok(None);
+        }
+        // The board (and its revision) lives in the run-family ROOT's
+        // ledger; the child's own head does not carry it.
+        let root_id = handle.board_id()?.root();
+        let Some(root) = self.deps.session.get_session(root_id)? else {
+            return Ok(None);
+        };
+        let revision = root.ledger_ensure_head()?.board_revision;
+        let child = faktor_session::board::ChildId::of_session(handle.id());
+        let mut cache = self
+            .coordination
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let memo = cache.entry(handle.id()).or_default();
+        let mut read_error: Option<String> = None;
+        let rendered = memo
+            .notice_for(revision, || match handle.board_unread_counts(child) {
+                Ok(counts) => counts.values().map(|count| u64::from(*count)).sum(),
+                Err(err) => {
+                    read_error = Some(err.message);
+                    0
+                }
+            })
+            .map(str::to_string);
+        drop(cache);
+        if let Some(message) = read_error {
+            tracing::warn!(
+                session = %handle.id(),
+                board_revision = revision,
+                error = %message,
+                "coordination unread scan failed; no notice this boundary (neutral)"
+            );
+            return Ok(None);
+        }
+        Ok(rendered)
     }
 
     /// Drive an already-submitted turn receipt to its single genuine end.
@@ -3650,6 +3708,17 @@ impl AgentRuntime {
             let (model_changed, steer_note) = self
                 .drive_boundary_controls(handle, op_id, &cancel, &mut model)
                 .await?;
+            // P2 coordination boundary: the ONE bounded unread notice of an
+            // orchestrated child, merged with the durable steering note into
+            // the volatile `## Steering` slot. The notice is memoized by the
+            // board revision, carries COUNT ONLY (never bodies), and is the
+            // sole automatic prompt growth no matter how large the board is.
+            let coordination = self.child_coordination_notice(handle)?;
+            let system_extra = match coordination {
+                Some(notice) if steer_note.is_empty() => notice,
+                Some(notice) => format!("{steer_note}\n{notice}"),
+                None => steer_note,
+            };
             if model_changed {
                 caps = provider.capabilities(&model);
                 effective_caps = caps.clone();
@@ -3894,7 +3963,7 @@ impl AgentRuntime {
                 .context_prior(self.deps.context_prior.as_deref());
             let mut wire_plan = plan_wire_turn_with_prior(
                 &self.deps.instructions,
-                &steer_note,
+                &system_extra,
                 &tool_bundle.tools,
                 &project_rules,
                 &ledger,
@@ -3919,7 +3988,7 @@ impl AgentRuntime {
                     history = recent_turns_to_messages(&plan.kept_recent);
                     wire_plan = plan_wire_turn_with_prior(
                         &self.deps.instructions,
-                        &steer_note,
+                        &system_extra,
                         &tool_bundle.tools,
                         &project_rules,
                         &ledger,
@@ -4040,7 +4109,7 @@ impl AgentRuntime {
                 // seeded so the planning model itself is never rebuilt.
                 let candidate_planner = crate::wire_plan::TurnCandidatePlanner::new(
                     &self.deps.instructions,
-                    &steer_note,
+                    &system_extra,
                     &tool_bundle.tools,
                     &project_rules,
                     &ledger,
@@ -29556,6 +29625,106 @@ mod tests {
         assert!(
             selected.body.contains(ATTACK),
             "the summarized selection is the only form the peer text may take"
+        );
+    }
+
+    /// P2 coordination boundary: an orchestrated child's wire request carries
+    /// ONE bounded `coordination: N unread; use board_read` line, memoized by
+    /// board revision (1 vs 10 000 unread is the same line modulo digits),
+    /// never a board body, and non-children get no notice at all.
+    #[tokio::test]
+    async fn child_boundary_coordination_notice_is_bounded_never_a_body_and_memoized() {
+        let (seed_deps, _dir0) = deps(scripted_provider(vec![ScriptedResponse::End]), vec![]);
+        let (manager, root) = shared_session(&seed_deps);
+        let root_handle = manager.get_session(root).unwrap().unwrap();
+        let ws = root_handle.row().unwrap().workspace_id;
+        let child = manager
+            .create_child_session(
+                root,
+                ws,
+                faktor_core::id::WorktreeId::new(1),
+                TaskId::new(1),
+                "fake",
+                "m",
+                "coordination child",
+                faktor_session::child::ChildOwnership::IsolatedWorktree,
+            )
+            .unwrap();
+        let secret = "SECRET BOARD BODY MUST NEVER ENTER THE PROMPT";
+        root_handle.board_post("status", secret, &[]).unwrap();
+
+        let captured: Arc<std::sync::Mutex<Vec<GenericAgentRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let inspected = Arc::new(InspectingProvider::new(
+            Arc::new(FakeProvider::with_script(
+                "fake",
+                ModelCapabilities {
+                    tools: true,
+                    ..Default::default()
+                },
+                vec![ScriptedResponse::Text("ok".into()), ScriptedResponse::End],
+            )),
+            move |_n, req| {
+                cap.lock().unwrap().push(req.clone());
+                Ok(())
+            },
+        ));
+        let (deps1, _dir1) = deps_sharing_session(manager.clone(), inspected, vec![]);
+        let runtime = AgentRuntime::new(deps1).unwrap();
+
+        // One unread => the exact single line; the unchanged revision is
+        // served from the memo (byte-identical) and the root gets nothing.
+        let first = runtime.child_coordination_notice(&child).unwrap();
+        assert_eq!(
+            first.as_deref(),
+            Some("coordination: 1 unread; use board_read")
+        );
+        assert_eq!(
+            runtime.child_coordination_notice(&child).unwrap(),
+            first,
+            "unchanged revision => byte-identical memoized notice"
+        );
+        assert_eq!(
+            runtime.child_coordination_notice(&root_handle).unwrap(),
+            None,
+            "only orchestrated children carry the notice"
+        );
+
+        // A second post bumps the revision: the notice recomputes to the
+        // same single line with the new count (coalesced, still O(1)).
+        root_handle
+            .board_post("again", "another body", &[])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .child_coordination_notice(&child)
+                .unwrap()
+                .as_deref(),
+            Some("coordination: 2 unread; use board_read")
+        );
+
+        // The child's turn injects the notice into the volatile steering
+        // slot and never a board body.
+        let outcome = runtime.run_turn(child.id(), "go", &[]).await.unwrap();
+        assert!(
+            !matches!(
+                outcome.final_state,
+                AgentState::FailedRecoverable | AgentState::FailedPermanent
+            ),
+            "{:?}",
+            outcome.final_state
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one wire request for the turn");
+        let system = &requests[0].system;
+        assert!(
+            system.contains("coordination: 2 unread; use board_read"),
+            "the bounded notice must ride the child prompt: {system}"
+        );
+        assert!(
+            !system.contains(secret) && !system.contains("another body"),
+            "board bodies never enter the prompt automatically"
         );
     }
 

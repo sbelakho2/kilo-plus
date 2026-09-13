@@ -1,0 +1,148 @@
+# Faktor CI — soak campaign (Woodpecker cron event, job name `soak`).
+#
+# REGISTRATION: a cron workflow only runs after the matching cron job exists
+# in the repository settings. Register it with
+#   bash scripts/woodpecker/activate.sh <owner/repo> --run-now
+# or via the API `POST /api/repos/{repo_id}/cron` with
+#   {"name":"soak","schedule":"0 4 * * 6","branch":"main","timezone":"UTC","enabled":true}
+# (or Repository Settings → Cron Jobs in the UI). See setup.md §6.
+#
+# TIMEOUT (required): Woodpecker has no per-step timeout, and the default
+# repository pipeline timeout is 60 minutes (max settable 120). The 24h
+# wall-clock run therefore needs BOTH:
+#   server: WOODPECKER_MAX_PIPELINE_TIMEOUT=1560   (26h; server/agent env)
+#   repo:   PATCH /api/repos/{repo_id} {"timeout":1560}
+# On hosted woodpecker-ci.org the server-side cap is fixed: the longrun-24h
+# lane can only run on a self-hosted instance where the cap was raised, and
+# it stays a recorded non-run otherwise (setup.md §6).
+#
+# STORAGE POLICY: cron events are trusted, so this workflow may use its own
+# `faktor-soak-*` named volumes. It never mounts `faktor-trusted-*`
+# (trusted.yaml) or `faktor-nightly-*` (nightly.yaml), and `pr.yaml` never
+# mounts these.
+#
+# Coverage: the [soak] 12h synthetic session (tests/soak, skew-safe) and the
+# [soak] 24h zero-drift wall-clock certification (tests/longrun).
+# Commit-status context (default format): ci/woodpecker/cron/soak
+
+labels:
+  platform: linux/amd64
+
+when:
+  - event: cron
+    cron: soak
+
+steps:
+  # ----------------------------------------------------------- soak-scale --
+  # [soak] 12-hour synthetic session (time-skewed, bounded).
+  - name: soak-scale
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-soak-cargo-registry:/usr/local/cargo/registry
+      - faktor-soak-cargo-git:/usr/local/cargo/git
+      - faktor-soak-target-scale:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-soak --release -- --ignored
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"soak-scale","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/soak-scale.json
+
+  # ------------------------------------------------------------ longrun-24h --
+  # [soak] 24h zero-drift certification (real wall clock).
+  - name: longrun-24h
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-soak-cargo-registry:/usr/local/cargo/registry
+      - faktor-soak-cargo-git:/usr/local/cargo/git
+      - faktor-soak-target-longrun:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-longrun --release -- --ignored
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"longrun-24h","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/longrun-24h.json
+
+  # ------------------------------------------------------ certificate-soak --
+  # Same marker mechanism as the other certificates: both [soak] lanes must
+  # produce a passed marker for this exact commit, and the workflow status
+  # must be success. The manifest is the durable soak evidence for the commit.
+  - name: certificate-soak
+    image: python:3.13-slim
+    depends_on:
+      - soak-scale
+      - longrun-24h
+    when:
+      status: [success, failure]
+    commands:
+      - |
+        python3 - <<'PY'
+        import json, os, pathlib, sys
+
+        EXPECTED = ["soak-scale", "longrun-24h"]
+        SCHEMA = "faktor-woodpecker-lane/v1"
+        commit = os.environ.get("CI_COMMIT_SHA", "")
+        lanes_dir = pathlib.Path("target/certification/lanes")
+        out_dir = pathlib.Path("target/certification")
+        results = {}
+        problems = []
+
+        for lane in EXPECTED:
+            path = lanes_dir / (lane + ".json")
+            if not path.is_file():
+                results[lane] = "missing"
+                problems.append("lane " + lane + " wrote no marker (skipped, failed, timed out, or killed before its evidence step)")
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                results[lane] = "unreadable"
+                problems.append("lane " + lane + " marker is not valid JSON: " + str(exc))
+                continue
+            status = str(record.get("status", "unknown"))
+            if record.get("schema") != SCHEMA:
+                results[lane] = "wrong-schema"
+                problems.append("lane " + lane + " marker schema=" + str(record.get("schema")))
+            elif status != "passed":
+                results[lane] = status
+                problems.append("lane " + lane + " marker status=" + status)
+            elif commit and record.get("commit") != commit:
+                results[lane] = "stale"
+                problems.append("lane " + lane + " marker commit=" + str(record.get("commit")) + " != " + commit)
+            else:
+                results[lane] = "passed"
+
+        unexpected = sorted(
+            p.stem for p in lanes_dir.glob("*.json") if p.stem not in EXPECTED
+        ) if lanes_dir.is_dir() else []
+        for lane in unexpected:
+            problems.append("unexpected marker for lane " + lane)
+
+        pipeline_status = os.environ.get("CI_PIPELINE_STATUS", "unknown")
+        if pipeline_status != "success":
+            problems.append("workflow status before this step is " + pipeline_status + " (a soak lane failed)")
+
+        status = "pass" if not problems else "fail"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema": "faktor-ci-certification/v1",
+            "platform": "linux-soak",
+            "workflow": "soak",
+            "commit": commit,
+            "pipeline": os.environ.get("CI_PIPELINE_NUMBER", ""),
+            "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
+            "status": status,
+            "lanes": results,
+        }
+        (out_dir / "ci-certification.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        for lane in EXPECTED:
+            print("passed " + lane) if results.get(lane) == "passed" else print("FAILED " + str(results.get(lane)) + " " + lane)
+        if problems:
+            for problem in problems:
+                print("certification problem: " + problem, file=sys.stderr)
+            sys.exit(1)
+        print("certification: PASS (soak lanes verified; this is the durable soak evidence for the commit)")
+        PY

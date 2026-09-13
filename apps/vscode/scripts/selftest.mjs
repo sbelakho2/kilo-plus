@@ -3423,6 +3423,38 @@ async function companionPanelTests() {
     assert(pause, 'a running child must offer Pause');
     pause.click();
     assertEqual(posted[posted.length - 1].action, 'pause');
+
+    // Steer (P2 UI parity): a bounded inline textbox plus the button posts
+    // the EXACT faktorAgentAction body; an empty box falls back to the bare
+    // host-prompt request.
+    const steerInput = findAll(
+      cards[1],
+      (node) => node.tagName === 'input' && node.getAttribute('aria-label') === 'steer note',
+      walk,
+    )[0];
+    assert(steerInput, 'a child card must offer the inline steer textbox');
+    assertEqual(steerInput.maxLength, 500, 'the steer textbox must be bounded at 500 chars');
+    const steerButton = findAll(
+      cards[1],
+      (node) => node.tagName === 'button' && node.textContent === 'Steer',
+      walk,
+    )[0];
+    assert(steerButton, 'a child card must offer Steer');
+    steerInput.value = '  focus on the parser  ';
+    steerButton.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'faktorAgentAction',
+      agentId: 'c2',
+      action: 'steer',
+      text: 'focus on the parser',
+    });
+    steerInput.value = '   ';
+    steerButton.click();
+    assertDeepEqual(posted[posted.length - 1], {
+      type: 'faktorAgentAction',
+      agentId: 'c2',
+      action: 'steer',
+    });
     const toggle = findAll(
       cards[0],
       (node) => node.tagName === 'button' && node.textContent === 'Foreground',

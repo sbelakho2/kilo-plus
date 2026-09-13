@@ -1,0 +1,290 @@
+# Faktor CI — pull_request workflow. UNTRUSTED EVENT: EPHEMERAL STORAGE ONLY.
+#
+# SECURITY POLICY (audit P1): a pull_request pipeline may be driven by code
+# that is not yet reviewed, so this file must never declare `volumes:` and
+# must never set CARGO_TARGET_DIR to a named-volume path. Everything a PR
+# job writes stays inside the per-pipeline workspace and is discarded when
+# the pipeline ends. The trusted caches (`faktor-trusted-*`, mounted only by
+# `trusted.yaml`) and the cron caches (`faktor-nightly-*` / `faktor-soak-*`)
+# are therefore out of reach of PR code by construction.
+#
+# Why a separate workflow file instead of an event filter on `trusted.yaml`:
+# Woodpecker's trusted/volumes flag is per repository, not per event, so the
+# only structural guarantee that a PR can never mount a cache is that the
+# workflow file the PR event runs contains no volume declaration at all.
+#
+# The step set is deliberately reduced: the release `[perf]` budgets (and the
+# trusted/platform certificates) belong to `trusted.yaml`; a PR still runs the
+# full correctness set (fmt/clippy/check/test/doctor, static+security+fuzz,
+# docs-sync, VSIX build+verify, required chromium render gate, JetBrains
+# build+smoke) without a warm cache.
+#
+# Commit-status context (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
+#   ci/woodpecker/pr/pr — this is the context branch protection requires.
+#
+# Residual risk (documented in scripts/woodpecker/setup.md §5): if the
+# repository is marked Trusted (volumes) so the trusted workflow can use
+# caches, a PR that edits its own config could add `volumes:` and Woodpecker
+# would honor it. Keep "Require approval for forked repositories" enabled
+# (the Woodpecker default) and review config edits.
+
+labels:
+  platform: linux/amd64
+
+when:
+  - event: pull_request
+
+steps:
+  # ------------------------------------------------------ storage policy --
+  # Fail closed on an accidental regression: the PR workflow itself must not
+  # declare a volume. A malicious config can remove this guard, which is why
+  # it is only defense-in-depth; the structural guarantee is the absent
+  # `volumes:` key plus the documented trust/approval settings.
+  - name: storage-policy
+    image: alpine:3.20
+    commands:
+      - |
+        set -eu
+        if grep -nE '^[[:space:]]*volumes:' .woodpecker/pr.yaml; then
+          echo "POLICY VIOLATION: .woodpecker/pr.yaml must not declare volumes (untrusted event)" >&2
+          exit 1
+        fi
+        if grep -vE '^[[:space:]]*#' .woodpecker/pr.yaml | grep -nE 'faktor-(trusted|nightly|soak)-'; then
+          echo "POLICY VIOLATION: .woodpecker/pr.yaml must not reference trusted/cron cache volumes" >&2
+          exit 1
+        fi
+        echo "storage policy: PR workflow declares no volumes"
+
+  # ---------------------------------------------------------------- linux --
+  - name: linux
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
+      - rustup component add rustfmt clippy
+      - cargo fmt --check
+      - cargo check --workspace --all-features
+      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - cargo test --workspace --all-features
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"linux","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/linux.json
+
+  # --------------------------------------------------------------- static --
+  - name: static
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - cargo test -p faktor-tests-static-authority
+      - cargo test -p faktor-security
+      - cargo test -p faktor-tests-fuzz-seeds
+      - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="target/release/faktor-cli" bash scripts/supply-chain.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"static","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/static.json
+
+  # ----------------------------------------------------------------- docs --
+  - name: docs
+    image: rust:1.98
+    environment:
+      RUST_BACKTRACE: "1"
+    commands:
+      - cargo doc --workspace --all-features --no-deps
+      - bash scripts/branding-scan.sh
+      - bash scripts/check-docs-sync.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"docs","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/docs.json
+
+  # --------------------------------------------------------------- vscode --
+  - name: vscode
+    image: node:24
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
+      - cd apps/vscode
+      - npm ci
+      - npm run build
+      - node scripts/selftest.mjs
+      - npm run prepackage:vsix
+      - npx --yes @vscode/vsce package --out faktor-ci.vsix
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+      - rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
+      - node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
+      - cd "$CI_WORKSPACE"
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"vscode","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/vscode.json
+
+  # -------------------------------------------------------- vscode-visual --
+  - name: vscode-visual
+    image: node:24
+    commands:
+      - export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
+      - node scripts/webview-visual-check.mjs --self-test
+      - npm install --prefix target/visual-playwright --no-save playwright
+      - target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
+      - node scripts/webview-visual-check.mjs
+      - |
+        node -e '
+          const fs = require("node:fs");
+          const report = JSON.parse(
+            fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
+          );
+          const status = report.render && report.render.status;
+          if (status !== "passed") {
+            console.error("REQUIRED render gate did not pass (render.status=" + status + ")");
+            process.exit(1);
+          }
+          console.log("render gate passed (" + (report.render.states || "?") + " states)");
+        '
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"vscode-visual","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/vscode-visual.json
+
+  # ----------------------------------------------- vscode-visual-with-skip --
+  # Diagnostics twin: explicit skip when chromium cannot be installed; never
+  # a substitute for the required render lane above.
+  - name: vscode-visual-with-skip
+    image: node:24
+    depends_on: [vscode-visual]
+    when:
+      status: [success, failure]
+    environment:
+      VISUAL_PLAYWRIGHT_DIR: target/visual-playwright-diagnostics
+    commands:
+      - bash scripts/ci-vscode-visual.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"vscode-visual-with-skip","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/vscode-visual-with-skip.json
+
+  # -------------------------------------------------------- jetbrains-build --
+  - name: jetbrains-build
+    image: eclipse-temurin:17-jdk
+    commands:
+      - cd apps/jetbrains
+      - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
+      - cd "$CI_WORKSPACE"
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"jetbrains-build","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/jetbrains-build.json
+
+  # -------------------------------------------------------- jetbrains-smoke --
+  - name: jetbrains-smoke
+    image: ubuntu:24.04
+    environment:
+      RUST_BACKTRACE: "1"
+      DEBIAN_FRONTEND: noninteractive
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends build-essential curl pkg-config libssl-dev kotlin openjdk-11-jre-headless ca-certificates
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - . "$HOME/.cargo/env"
+      - bash apps/jetbrains/compile-and-smoke.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"jetbrains-smoke","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/jetbrains-smoke.json
+
+  # ---------------------------------------------------------- certificate --
+  # Aggregate gate for the PR lane set (same marker rule as trusted.yaml,
+  # minus the trusted-only perf lane). Runs even when a lane failed so the
+  # evidence is honest, and fails on any missing/failed/stale/unexpected
+  # marker or a non-success CI_PIPELINE_STATUS. Because Woodpecker reports
+  # one commit status per workflow, this step's failure fails the whole
+  # `pr` workflow — which is why branch protection requires
+  # `ci/woodpecker/pr/pr`.
+  - name: certificate
+    image: python:3.13-slim
+    depends_on:
+      - storage-policy
+      - linux
+      - static
+      - docs
+      - vscode
+      - vscode-visual
+      - vscode-visual-with-skip
+      - jetbrains-build
+      - jetbrains-smoke
+    when:
+      status: [success, failure]
+    commands:
+      - |
+        python3 - <<'PY'
+        import json, os, pathlib, sys
+
+        EXPECTED = [
+            "linux",
+            "static",
+            "docs",
+            "vscode",
+            "vscode-visual",
+            "vscode-visual-with-skip",
+            "jetbrains-build",
+            "jetbrains-smoke",
+        ]
+        SCHEMA = "faktor-woodpecker-lane/v1"
+        commit = os.environ.get("CI_COMMIT_SHA", "")
+        lanes_dir = pathlib.Path("target/certification/lanes")
+        out_dir = pathlib.Path("target/certification")
+        results = {}
+        problems = []
+
+        # Defense-in-depth storage policy: the PR workflow file that this
+        # pipeline actually runs must not declare volumes.
+        pr_file = pathlib.Path(".woodpecker/pr.yaml")
+        if pr_file.is_file():
+            for lineno, line in enumerate(pr_file.read_text(encoding="utf-8").splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("volumes:"):
+                    problems.append(
+                        "storage policy: .woodpecker/pr.yaml:%d declares volumes on an untrusted event" % lineno
+                    )
+        else:
+            problems.append("storage policy: .woodpecker/pr.yaml is missing from the workspace")
+
+        for lane in EXPECTED:
+            path = lanes_dir / (lane + ".json")
+            if not path.is_file():
+                results[lane] = "missing"
+                problems.append("lane " + lane + " wrote no marker (skipped, failed, or killed before its evidence step)")
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                results[lane] = "unreadable"
+                problems.append("lane " + lane + " marker is not valid JSON: " + str(exc))
+                continue
+            status = str(record.get("status", "unknown"))
+            if record.get("schema") != SCHEMA:
+                results[lane] = "wrong-schema"
+                problems.append("lane " + lane + " marker schema=" + str(record.get("schema")))
+            elif status != "passed":
+                results[lane] = status
+                problems.append("lane " + lane + " marker status=" + status)
+            elif commit and record.get("commit") != commit:
+                results[lane] = "stale"
+                problems.append("lane " + lane + " marker commit=" + str(record.get("commit")) + " != " + commit)
+            else:
+                results[lane] = "passed"
+
+        unexpected = sorted(
+            p.stem for p in lanes_dir.glob("*.json") if p.stem not in EXPECTED
+        ) if lanes_dir.is_dir() else []
+        for lane in unexpected:
+            problems.append("unexpected marker for lane " + lane)
+
+        pipeline_status = os.environ.get("CI_PIPELINE_STATUS", "unknown")
+        if pipeline_status != "success":
+            problems.append("workflow status before this step is " + pipeline_status + " (a dependency lane failed)")
+
+        status = "pass" if not problems else "fail"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema": "faktor-ci-certification/v1",
+            "platform": "linux-pr",
+            "workflow": "pr",
+            "commit": commit,
+            "pipeline": os.environ.get("CI_PIPELINE_NUMBER", ""),
+            "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
+            "status": status,
+            "lanes": results,
+        }
+        (out_dir / "ci-certification.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        for lane in EXPECTED:
+            print("passed " + lane) if results.get(lane) == "passed" else print("FAILED " + str(results.get(lane)) + " " + lane)
+        if problems:
+            for problem in problems:
+                print("certification problem: " + problem, file=sys.stderr)
+            sys.exit(1)
+        print("certification: PASS (every required PR lane produced a passed marker)")
+        PY

@@ -10957,6 +10957,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 2", []).unwrap();
             }
             s.id
@@ -11178,6 +11184,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 5", []).unwrap();
             }
             s.id
@@ -12243,6 +12255,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 7", []).unwrap();
             }
             s.id
@@ -12394,6 +12412,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 8", []).unwrap();
             }
             (s.id, ws)
@@ -12650,6 +12674,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ws)
@@ -12776,6 +12806,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE provider_call DROP COLUMN reservation_id", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 9", []).unwrap();
             }
             (s.id, ledger)
@@ -13559,6 +13595,12 @@ mod tests {
                     .unwrap();
                 conn.execute("ALTER TABLE task DROP COLUMN spent_cost_micro", [])
                     .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 13", []).unwrap();
             }
             (s.id, row)
@@ -14541,6 +14583,12 @@ mod typed_ledger_tests {
                     [],
                 )
                 .unwrap();
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 14", []).unwrap();
             }
             (s.id, TaskId::new(1))
@@ -14689,6 +14737,12 @@ mod typed_ledger_tests {
                 .unwrap();
                 // Rewind the cursor: the v16 (index 16, target 17) and v17
                 // (index 17, target 18) blocks replay on reopen.
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 16", []).unwrap();
             }
             (s.id, tid)
@@ -15970,6 +16024,12 @@ mod typed_ledger_tests {
                 .unwrap();
                 // Rewind the cursor to the v16 schema target: ONLY the v17
                 // block (index 17, target 18) replays on reopen.
+                // v24 attachments are post-this-version: drop them (tolerantly,
+                // some legacy shapes lack the table/column) so the full chain
+                // replays cleanly on reopen.
+                let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+                let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+                let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
                 conn.execute("PRAGMA user_version = 17", []).unwrap();
             }
             (s.id, tid)
@@ -16682,6 +16742,12 @@ mod typed_ledger_tests {
                 [],
             )
             .unwrap();
+            // v24 attachments are post-this-version: drop them (tolerantly,
+            // some legacy shapes lack the table/column) so the full chain
+            // replays cleanly on reopen.
+            let _ = conn.execute("ALTER TABLE task DROP COLUMN attachments", []);
+            let _ = conn.execute("ALTER TABLE task_ledger DROP COLUMN attachments", []);
+            let _ = conn.execute("DROP TABLE IF EXISTS attachment", []);
             conn.execute("PRAGMA user_version = 18", []).unwrap();
         }
         let store = Store::open(dir.path().join("store"), true).unwrap();
@@ -17158,6 +17224,8 @@ mod evidence_store_tests {
                  DROP INDEX IF EXISTS idx_evidence_session_task;
                  DROP INDEX IF EXISTS idx_evidence_backing_cas;
                  DROP TABLE IF EXISTS evidence;
+                 ALTER TABLE task DROP COLUMN attachments;
+                 DROP TABLE IF EXISTS attachment;
                  PRAGMA user_version = 21;",
             )
             .unwrap();

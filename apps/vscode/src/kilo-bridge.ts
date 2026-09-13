@@ -151,6 +151,32 @@ const PRESENTATION_STATES: ReadonlySet<string> = new Set(['foreground', 'backgro
 /** Mirrors the daemon's bounded abort reason (native tournament abort DTO). */
 export const MAX_TOURNAMENT_ABORT_BYTES = BRIDGE_LIMITS.maxAbortReasonBytes;
 
+/**
+ * The host-side steer guard (mirrors the runtime's non-empty/<=500-char
+ * rule): trims one inline note and returns it, or a typed refusal reason.
+ * Both the bridge ingest and the host control path run THIS function, so a
+ * hostile/oversized value is refused with the same reason at both layers
+ * before the daemon (which re-validates) ever sees it.
+ */
+export function normalizeSteerText(
+  raw: unknown,
+): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly reason: string } {
+  if (typeof raw !== 'string') {
+    return { ok: false, reason: 'faktorAgentAction.text must be a non-empty string for steer' };
+  }
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: 'faktorAgentAction.text must be a non-empty string for steer' };
+  }
+  if (trimmed.length > BRIDGE_LIMITS.maxSteerChars) {
+    return {
+      ok: false,
+      reason: `faktorAgentAction.text exceeds ${BRIDGE_LIMITS.maxSteerChars} character bound`,
+    };
+  }
+  return { ok: true, text: trimmed };
+}
+
 const MESSAGE_LOAD_MODES: ReadonlySet<string> = new Set([
   'replace',
   'prepend',
@@ -301,6 +327,8 @@ export type BridgeCommand =
       readonly agentId: string;
       readonly action: string;
       readonly state: string | null;
+      /** The bounded inline steer note; `null` = the host prompts. */
+      readonly text: string | null;
     }
   | { readonly kind: 'faktorEvidenceExpand'; readonly evidenceId: number }
   | {
@@ -842,17 +870,20 @@ export function ingestWebviewMessage(
     } else if (message.state !== undefined && message.state !== null) {
       return drop(rawType, `faktorAgentAction.state is not valid for action "${message.action}"`, bytes);
     }
+    let text: string | null = null;
     if (message.action === 'steer') {
-      if (typeof message.text !== 'string' || message.text.trim().length === 0) {
-        return drop(rawType, 'faktorAgentAction.text must be a non-empty string for steer', bytes);
+      // `text` is optional: an absent value is the host-prompt request
+      // (the fallback UI's Steer control). A PROVIDED value is bounded and
+      // non-empty by the SAME guard the host control path runs.
+      if (message.text !== undefined && message.text !== null) {
+        const guard = normalizeSteerText(message.text);
+        if (!guard.ok) {
+          return drop(rawType, guard.reason, bytes);
+        }
+        text = guard.text;
       }
-      if (message.text.length > BRIDGE_LIMITS.maxSteerChars) {
-        return drop(
-          rawType,
-          `faktorAgentAction.text exceeds ${BRIDGE_LIMITS.maxSteerChars} character bound`,
-          bytes,
-        );
-      }
+    } else if (message.text !== undefined && message.text !== null) {
+      return drop(rawType, `faktorAgentAction.text is not valid for action "${message.action}"`, bytes);
     }
     if (message.action === 'model') {
       // The inline model is optional: the host prompts when the panel sends
@@ -876,7 +907,7 @@ export function ingestWebviewMessage(
         return drop(rawType, 'faktorAgentAction.maxTokens must be a positive integer', bytes);
       }
     }
-    return { kind: 'faktorAgentAction', agentId, action: message.action, state };
+    return { kind: 'faktorAgentAction', agentId, action: message.action, state, text };
   }
 
   // Evidence expansion: a positive durable evidence id only (the host
@@ -1055,6 +1086,7 @@ export function bridgeCommandToHostMessage(command: BridgeCommand): HostChatMess
         agentId: command.agentId,
         action: command.action,
         ...(command.state !== null ? { state: command.state } : {}),
+        ...(command.text !== null ? { text: command.text } : {}),
       };
     case 'faktorEvidenceExpand':
       return { type: 'retrieveEvidence', evidenceId: command.evidenceId };

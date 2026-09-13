@@ -63,8 +63,11 @@ use faktor_terminal::{EnvSpec, ProcessOwner, ProcessSupervisor, SpawnConfig};
 
 /// Hard bound on the goal-derived commit message (UTF-8 bytes).
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 200;
-/// Hard bound on one configured PR command template.
+/// Hard bound on one configured PR command template (and on ONE typed argv
+/// element: the program or one argument).
 pub const MAX_PR_COMMAND_BYTES: usize = 4096;
+/// Hard bound on the number of typed `pr_args` elements.
+pub const MAX_PR_ARGS: usize = 128;
 /// Bound on the captured PR command excerpt put into the durable detail.
 pub const MAX_PR_OUTPUT_BYTES: usize = 2000;
 /// Deliberate bound on one PR command (a wedged helper must not hang the
@@ -73,8 +76,17 @@ pub const PR_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The strict execution configuration of the completion-step runner. The
 /// daemon maps its `[completion]` config section onto this type; the
-/// defaults are intentionally inert (`pr_command: None`), so an unconfigured
+/// defaults are intentionally inert (no PR command), so an unconfigured
 /// daemon records the documented `Skipped` outcomes.
+///
+/// Two PR shapes are accepted:
+/// - `pr_program` + `pr_args` (P3, preferred): a typed argv executed
+///   directly through the supervisor — no shell, no whitespace splitting, so
+///   quoted arguments and paths with spaces are representable. Every element
+///   substitutes `{branch}`/`{base}`/`{remote}` independently.
+/// - `pr_command` (DEPRECATED): the historic whitespace-split string
+///   template, kept working with the exact same security checks. It is
+///   mutually exclusive with the typed shape.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompletionStepsConfig {
@@ -82,9 +94,18 @@ pub struct CompletionStepsConfig {
     pub remote: String,
     /// The base branch rendered into the PR template.
     pub base_branch: String,
-    /// The PR command template. `None` = the documented "not configured"
-    /// `Skipped` outcome for a requested PR step.
+    /// DEPRECATED: the whitespace-split PR command template. `None` = the
+    /// documented "not configured" `Skipped` outcome for a requested PR
+    /// step (unless `pr_program` is configured).
+    #[serde(default)]
     pub pr_command: Option<String>,
+    /// The typed argv program (executed directly; spaces are preserved).
+    /// `None` with `pr_command: None` = the documented `Skipped` outcome.
+    #[serde(default)]
+    pub pr_program: Option<String>,
+    /// The typed argv arguments; each element is placeholder-substituted.
+    #[serde(default)]
+    pub pr_args: Vec<String>,
 }
 
 impl Default for CompletionStepsConfig {
@@ -93,22 +114,34 @@ impl Default for CompletionStepsConfig {
             remote: "origin".into(),
             base_branch: "main".into(),
             pr_command: None,
+            pr_program: None,
+            pr_args: Vec::new(),
         }
     }
 }
 
 impl CompletionStepsConfig {
-    /// Strict validation: bounded, option-shaped remote and base branch;
-    /// a PR command that is bounded, single-line, shell-metachar-free and
-    /// templated only with the documented placeholders and at least
-    /// `{branch}` (a command that cannot name the PR head is refused).
+    /// Strict validation: bounded, option-shaped remote and base branch; a
+    /// PR command that is bounded, single-line and templated only with the
+    /// documented placeholders and at least `{branch}` (a command that
+    /// cannot name the PR head is refused). The legacy string template
+    /// additionally refuses shell metacharacters (it is split on
+    /// whitespace); the typed argv shape allows every non-control character
+    /// because no shell and no splitting is ever involved. Configuring BOTH
+    /// shapes is ambiguous and refused.
     pub fn validate(&self) -> Result<(), String> {
         validate_remote_name(&self.remote)?;
         validate_branch_name(&self.base_branch)?;
-        if let Some(command) = &self.pr_command {
-            validate_pr_command(command)?;
+        match (&self.pr_command, &self.pr_program) {
+            (Some(_), Some(_)) => Err(
+                "pr_command (deprecated) and pr_program are mutually exclusive; configure exactly one"
+                    .into(),
+            ),
+            (Some(command), None) => validate_pr_command(command),
+            (None, Some(program)) => validate_pr_argv(program, &self.pr_args),
+            (None, None) if self.pr_args.is_empty() => Ok(()),
+            (None, None) => Err("pr_args requires pr_program".into()),
         }
-        Ok(())
     }
 }
 
@@ -553,11 +586,11 @@ impl CompletionStepRunner {
     }
 
     async fn execute_pr(&self, ctx: &CompletionStepContext) -> StepExecution {
-        let Some(template) = self.config.pr_command.clone() else {
+        if self.config.pr_command.is_none() && self.config.pr_program.is_none() {
             return StepExecution::Skipped {
                 detail: "[completion] pr_command is not configured; no PR was created".into(),
             };
-        };
+        }
         let owner = ProcessOwner::Daemon;
         let branch = match self.git.current_branch(&ctx.root, owner).await {
             Ok(branch) if !branch.is_empty() => branch,
@@ -572,16 +605,34 @@ impl CompletionStepRunner {
                 }
             }
         };
-        let (program, args) = match render_pr_command(
-            &template,
-            &branch,
-            &self.config.base_branch,
-            &self.config.remote,
-        ) {
-            Ok(rendered) => rendered,
-            Err(e) => {
-                return StepExecution::Failed {
-                    detail: format!("pr_command render failed: {e}"),
+        let (program, args) = if let Some(program) = self.config.pr_program.as_deref() {
+            match render_pr_argv(
+                program,
+                &self.config.pr_args,
+                &branch,
+                &self.config.base_branch,
+                &self.config.remote,
+            ) {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    return StepExecution::Failed {
+                        detail: format!("pr_program render failed: {e}"),
+                    }
+                }
+            }
+        } else {
+            let template = self.config.pr_command.as_deref().unwrap_or_default();
+            match render_pr_command(
+                template,
+                &branch,
+                &self.config.base_branch,
+                &self.config.remote,
+            ) {
+                Ok(rendered) => rendered,
+                Err(e) => {
+                    return StepExecution::Failed {
+                        detail: format!("pr_command render failed: {e}"),
+                    }
                 }
             }
         };
@@ -710,9 +761,10 @@ pub fn render_pr_command(
     Ok((program, parts.map(str::to_string).collect()))
 }
 
-/// Strict PR-template validation: bounded, single-line, no shell
-/// metacharacters (no shell is ever involved), known placeholders only and
-/// at least `{branch}` (the head the PR is created from).
+/// Strict PR-template validation (DEPRECATED shape): bounded, single-line,
+/// no shell metacharacters (no shell is ever involved, and the template is
+/// split on whitespace), known placeholders only and at least `{branch}`
+/// (the head the PR is created from).
 pub fn validate_pr_command(template: &str) -> Result<(), String> {
     if template.trim().is_empty() {
         return Err("pr_command must not be empty".into());
@@ -749,8 +801,59 @@ pub fn validate_pr_command(template: &str) -> Result<(), String> {
             ));
         }
     }
+    scan_pr_placeholders(template, "pr_command")?;
+    if !template.contains("{branch}") {
+        return Err("pr_command must template {branch} (the PR head is never implicit)".into());
+    }
+    Ok(())
+}
+
+/// Strict typed-argv validation (P3): `pr_program` plus each `pr_args`
+/// element are bounded, single-line (no control characters) argv values with
+/// known placeholders only (per element) and `{branch}` somewhere. Spaces
+/// are LEGAL — argv elements are executed directly, never split or shelled.
+pub fn validate_pr_argv(program: &str, args: &[String]) -> Result<(), String> {
+    if program.is_empty() {
+        return Err("pr_program must not be empty".into());
+    }
+    if program.len() > MAX_PR_COMMAND_BYTES {
+        return Err(format!(
+            "pr_program of {} bytes exceeds MAX_PR_COMMAND_BYTES ({MAX_PR_COMMAND_BYTES})",
+            program.len()
+        ));
+    }
+    if args.len() > MAX_PR_ARGS {
+        return Err(format!(
+            "pr_args of {} elements exceeds MAX_PR_ARGS ({MAX_PR_ARGS})",
+            args.len()
+        ));
+    }
+    let mut branch_seen = false;
+    for element in std::iter::once(program).chain(args.iter().map(String::as_str)) {
+        for c in element.chars() {
+            if c.is_control() {
+                return Err(
+                    "pr_program/pr_args must not contain control characters or newlines".into(),
+                );
+            }
+        }
+        branch_seen |= scan_pr_placeholders(element, "pr_program/pr_args")?;
+    }
+    if !branch_seen {
+        return Err(
+            "pr_program/pr_args must template {branch} (the PR head is never implicit)".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Scan one template element for the documented placeholders; returns TRUE
+/// when `{branch}` occurs. Unknown names, a stray `}` and an unclosed `{`
+/// are typed refusals.
+fn scan_pr_placeholders(template: &str, label: &str) -> Result<bool, String> {
     let bytes = template.as_bytes();
     let mut index = 0;
+    let mut branch_seen = false;
     while index < bytes.len() {
         match bytes[index] {
             b'{' => {
@@ -758,23 +861,50 @@ pub fn validate_pr_command(template: &str) -> Result<(), String> {
                     .iter()
                     .position(|b| *b == b'}')
                     .map(|p| index + 1 + p)
-                    .ok_or_else(|| "pr_command carries an unclosed '{'".to_string())?;
+                    .ok_or_else(|| format!("{label} carries an unclosed '{{'"))?;
                 let name = &template[index + 1..end];
                 if !matches!(name, "branch" | "base" | "remote") {
                     return Err(format!(
-                        "pr_command placeholder {{{name}}} is unknown; supported: {{branch}}, {{base}}, {{remote}}"
+                        "{label} placeholder {{{name}}} is unknown; supported: {{branch}}, {{base}}, {{remote}}"
                     ));
                 }
+                branch_seen |= name == "branch";
                 index = end + 1;
             }
-            b'}' => return Err("pr_command carries a stray '}'".into()),
+            b'}' => return Err(format!("{label} carries a stray '}}'")),
             _ => index += 1,
         }
     }
-    if !template.contains("{branch}") {
-        return Err("pr_command must template {branch} (the PR head is never implicit)".into());
+    Ok(branch_seen)
+}
+
+/// Render one typed argv (P3): validate, substitute each element's
+/// `{branch}`/`{base}`/`{remote}` independently, and return the program plus
+/// the argument vector exactly as the supervisor must spawn it (spaces
+/// inside an element are preserved verbatim).
+pub fn render_pr_argv(
+    program: &str,
+    args: &[String],
+    branch: &str,
+    base: &str,
+    remote: &str,
+) -> Result<(String, Vec<String>), String> {
+    validate_pr_argv(program, args)?;
+    let render = |element: &str| {
+        element
+            .replace("{branch}", branch)
+            .replace("{base}", base)
+            .replace("{remote}", remote)
+    };
+    let rendered_program = render(program);
+    if rendered_program.contains('{') || rendered_program.contains('}') {
+        return Err("rendered pr_program still carries an unresolved placeholder".into());
     }
-    Ok(())
+    if rendered_program.is_empty() {
+        return Err("pr_program renders to an empty program".into());
+    }
+    let rendered_args: Vec<String> = args.iter().map(|arg| render(arg)).collect();
+    Ok((rendered_program, rendered_args))
 }
 
 fn validate_remote_name(remote: &str) -> Result<(), String> {
@@ -1327,6 +1457,59 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn typed_argv_pr_program_executes_with_spaces_preserved() {
+        let (dir, m) = manager();
+        let repo = init_repo(dir.path());
+        // A program path WITH SPACES and an argument WITH SPACES: the typed
+        // argv is executed directly (no shell, no whitespace splitting), so
+        // each element must arrive verbatim. The spy writes its argv to
+        // `args.txt` in the step's cwd (the repo root).
+        use std::os::unix::fs::PermissionsExt;
+        let tools = dir.path().join("my tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let script = tools.join("fake pr.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv-spy.txt\necho \"https://example.test/pr/11\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let config = CompletionStepsConfig {
+            pr_program: Some(script.display().to_string()),
+            pr_args: vec![
+                "pr".into(),
+                "create".into(),
+                "--head".into(),
+                "{branch}".into(),
+                "--title".into(),
+                "spaces stay one arg".into(),
+                "--remote".into(),
+                "{remote}".into(),
+            ],
+            base_branch: "main".into(),
+            ..Default::default()
+        };
+        let (h, task_id) =
+            session_with_task(&m, "typed argv pr", Some(contract(false, false, true)));
+        let runner = runner(dir.path(), config, allow_all());
+        let report = runner
+            .run(&h, task_id, &ctx(&repo, "typed argv pr"))
+            .await
+            .unwrap();
+        assert!(report.all_succeeded(), "{report:?}");
+        assert_eq!(report.pr_url.as_deref(), Some("https://example.test/pr/11"));
+        let observed = std::fs::read_to_string(repo.join("argv-spy.txt")).unwrap();
+        assert_eq!(
+            observed, "pr\ncreate\n--head\nmain\n--title\nspaces stay one arg\n--remote\norigin\n",
+            "every argv element must arrive verbatim, spaces included"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn existing_pr_is_an_idempotent_success_with_the_url() {
         let (dir, m) = manager();
         let repo = init_repo(dir.path());
@@ -1567,5 +1750,113 @@ mod tests {
             Some("https://example.test/pr/1".to_string())
         );
         assert!(parse_pr_url("no url here").is_none());
+    }
+
+    /// P3 typed argv: per-element placeholder substitution (spaces are legal
+    /// argv characters), strict refusals, and legacy-template parity with
+    /// the exact historic security checks.
+    #[test]
+    fn typed_argv_pr_config_substitutes_per_element_and_keeps_legacy_parity() {
+        let program = "/opt/My Tools/gh";
+        let args: Vec<String> = [
+            "pr",
+            "create",
+            "--head",
+            "{branch}",
+            "--base",
+            "{base}",
+            "--title",
+            "my PR title",
+            "{remote}",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let config = CompletionStepsConfig {
+            pr_program: Some(program.into()),
+            pr_args: args.clone(),
+            ..Default::default()
+        };
+        config.validate().expect("spaces are legal argv characters");
+        let (rendered_program, rendered_args) =
+            render_pr_argv(program, &args, "feat/x", "main", "origin").unwrap();
+        assert_eq!(rendered_program, program, "the program path stays exact");
+        assert_eq!(
+            rendered_args,
+            vec![
+                "pr",
+                "create",
+                "--head",
+                "feat/x",
+                "--base",
+                "main",
+                "--title",
+                "my PR title",
+                "origin"
+            ],
+            "every element substitutes independently; spaces are preserved"
+        );
+
+        // Strict refusals: empty program, unknown/unclosed/stray placeholder,
+        // missing {branch}, control chars, over-bound args, args without a
+        // program, and both shapes configured at once.
+        let bad = |program: Option<&str>, args: Vec<&str>| {
+            CompletionStepsConfig {
+                pr_program: program.map(str::to_string),
+                pr_args: args.into_iter().map(str::to_string).collect(),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        };
+        assert!(bad(Some(""), vec!["{branch}"]));
+        assert!(bad(Some("/bin/gh"), vec!["--head", "{nope}"]));
+        assert!(bad(Some("/bin/gh"), vec!["--head", "{branch"]));
+        assert!(bad(Some("/bin/gh"), vec!["--head", "{branch}}"]));
+        assert!(bad(Some("/bin/gh"), vec!["--head", "main"]));
+        assert!(bad(Some("/bin/gh"), vec!["--head", "{branch}\u{7}"]));
+        let too_many: Vec<&str> = std::iter::repeat_n("{branch}", MAX_PR_ARGS + 1).collect();
+        assert!(bad(Some("/bin/gh"), too_many));
+        assert!(bad(None, vec!["{branch}"]));
+        assert!(CompletionStepsConfig {
+            pr_command: Some("gh pr create --head {branch}".into()),
+            pr_program: Some("/bin/gh".into()),
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+
+        // Legacy parity: the historic render is byte-identical and every
+        // historic refusal still fires.
+        let (legacy_program, legacy_args) = render_pr_command(
+            "gh pr create --head {branch} --base {base}",
+            "feat/x",
+            "main",
+            "origin",
+        )
+        .unwrap();
+        assert_eq!(legacy_program, "gh");
+        assert_eq!(
+            legacy_args,
+            vec!["pr", "create", "--head", "feat/x", "--base", "main"]
+        );
+        for invalid in [
+            "",
+            "gh pr create --head {branch}; rm -rf /",
+            "gh pr create --head {branch} && true",
+            "gh pr create --head {branch} $(whoami)",
+            "gh pr create --head {nope}",
+            "gh pr create --head main",
+            "gh pr create\n--head {branch}",
+        ] {
+            assert!(
+                validate_pr_command(invalid).is_err(),
+                "{invalid:?} must stay refused"
+            );
+        }
+        assert!(
+            validate_pr_argv("gh pr create --head {branch}; rm -rf /", &[]).is_ok(),
+            "typed argv never splits or shells: spaces/metacharacters are plain characters"
+        );
     }
 }

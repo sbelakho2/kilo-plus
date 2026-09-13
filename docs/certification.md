@@ -90,9 +90,10 @@ SHA, never assumed.
 
 ### 2.1 Platform lanes
 
-CI (`.woodpecker.yml`, Woodpecker 3.x) runs exactly these jobs. GitHub
-Actions was the previous runner; its workflows were removed when CI migrated
-(historical note only, no workflow files remain under `.github/`).
+CI (the event-scoped workflows in `.woodpecker/`, Woodpecker 3.x) runs exactly
+these jobs. GitHub Actions was the previous runner; its workflows were removed
+when CI migrated (historical note only, no workflow files remain under
+`.github/`).
 
 | Job | Agent | Content |
 | --- | --- | --- |
@@ -121,10 +122,26 @@ unexpected skip cannot masquerade as a pass. `scripts/woodpecker/setup.md`
 documents the agent labels, self-hosted macOS/Windows agents, trusted-volume
 caching and the free cloud tier (linux runners only).
 
+The table above is the **trusted** lane set (`trusted.yaml`: `push`/`tag`, with
+the named-volume caches and the release `[perf]` budgets). PRs run the reduced,
+**volume-free** `pr.yaml` copy of the correctness lanes (`linux`, `static`,
+`docs`, `vscode`, `vscode-visual`, `vscode-visual-with-skip`,
+`jetbrains-build`, `jetbrains-smoke`) plus its own certificate; branch
+protection requires the resulting `ci/woodpecker/pr/pr` workflow status. The
+cron workflows own the campaigns that are too long for push/PR:
+`nightly.yaml` runs the ignored `[fault]` campaign at scale, the longrun
+suite, efficiency, economy, the coding-benchmark smoke, the provider-key
+real-model run (an explicit recorded skip unless keys are supplied
+out-of-band) and supply-chain evidence; `soak.yaml` runs the `[soak]` 12h
+synthetic session and the 24h zero-drift wall-clock certification. Both write
+lane markers and their own certificate, and `soak` needs
+`WOODPECKER_MAX_PIPELINE_TIMEOUT` raised server-side because Woodpecker has no
+per-step timeout.
+
 100% requires the linux certificate green at the exact commit, plus the
 platform certificates when self-hosted darwin/windows agents exist. The
-release real-time soak (12–24h wall clock) is a self-hosted hook and is
-deliberately **not** part of the default pipelines; `bash
+release real-time soak (12–24h wall clock) is owned by the `soak` cron
+workflow and is deliberately **not** part of the PR/push lane set; `bash
 scripts/certify-local.sh full` keeps the long release lanes ([perf], [fault]
 at scale, coding benchmark, efficiency, ACP interop, packaging, installation
 matrix) runnable offline, and the real soak must be run and recorded

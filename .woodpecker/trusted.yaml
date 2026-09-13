@@ -1,6 +1,12 @@
-# Faktor CI — Woodpecker (targeted at Woodpecker 3.x, verified against the
-# 3.18 syntax; the same file parses on the 2.8 line: matrix, labels, steps,
-# step-level depends_on and the status filter all exist there).
+# Faktor CI — trusted workflow: push (any branch) + version tags.
+#
+# This is the ONLY workflow file that declares named volumes. The untrusted
+# pull_request event runs `.woodpecker/pr.yaml`, which declares none, so a PR
+# pipeline can never mount (or write into) the `faktor-trusted-*` caches.
+# The cron workflows (`nightly.yaml`, `soak.yaml`) use their own
+# `faktor-nightly-*` / `faktor-soak-*` volumes so heavy campaigns cannot
+# poison these caches either. See scripts/woodpecker/setup.md §5 for the
+# trust model and the residual risks.
 #
 # Job graph (one workflow per matrix platform; all mandatory linux lanes run
 # as parallel steps of a single workflow so they share one workspace):
@@ -37,6 +43,8 @@
 # Named volumes (cargo/gradle/npm/playwright caches) require the repository
 # to be marked Trusted (volumes) by a server admin; delete the `volumes:`
 # lines if your instance cannot grant that. No secrets are required.
+# Commit-status contexts (default `WOODPECKER_STATUS_CONTEXT_FORMAT`):
+#   push: ci/woodpecker/push/trusted   tag: ci/woodpecker/tag/trusted
 
 matrix:
   platform:
@@ -47,10 +55,12 @@ matrix:
 labels:
   platform: ${platform}
 
+# push (any branch) and tag events are collaborator-authored: only these may
+# mount the trusted caches. pull_request never reaches this file.
 when:
-  - event: [push, pull_request]
+  - event: [push, tag]
     evaluate: 'platform == "linux/amd64"'
-  - event: [push]
+  - event: push
     branch: main
     evaluate: 'platform != "linux/amd64"'
 
@@ -69,9 +79,9 @@ steps:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
     volumes:
-      - faktor-cargo-registry:/usr/local/cargo/registry
-      - faktor-cargo-git:/usr/local/cargo/git
-      - faktor-linux-target:/woodpecker-cache/target
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
+      - faktor-trusted-target-linux:/woodpecker-cache/target
     commands:
       - apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
       - rustup component add rustfmt clippy
@@ -95,9 +105,9 @@ steps:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
     volumes:
-      - faktor-cargo-registry:/usr/local/cargo/registry
-      - faktor-cargo-git:/usr/local/cargo/git
-      - faktor-static-target:/woodpecker-cache/target
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
+      - faktor-trusted-target-static:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-static-authority
       - cargo test -p faktor-security
@@ -116,9 +126,9 @@ steps:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
     volumes:
-      - faktor-cargo-registry:/usr/local/cargo/registry
-      - faktor-cargo-git:/usr/local/cargo/git
-      - faktor-docs-target:/woodpecker-cache/target
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
+      - faktor-trusted-target-docs:/woodpecker-cache/target
     commands:
       - cargo doc --workspace --all-features --no-deps
       - bash scripts/branding-scan.sh
@@ -134,7 +144,7 @@ steps:
       matrix:
         platform: linux/amd64
     volumes:
-      - faktor-npm-cache:/root/.npm
+      - faktor-trusted-npm-cache:/root/.npm
     commands:
       - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
       - cd apps/vscode
@@ -160,7 +170,7 @@ steps:
       matrix:
         platform: linux/amd64
     volumes:
-      - faktor-playwright-browsers:/woodpecker-cache/playwright
+      - faktor-trusted-playwright-browsers:/woodpecker-cache/playwright
     commands:
       - export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
       - export PLAYWRIGHT_BROWSERS_PATH=/woodpecker-cache/playwright
@@ -211,7 +221,7 @@ steps:
       matrix:
         platform: linux/amd64
     volumes:
-      - faktor-gradle-home:/root/.gradle
+      - faktor-trusted-gradle-home:/root/.gradle
     commands:
       - cd apps/jetbrains
       - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
@@ -231,8 +241,8 @@ steps:
       RUST_BACKTRACE: "1"
       DEBIAN_FRONTEND: noninteractive
     volumes:
-      - faktor-cargo-registry:/usr/local/cargo/registry
-      - faktor-cargo-git:/usr/local/cargo/git
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
     commands:
       - apt-get update && apt-get install -y --no-install-recommends build-essential curl pkg-config libssl-dev kotlin openjdk-11-jre-headless ca-certificates
       - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -243,7 +253,8 @@ steps:
   # ----------------------------------------------------------------- perf --
   # Release [perf] gates. Serialized after the other rust lanes because the
   # distribution budgets must not race a fully loaded agent; runs even when a
-  # dependency failed so the evidence is honest.
+  # dependency failed so the evidence is honest. The reduced PR lane set is
+  # deliberately excluded from these release budgets (see pr.yaml).
   - name: perf
     image: rust:1.98
     depends_on: [linux, static, docs]
@@ -255,9 +266,9 @@ steps:
       RUST_BACKTRACE: "1"
       CARGO_TARGET_DIR: /woodpecker-cache/target
     volumes:
-      - faktor-cargo-registry:/usr/local/cargo/registry
-      - faktor-cargo-git:/usr/local/cargo/git
-      - faktor-perf-target:/woodpecker-cache/target
+      - faktor-trusted-cargo-registry:/usr/local/cargo/registry
+      - faktor-trusted-cargo-git:/usr/local/cargo/git
+      - faktor-trusted-target-perf:/woodpecker-cache/target
     commands:
       - cargo test -p faktor-tests-performance --release -- --ignored
       - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"perf","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/perf.json
@@ -322,7 +333,7 @@ steps:
   # linux lane above, runs regardless of their outcome, verifies every lane
   # marker AND this workflow's own CI_PIPELINE_STATUS, and writes
   # target/certification/ci-certification.json. Branch protection should
-  # require this step.
+  # require the `pr` workflow, whose own certificate gates the PR lane set.
   - name: certificate
     image: python:3.13-slim
     depends_on:
@@ -403,6 +414,7 @@ steps:
         manifest = {
             "schema": "faktor-ci-certification/v1",
             "platform": platform,
+            "workflow": "trusted",
             "commit": commit,
             "pipeline": os.environ.get("CI_PIPELINE_NUMBER", ""),
             "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
@@ -451,7 +463,7 @@ steps:
           rc=1
         fi
         if [ "$rc" -eq 0 ]; then st=pass; else st=fail; fi
-        printf '{"schema":"faktor-ci-certification/v1","platform":"darwin","commit":"%s","pipeline":"%s","status":"%s"}\n' \
+        printf '{"schema":"faktor-ci-certification/v1","platform":"darwin","workflow":"trusted","commit":"%s","pipeline":"%s","status":"%s"}\n' \
           "$CI_COMMIT_SHA" "$CI_PIPELINE_NUMBER" "$st" > target/certification/ci-certification.json
         echo "certification=$st platform=darwin"
         [ "$rc" -eq 0 ]
@@ -483,7 +495,7 @@ steps:
           $rc = 1
         }
         $st = if ($rc -eq 0) { "pass" } else { "fail" }
-        $manifest = '{"schema":"faktor-ci-certification/v1","platform":"windows","commit":"' + $env:CI_COMMIT_SHA + '","pipeline":"' + $env:CI_PIPELINE_NUMBER + '","status":"' + $st + '"}'
+        $manifest = '{"schema":"faktor-ci-certification/v1","platform":"windows","workflow":"trusted","commit":"' + $env:CI_COMMIT_SHA + '","pipeline":"' + $env:CI_PIPELINE_NUMBER + '","status":"' + $st + '"}'
         Set-Content -Path target/certification/ci-certification.json -Value $manifest
         Write-Host "certification=$st platform=windows"
         if ($rc -ne 0) { exit 1 }
