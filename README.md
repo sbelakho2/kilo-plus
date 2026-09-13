@@ -96,6 +96,39 @@ cargo run -p faktor-cli -- run --data-dir /tmp/kp-demo "explain this repo"
 cargo run -p faktor-cli -- doctor
 ```
 
+## CI
+
+CI runs on [Woodpecker](https://woodpecker-ci.org) from the root
+`.woodpecker.yml` (targeted at Woodpecker 3.x). One workflow is generated per
+matrix platform; `labels: platform: ${platform}` routes each combination to a
+matching agent:
+
+- **linux/amd64** (`push` + `pull_request`) — parallel lanes `linux` (fmt,
+  clippy `-D warnings`, `check`/`test --workspace --all-features`, doctor),
+  `static` (authority scans, security suite, seeded fuzz, supply-chain
+  evidence with recorded skips), `docs` (`cargo doc`, branding scan,
+  docs-drift guard), `vscode` (npm build + offline selftest + self-contained
+  VSIX verify), `vscode-visual` (required chromium render gate),
+  `vscode-visual-with-skip` (diagnostics twin), `jetbrains-build` (Gradle
+  `buildPlugin`) and `jetbrains-smoke` (kotlinc wire/native smokes), then the
+  release `[perf]` lane.
+- **darwin/arm64** and **windows/amd64** (`push` to `main` only) — self-hosted
+  agents with the `local` backend; hosted runners are linux-only, so these
+  lanes queue until you register an agent (`scripts/woodpecker/setup.md`).
+
+The `certificate` job is the aggregate gate: every lane writes
+`target/certification/lanes/<lane>.json` into the shared workflow workspace,
+and `certificate` (depending on all lanes, running on `success` or `failure`)
+fails when a marker is missing/failed/stale or the workflow status is not
+success; darwin/windows carry equivalent per-platform certificates. It is the
+single required status check for branch protection. No secrets are required;
+the named cache volumes need the repository to be marked trusted by a server
+admin (see `scripts/woodpecker/setup.md`).
+
+The offline per-host certificate is unchanged: `bash scripts/certify-local.sh
+fast` (or `full`) emits `target/certification/manifest.json`; see
+`docs/certification.md`.
+
 ## Branding
 
 All user-visible metadata in this repository uses Faktor branding; legacy

@@ -1,0 +1,489 @@
+# Faktor CI — Woodpecker (targeted at Woodpecker 3.x, verified against the
+# 3.18 syntax; the same file parses on the 2.8 line: matrix, labels, steps,
+# step-level depends_on and the status filter all exist there).
+#
+# Job graph (one workflow per matrix platform; all mandatory linux lanes run
+# as parallel steps of a single workflow so they share one workspace):
+#
+#   stage 1 (parallel): linux · static · docs · vscode · vscode-visual
+#                       · vscode-visual-with-skip · jetbrains-build
+#                       · jetbrains-smoke
+#   stage 2:            perf (after linux, static, docs)
+#   stage 3:            certificate (after every linux lane)
+#
+#   darwin combo:  darwin-check · darwin-test · darwin-doctor -> certificate-darwin
+#   windows combo: windows-check · windows-test -> certificate-windows
+#
+# Aggregation mechanism (the one Woodpecker actually supports):
+#   * Woodpecker workflows are filesystem-isolated, so markers only work
+#     between steps of ONE workflow (docs: "files are only shared between
+#     steps of the same workflow"). Every lane therefore ends by writing
+#     target/certification/lanes/<lane>.json with its lane name, commit and
+#     status; the certificate step depends_on every lane, runs with
+#     `when.status: [success, failure]` (dependents are otherwise skipped
+#     when a dependency fails) and fails when any marker is missing, marked
+#     failed, carries a foreign commit, or is not the expected schema.
+#   * CI_PIPELINE_STATUS is the runtime's own "workflow failed before this
+#     step" signal and is checked as an independent second condition.
+#   * The per-platform certificate steps cover the self-hosted darwin and
+#     windows agents; cross-platform lanes cannot be folded into the linux
+#     certificate because workflows share no filesystem.
+#
+# Agent routing: `labels.platform` is the documented agent selector. The
+# deprecated `runs_on` key is NOT an agent selector in 3.x (it feeds the
+# run-on-success/failure flag of dependent tasks and would make a workflow
+# never match); see scripts/woodpecker/setup.md.
+#
+# Named volumes (cargo/gradle/npm/playwright caches) require the repository
+# to be marked Trusted (volumes) by a server admin; delete the `volumes:`
+# lines if your instance cannot grant that. No secrets are required.
+
+matrix:
+  platform:
+    - linux/amd64
+    - darwin/arm64
+    - windows/amd64
+
+labels:
+  platform: ${platform}
+
+when:
+  - event: [push, pull_request]
+    evaluate: 'platform == "linux/amd64"'
+  - event: [push]
+    branch: main
+    evaluate: 'platform != "linux/amd64"'
+
+steps:
+  # ---------------------------------------------------------------- linux --
+  # The default lane (hosted linux/amd64 runners). Same commands the CI
+  # gates always ran: fmt + clippy -D warnings + check/test --all-features +
+  # doctor. Protocol/compat/stream tests ride the --workspace all-features
+  # run. Long lanes stay #[ignore]-gated.
+  - name: linux
+    image: rust:1.98
+    when:
+      matrix:
+        platform: linux/amd64
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-cargo-registry:/usr/local/cargo/registry
+      - faktor-cargo-git:/usr/local/cargo/git
+      - faktor-linux-target:/woodpecker-cache/target
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends python3 procps ca-certificates
+      - rustup component add rustfmt clippy
+      - cargo fmt --check
+      - cargo check --workspace --all-features
+      - cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - cargo test --workspace --all-features
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"linux","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/linux.json
+
+  # --------------------------------------------------------------- static --
+  # Static-authority scans + security suite + seeded fuzz campaign +
+  # supply-chain evidence (missing advisory tools are RECORDED skips inside
+  # target/certification/supply-chain-status.json, never a silent pass).
+  - name: static
+    image: rust:1.98
+    when:
+      matrix:
+        platform: linux/amd64
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-cargo-registry:/usr/local/cargo/registry
+      - faktor-cargo-git:/usr/local/cargo/git
+      - faktor-static-target:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-static-authority
+      - cargo test -p faktor-security
+      - cargo test -p faktor-tests-fuzz-seeds
+      - SUPPLY_CHAIN_BUILD=1 SUPPLY_CHAIN_ARTIFACTS="$CARGO_TARGET_DIR/release/faktor-cli" bash scripts/supply-chain.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"static","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/static.json
+
+  # ----------------------------------------------------------------- docs --
+  # Rustdoc + branding scan + the docs-drift guard (check-docs-sync.sh).
+  - name: docs
+    image: rust:1.98
+    when:
+      matrix:
+        platform: linux/amd64
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-cargo-registry:/usr/local/cargo/registry
+      - faktor-cargo-git:/usr/local/cargo/git
+      - faktor-docs-target:/woodpecker-cache/target
+    commands:
+      - cargo doc --workspace --all-features --no-deps
+      - bash scripts/branding-scan.sh
+      - bash scripts/check-docs-sync.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"docs","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/docs.json
+
+  # --------------------------------------------------------------- vscode --
+  # Build + offline selftest + self-contained VSIX (vendored closure staged,
+  # unzipped and hash-asserted; IDE launch recorded when a `code` CLI exists).
+  - name: vscode
+    image: node:24
+    when:
+      matrix:
+        platform: linux/amd64
+    volumes:
+      - faktor-npm-cache:/root/.npm
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
+      - cd apps/vscode
+      - npm ci
+      - npm run build
+      - node scripts/selftest.mjs
+      - npm run prepackage:vsix
+      - npx --yes @vscode/vsce package --out faktor-ci.vsix
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --min-webview-files 25
+      - rm -rf /tmp/faktor-vsix && mkdir -p /tmp/faktor-vsix && unzip -q faktor-ci.vsix -d /tmp/faktor-vsix
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --extract-dir /tmp/faktor-vsix/extension
+      - node scripts/selftest.mjs --packaged /tmp/faktor-vsix/extension
+      - node scripts/verify-vsix.mjs faktor-ci.vsix --ide-load
+      - cd "$CI_WORKSPACE"
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"vscode","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/vscode.json
+
+  # -------------------------------------------------------- vscode-visual --
+  # REQUIRED render gate: playwright + chromium are installed explicitly and
+  # the step fails unless visual-report.json records render.status=passed.
+  - name: vscode-visual
+    image: node:24
+    when:
+      matrix:
+        platform: linux/amd64
+    volumes:
+      - faktor-playwright-browsers:/woodpecker-cache/playwright
+    commands:
+      - export FAKTOR_PLAYWRIGHT="$CI_WORKSPACE/target/visual-playwright/node_modules/playwright"
+      - export PLAYWRIGHT_BROWSERS_PATH=/woodpecker-cache/playwright
+      - node scripts/webview-visual-check.mjs --self-test
+      - npm install --prefix target/visual-playwright --no-save playwright
+      - target/visual-playwright/node_modules/.bin/playwright install --with-deps chromium
+      - node scripts/webview-visual-check.mjs
+      - |
+        node -e '
+          const fs = require("node:fs");
+          const report = JSON.parse(
+            fs.readFileSync("ui/kilo-v756-webview/dist/visual-report.json", "utf8"),
+          );
+          const status = report.render && report.render.status;
+          if (status !== "passed") {
+            console.error("REQUIRED render gate did not pass (render.status=" + status + ")");
+            process.exit(1);
+          }
+          console.log("render gate passed (" + (report.render.states || "?") + " states)");
+        '
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"vscode-visual","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/vscode-visual.json
+
+  # ----------------------------------------------- vscode-visual-with-skip --
+  # Diagnostics twin: always records an explicit skip when chromium cannot be
+  # installed; never a substitute for the required render lane above.
+  - name: vscode-visual-with-skip
+    image: node:24
+    # Serialized after the required render gate: both lanes write
+    # ui/kilo-v756-webview/dist/visual-report.json in the shared workspace.
+    # Runs on failure too so the diagnostics still land.
+    depends_on: [vscode-visual]
+    when:
+      matrix:
+        platform: linux/amd64
+      status: [success, failure]
+    environment:
+      # Distinct prefix: the required vscode-visual step installs into
+      # target/visual-playwright in the same shared workspace.
+      VISUAL_PLAYWRIGHT_DIR: target/visual-playwright-diagnostics
+    commands:
+      - bash scripts/ci-vscode-visual.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"vscode-visual-with-skip","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/vscode-visual-with-skip.json
+
+  # -------------------------------------------------------- jetbrains-build --
+  - name: jetbrains-build
+    image: eclipse-temurin:17-jdk
+    when:
+      matrix:
+        platform: linux/amd64
+    volumes:
+      - faktor-gradle-home:/root/.gradle
+    commands:
+      - cd apps/jetbrains
+      - ./gradlew :frontend:buildPlugin --no-daemon --stacktrace
+      - cd "$CI_WORKSPACE"
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"jetbrains-build","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/jetbrains-build.json
+
+  # -------------------------------------------------------- jetbrains-smoke --
+  # kotlinc split-mode compile + wire/native smokes against a real daemon.
+  # ubuntu:24.04 mirrors the hosted runner (apt kotlinc 1.3 + old-JDK
+  # fallback handled by apps/jetbrains/compile-and-smoke.sh).
+  - name: jetbrains-smoke
+    image: ubuntu:24.04
+    when:
+      matrix:
+        platform: linux/amd64
+    environment:
+      RUST_BACKTRACE: "1"
+      DEBIAN_FRONTEND: noninteractive
+    volumes:
+      - faktor-cargo-registry:/usr/local/cargo/registry
+      - faktor-cargo-git:/usr/local/cargo/git
+    commands:
+      - apt-get update && apt-get install -y --no-install-recommends build-essential curl pkg-config libssl-dev kotlin openjdk-11-jre-headless ca-certificates
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      - . "$HOME/.cargo/env"
+      - bash apps/jetbrains/compile-and-smoke.sh
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"jetbrains-smoke","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/jetbrains-smoke.json
+
+  # ----------------------------------------------------------------- perf --
+  # Release [perf] gates. Serialized after the other rust lanes because the
+  # distribution budgets must not race a fully loaded agent; runs even when a
+  # dependency failed so the evidence is honest.
+  - name: perf
+    image: rust:1.98
+    depends_on: [linux, static, docs]
+    when:
+      matrix:
+        platform: linux/amd64
+      status: [success, failure]
+    environment:
+      RUST_BACKTRACE: "1"
+      CARGO_TARGET_DIR: /woodpecker-cache/target
+    volumes:
+      - faktor-cargo-registry:/usr/local/cargo/registry
+      - faktor-cargo-git:/usr/local/cargo/git
+      - faktor-perf-target:/woodpecker-cache/target
+    commands:
+      - cargo test -p faktor-tests-performance --release -- --ignored
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"perf","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/perf.json
+
+  # --------------------------------------------------------------- darwin --
+  # Self-hosted macOS agent, `local` backend (steps run directly on the host:
+  # rust stable + Xcode CLT required). Push to main only.
+  - name: darwin-check
+    image: bash
+    when:
+      matrix:
+        platform: darwin/arm64
+    commands:
+      - cargo check --workspace
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"darwin-check","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/darwin-check.json
+
+  - name: darwin-test
+    image: bash
+    when:
+      matrix:
+        platform: darwin/arm64
+    commands:
+      - cargo test --workspace
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"darwin-test","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/darwin-test.json
+
+  - name: darwin-doctor
+    image: bash
+    when:
+      matrix:
+        platform: darwin/arm64
+    commands:
+      - cargo run -p faktor-cli -- doctor --data-dir /tmp/kp-ci
+      - mkdir -p target/certification/lanes && printf '{"schema":"faktor-woodpecker-lane/v1","lane":"darwin-doctor","status":"passed","commit":"%s"}\n' "$CI_COMMIT_SHA" > target/certification/lanes/darwin-doctor.json
+
+  # -------------------------------------------------------------- windows --
+  # Self-hosted Windows agent, `local` backend. Push to main only. Same
+  # exclusions as the old windows lane: every remaining exclusion is genuinely
+  # Windows-incompatible as written, everything else (incl. agent/verify/
+  # index/cas/snapshot) compiles and tests here.
+  - name: windows-check
+    image: powershell
+    when:
+      matrix:
+        platform: windows/amd64
+    commands:
+      - cargo check --workspace
+      - New-Item -ItemType Directory -Force -Path target/certification/lanes | Out-Null
+      - Set-Content -Path target/certification/lanes/windows-check.json -Value ('{"schema":"faktor-woodpecker-lane/v1","lane":"windows-check","status":"passed","commit":"' + $env:CI_COMMIT_SHA + '"}')
+
+  - name: windows-test
+    image: powershell
+    when:
+      matrix:
+        platform: windows/amd64
+    commands:
+      - cargo test --workspace --exclude faktor-cli --exclude faktor-hooks --exclude faktor-tests-coding-benchmark --exclude faktor-tests-fuzz-seeds --exclude faktor-tests-performance
+      - New-Item -ItemType Directory -Force -Path target/certification/lanes | Out-Null
+      - Set-Content -Path target/certification/lanes/windows-test.json -Value ('{"schema":"faktor-woodpecker-lane/v1","lane":"windows-test","status":"passed","commit":"' + $env:CI_COMMIT_SHA + '"}')
+
+  # ---------------------------------------------------------- certificate --
+  # The aggregate gate for the default/cloud lane set: depends_on every
+  # linux lane above, runs regardless of their outcome, verifies every lane
+  # marker AND this workflow's own CI_PIPELINE_STATUS, and writes
+  # target/certification/ci-certification.json. Branch protection should
+  # require this step.
+  - name: certificate
+    image: python:3.13-slim
+    depends_on:
+      - linux
+      - static
+      - docs
+      - vscode
+      - vscode-visual
+      - vscode-visual-with-skip
+      - jetbrains-build
+      - jetbrains-smoke
+      - perf
+    when:
+      matrix:
+        platform: linux/amd64
+      status: [success, failure]
+    commands:
+      - |
+        python3 - <<'PY'
+        import json, os, pathlib, sys
+
+        EXPECTED = [
+            "linux",
+            "static",
+            "docs",
+            "vscode",
+            "vscode-visual",
+            "vscode-visual-with-skip",
+            "jetbrains-build",
+            "jetbrains-smoke",
+            "perf",
+        ]
+        SCHEMA = "faktor-woodpecker-lane/v1"
+        commit = os.environ.get("CI_COMMIT_SHA", "")
+        platform = "linux"
+        lanes_dir = pathlib.Path("target/certification/lanes")
+        out_dir = pathlib.Path("target/certification")
+        results = {}
+        problems = []
+
+        for lane in EXPECTED:
+            path = lanes_dir / (lane + ".json")
+            if not path.is_file():
+                results[lane] = "missing"
+                problems.append("lane " + lane + " wrote no marker (skipped, failed, or killed before its evidence step)")
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                results[lane] = "unreadable"
+                problems.append("lane " + lane + " marker is not valid JSON: " + str(exc))
+                continue
+            status = str(record.get("status", "unknown"))
+            if record.get("schema") != SCHEMA:
+                results[lane] = "wrong-schema"
+                problems.append("lane " + lane + " marker schema=" + str(record.get("schema")))
+            elif status != "passed":
+                results[lane] = status
+                problems.append("lane " + lane + " marker status=" + status)
+            elif commit and record.get("commit") != commit:
+                results[lane] = "stale"
+                problems.append("lane " + lane + " marker commit=" + str(record.get("commit")) + " != " + commit)
+            else:
+                results[lane] = "passed"
+
+        unexpected = sorted(
+            p.stem for p in lanes_dir.glob("*.json") if p.stem not in EXPECTED
+        ) if lanes_dir.is_dir() else []
+        for lane in unexpected:
+            problems.append("unexpected marker for lane " + lane)
+
+        pipeline_status = os.environ.get("CI_PIPELINE_STATUS", "unknown")
+        if pipeline_status != "success":
+            problems.append("workflow status before this step is " + pipeline_status + " (a dependency lane failed)")
+
+        status = "pass" if not problems else "fail"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest = {
+            "schema": "faktor-ci-certification/v1",
+            "platform": platform,
+            "commit": commit,
+            "pipeline": os.environ.get("CI_PIPELINE_NUMBER", ""),
+            "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
+            "status": status,
+            "lanes": results,
+        }
+        (out_dir / "ci-certification.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        for lane in EXPECTED:
+            print("passed " + lane) if results.get(lane) == "passed" else print("FAILED " + str(results.get(lane)) + " " + lane)
+        if problems:
+            for problem in problems:
+                print("certification problem: " + problem, file=sys.stderr)
+            sys.exit(1)
+        print("certification: PASS (every required lane produced a passed marker)")
+        PY
+
+  # ------------------------------------------- certificate (darwin lane) --
+  # Per-platform aggregate for the self-hosted macOS combo. The linux combo
+  # cannot read these markers: Woodpecker workflows share no filesystem.
+  - name: certificate-darwin
+    image: bash
+    depends_on: [darwin-check, darwin-test, darwin-doctor]
+    when:
+      matrix:
+        platform: darwin/arm64
+      status: [success, failure]
+    commands:
+      - |
+        set -u
+        mkdir -p target/certification
+        rc=0
+        for lane in darwin-check darwin-test darwin-doctor; do
+          f="target/certification/lanes/$lane.json"
+          if [ -f "$f" ] && grep -q '"status":"passed"' "$f" && grep -q "\"commit\":\"$CI_COMMIT_SHA\"" "$f"; then
+            echo "passed $lane"
+          else
+            echo "FAILED $lane (missing, failed, stale, or wrong commit)"
+            rc=1
+          fi
+        done
+        if [ "$CI_PIPELINE_STATUS" != "success" ]; then
+          echo "FAILED workflow status=$CI_PIPELINE_STATUS"
+          rc=1
+        fi
+        if [ "$rc" -eq 0 ]; then st=pass; else st=fail; fi
+        printf '{"schema":"faktor-ci-certification/v1","platform":"darwin","commit":"%s","pipeline":"%s","status":"%s"}\n' \
+          "$CI_COMMIT_SHA" "$CI_PIPELINE_NUMBER" "$st" > target/certification/ci-certification.json
+        echo "certification=$st platform=darwin"
+        [ "$rc" -eq 0 ]
+
+  # ------------------------------------------ certificate (windows lane) --
+  - name: certificate-windows
+    image: powershell
+    depends_on: [windows-check, windows-test]
+    when:
+      matrix:
+        platform: windows/amd64
+      status: [success, failure]
+    commands:
+      - |
+        $ErrorActionPreference = "Stop"
+        New-Item -ItemType Directory -Force -Path target/certification | Out-Null
+        $rc = 0
+        foreach ($lane in @("windows-check", "windows-test")) {
+          $f = "target/certification/lanes/$lane.json"
+          if ((Test-Path $f) -and (Select-String -Quiet -Path $f -Pattern '"status":"passed"') -and (Select-String -Quiet -Path $f -Pattern ('"commit":"' + $env:CI_COMMIT_SHA + '"'))) {
+            Write-Host "passed $lane"
+          } else {
+            Write-Host "FAILED $lane (missing, failed, stale, or wrong commit)"
+            $rc = 1
+          }
+        }
+        if ($env:CI_PIPELINE_STATUS -ne "success") {
+          Write-Host "FAILED workflow status=$env:CI_PIPELINE_STATUS"
+          $rc = 1
+        }
+        $st = if ($rc -eq 0) { "pass" } else { "fail" }
+        $manifest = '{"schema":"faktor-ci-certification/v1","platform":"windows","commit":"' + $env:CI_COMMIT_SHA + '","pipeline":"' + $env:CI_PIPELINE_NUMBER + '","status":"' + $st + '"}'
+        Set-Content -Path target/certification/ci-certification.json -Value $manifest
+        Write-Host "certification=$st platform=windows"
+        if ($rc -ne 0) { exit 1 }

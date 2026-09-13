@@ -1,0 +1,71 @@
+# Woodpecker CI server + docker agent for the Faktor pipelines
+# (`.woodpecker.yml` at the repository root). See setup.md for the full
+# walkthrough, agent labels and cloud/self-hosted notes.
+#
+#   cd scripts/woodpecker
+#   export WOODPECKER_AGENT_SECRET="$(openssl rand -hex 32)"
+#   export WOODPECKER_HOST="http://localhost:8000"
+#   export WOODPECKER_GITHUB_CLIENT="<oauth app client id>"
+#   export WOODPECKER_GITHUB_SECRET="<oauth app client secret>"
+#   docker compose up -d
+services:
+  woodpecker-server:
+    image: woodpeckerci/woodpecker-server:v3
+    restart: unless-stopped
+    ports:
+      - "8000:8000" # UI/API
+      # gRPC port for remote agents (macOS/Windows hosts). Firewall it to
+      # your agent hosts; only the agent secret is sent over it.
+      - "9000:9000"
+    environment:
+      # Set to "false" (or remove) for closed registration on a private
+      # instance; "true" lets any forge user log in.
+      WOODPECKER_OPEN: "true"
+      WOODPECKER_HOST: ${WOODPECKER_HOST:-http://localhost:8000}
+      WOODPECKER_AGENT_SECRET: ${WOODPECKER_AGENT_SECRET:?set WOODPECKER_AGENT_SECRET to a shared random secret}
+      WOODPECKER_GITHUB: "true"
+      WOODPECKER_GITHUB_CLIENT: ${WOODPECKER_GITHUB_CLIENT:-}
+      WOODPECKER_GITHUB_SECRET: ${WOODPECKER_GITHUB_SECRET:-}
+    volumes:
+      - woodpecker-data:/var/lib/woodpecker
+
+  woodpecker-agent:
+    image: woodpeckerci/woodpecker-agent:v3
+    restart: unless-stopped
+    depends_on:
+      - woodpecker-server
+    environment:
+      WOODPECKER_SERVER: woodpecker-server:9000
+      WOODPECKER_AGENT_SECRET: ${WOODPECKER_AGENT_SECRET:?set WOODPECKER_AGENT_SECRET to the server value}
+      WOODPECKER_BACKEND: docker
+      WOODPECKER_MAX_WORKFLOWS: "2"
+      # Must match the matrix `platform` value in .woodpecker.yml; an
+      # arm64 host needs platform=linux/arm64 there.
+      WOODPECKER_AGENT_LABELS: "platform=linux/amd64,hostname=faktor-linux-agent"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - woodpecker-agent-config:/etc/woodpecker
+
+  # Local-backend agent for a macOS or Windows host. Run the agent BINARY
+  # directly on that host: the local backend executes every step on the host
+  # and refuses to run from inside a container, so this service is a
+  # documented reference only. See setup.md §5 for the native install.
+  #
+  # woodpecker-agent-selfhosted:
+  #   image: woodpeckerci/woodpecker-agent:v3
+  #   restart: unless-stopped
+  #   network_mode: host
+  #   environment:
+  #     WOODPECKER_SERVER: ${WOODPECKER_SERVER_URL:?e.g. http://woodpecker.example.com:9000}
+  #     WOODPECKER_AGENT_SECRET: ${WOODPECKER_AGENT_SECRET:?set WOODPECKER_AGENT_SECRET to the server value}
+  #     WOODPECKER_BACKEND: local
+  #     WOODPECKER_MAX_WORKFLOWS: "1"
+  #     # macOS Apple Silicon; use darwin/amd64 on Intel or windows/amd64 on
+  #     # Windows (and keep .woodpecker.yml's matrix value in sync).
+  #     WOODPECKER_AGENT_LABELS: "platform=darwin/arm64,hostname=faktor-darwin-agent"
+  #   volumes:
+  #     - woodpecker-agent-config:/etc/woodpecker
+
+volumes:
+  woodpecker-data:
+  woodpecker-agent-config:

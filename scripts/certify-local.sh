@@ -5,6 +5,12 @@
 # emits a machine-readable certificate for the EXACT commit it ran on.
 # No network, no provider keys, no LLM calls: every section is local.
 #
+# CI migration note: the platform lanes moved from GitHub Actions to
+# Woodpecker (root `.woodpecker.yml`), but this harness REMAINS the
+# local/offline certificate: it is the per-host evidence source and the only
+# producer of the `local_offline` and `release` manifest levels. CI and this
+# script are complementary, not substitutes (docs/certification.md §1/§5).
+#
 # Profiles:
 #   fast (default)  fmt --check; check --workspace; cross-target compile
 #                   (windows-msvc, per-crate skips recorded); derived
