@@ -4546,3 +4546,60 @@ async fn child_projection_derives_budget_and_phase_across_reopen() {
     assert_eq!(rows[0].budget_max_tokens, Some(777));
     assert_eq!(rows[0].execution_phase, ExecutionPhase::Coding);
 }
+
+/// P1 child specs: binary attachments are a typed field SEPARATE from the
+/// workspace-relative `files`, are validated with their own loud rule
+/// (images refused until provider media/content parts exist), and decode
+/// byte-identically on re-attach while old rows stay empty.
+#[test]
+fn child_spec_attachments_are_separate_from_paths_and_decode_on_reattach() {
+    let attachment = AttachmentId {
+        digest: faktor_core::hash::FileHash::from([3; 32]),
+        mime: "application/pdf".into(),
+        filename: Some("spec.pdf".into()),
+        size: 7,
+    };
+    let mut spec = ChildSpec::new("item-a");
+    spec.files = vec!["src/a.rs".into()];
+    spec.attachments = vec![attachment.clone()];
+    validate_attachment_ids(&spec.attachments).expect("stored pdf attachment validates");
+    validate_attachment_files(&spec.files).expect("path attachment validates");
+    // Serialize -> decode: the re-attach sees the byte-identical typed set,
+    // distinct from the path list.
+    let encoded = serde_json::to_string(&spec).unwrap();
+    let decoded: ChildSpec = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(decoded.attachments, vec![attachment.clone()]);
+    assert_eq!(decoded.files, vec!["src/a.rs".to_string()]);
+    // An OLD durable row without the field decodes with an EMPTY set (the
+    // attachment-free behavior is byte-identical).
+    let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    old.as_object_mut().unwrap().remove("attachments");
+    let legacy: ChildSpec = serde_json::from_value(old).unwrap();
+    assert!(legacy.attachments.is_empty());
+    assert_eq!(legacy.files, vec!["src/a.rs".to_string()]);
+
+    // A durable tampered spec is refused before any spawn.
+    let mut hostile = spec.clone();
+    hostile.attachments = vec![AttachmentId {
+        filename: Some("../secrets".into()),
+        ..attachment.clone()
+    }];
+    assert!(validate_attachment_ids(&hostile.attachments).is_err());
+
+    // Images are refused loudly: no provider media/content part exists to
+    // carry their bytes.
+    let image = AttachmentId {
+        digest: faktor_core::hash::FileHash::from([4; 32]),
+        mime: "image/png".into(),
+        filename: None,
+        size: 3,
+    };
+    let err = validate_attachment_ids(&[image]).expect_err("images are refused");
+    assert!(err.to_string().contains("provider media"), "{err}");
+    // The set bound is typed and inclusive.
+    let many = vec![attachment; faktor_session::MAX_ATTACHMENTS_PER_TASK + 1];
+    assert!(matches!(
+        validate_attachment_ids(&many),
+        Err(ExecError::Oversized(_))
+    ));
+}

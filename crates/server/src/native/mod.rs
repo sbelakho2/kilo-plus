@@ -17,6 +17,7 @@ use faktor_protocol::error::ApiError;
 use crate::api::{AppState, ServerDeps};
 
 pub(crate) mod agents;
+pub(crate) mod attachment;
 pub(crate) mod board;
 pub(crate) mod evidence;
 pub(crate) mod models;
@@ -31,6 +32,7 @@ pub(crate) mod usage;
 pub(crate) mod verification;
 
 pub(crate) use agents::*;
+pub(crate) use attachment::*;
 pub(crate) use board::*;
 pub(crate) use evidence::*;
 pub(crate) use models::*;

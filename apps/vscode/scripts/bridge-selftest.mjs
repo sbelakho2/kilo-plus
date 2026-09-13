@@ -17,6 +17,7 @@ import {
   messagesLoadedMessage,
   nativeEventToWebviewMessages,
   readyMessage,
+  sendMessageFailedMessage,
   sessionToUpstream,
   snapshotToWebviewMessages,
   vendoredCsp,
@@ -235,7 +236,11 @@ export const bridgeTests = [
     fn: () => {
       const bigText = ingestWebviewMessage({ type: 'sendMessage', text: 'x'.repeat(BRIDGE_LIMITS.maxTextChars + 1) });
       assertDrop(bigText, 'character bound', 'text bound');
-      const envelope = ingestWebviewMessage({ type: 'sendMessage', text: 'x'.repeat(300 * 1024), pad: 'y'.repeat(300 * 1024) });
+      const envelope = ingestWebviewMessage({
+        type: 'sendMessage',
+        text: 'ok',
+        pad: 'y'.repeat(BRIDGE_LIMITS.maxInboundBytes + 1024),
+      });
       assertDrop(envelope, 'byte bound', 'envelope bound');
       assertDrop(
         ingestWebviewMessage({ type: 'abort', sessionID: 's'.repeat(BRIDGE_LIMITS.maxStringChars + 1) }),
@@ -554,13 +559,34 @@ export const bridgeTests = [
         }
       }
 
-      // The literal required mapping: sendGoal with the bounded file paths.
+      // The literal required mapping: sendGoal with the bounded file paths
+      // plus the pending envelope (identity + ORIGINAL files payload) that
+      // is retained until durable acceptance.
       const command = ingestWebviewMessage(
-        { type: 'sendMessage', text: 'goal', files: [{ url: 'file:///w/src/a.ts' }] },
+        {
+          type: 'sendMessage',
+          text: 'goal',
+          messageID: 'm-1',
+          draftID: 'd-1',
+          files: [{ url: 'file:///w/src/a.ts' }],
+        },
         { workspaceDirectory: '/w' },
       );
       const host = bridgeCommandToHostMessage(command);
-      if (JSON.stringify(host) !== JSON.stringify({ type: 'sendGoal', goal: 'goal', files: ['src/a.ts'] })) {
+      const expectedHost = {
+        type: 'sendGoal',
+        goal: 'goal',
+        files: ['src/a.ts'],
+        pending: {
+          text: 'goal',
+          sessionId: null,
+          draftId: 'd-1',
+          messageId: 'm-1',
+          files: [{ url: 'file:///w/src/a.ts' }],
+          attachments: [],
+        },
+      };
+      if (JSON.stringify(host) !== JSON.stringify(expectedHost)) {
         throw new Error(`sendGoal mapping wrong: ${JSON.stringify(host)}`);
       }
 
@@ -576,6 +602,12 @@ export const bridgeTests = [
       }
       if (String(dataHost.goal).includes('base64')) {
         throw new Error('binary bytes must never enter the prompt text');
+      }
+      // The ref carries the EXACT bytes (base64) and the loud image flag so
+      // the host can refuse the submission and restore the draft.
+      const ref = dataHost.attachments[0];
+      if (ref.isImage !== true || ref.dataBase64 !== Buffer.from([137, 80, 78, 71]).toString('base64')) {
+        throw new Error(`attachment ref bytes wrong: ${JSON.stringify(ref)}`);
       }
 
       const many = [];
@@ -597,6 +629,79 @@ export const bridgeTests = [
       if (badBase64.refused.length !== 1 || !badBase64.refused[0].reason.includes('base64')) {
         throw new Error(`malformed base64 must be refused: ${JSON.stringify(badBase64)}`);
       }
+    },
+  },
+  {
+    label: 'pending submission identity is retained and sendMessageFailed restores it verbatim',
+    fn: () => {
+      const png = `data:image/png;base64,${Buffer.from([137, 80, 78, 71]).toString('base64')}`;
+      const command = ingestWebviewMessage(
+        {
+          type: 'sendMessage',
+          text: 'see this screenshot',
+          sessionID: '7',
+          draftID: 'draft-9',
+          messageID: 'msg-9',
+          files: [
+            { url: 'src/a.ts' },
+            { url: png, mime: 'image/png', filename: 'shot.png' },
+          ],
+        },
+        { workspaceDirectory: '/w' },
+      );
+      if (command.kind !== 'sendMessage') {
+        throw new Error(`sendMessage must be accepted: ${JSON.stringify(command)}`);
+      }
+      if (
+        command.pending.draftId !== 'draft-9' ||
+        command.pending.messageId !== 'msg-9' ||
+        command.pending.sessionId !== '7' ||
+        command.pending.text !== 'see this screenshot'
+      ) {
+        throw new Error(`identity not retained: ${JSON.stringify(command.pending)}`);
+      }
+      // The ORIGINAL files payload (data-URL images included) is retained
+      // verbatim for the Kilo restore path.
+      if (command.pending.files.length !== 2 || command.pending.files[1].url !== png) {
+        throw new Error(`original files not retained: ${JSON.stringify(command.pending.files)}`);
+      }
+      const failed = sendMessageFailedMessage(command.pending, 'task start refused: boom');
+      if (
+        failed.type !== 'sendMessageFailed' ||
+        failed.text !== 'see this screenshot' ||
+        failed.sessionID !== '7' ||
+        failed.draftID !== 'draft-9' ||
+        failed.messageID !== 'msg-9' ||
+        failed.error !== 'task start refused: boom'
+      ) {
+        throw new Error(`sendMessageFailed identity wrong: ${JSON.stringify(failed)}`);
+      }
+      if (failed.files.length !== 2 || failed.files[1].url !== png) {
+        throw new Error(`sendMessageFailed must carry the images: ${JSON.stringify(failed.files)}`);
+      }
+      // A file-only / identity-less submission stays valid and restore keeps
+      // the absent fields absent (never fabricated).
+      const bare = ingestWebviewMessage({ type: 'sendMessage', text: 'plain' });
+      const bareFailed = sendMessageFailedMessage(bare.pending, 'x');
+      if ('sessionID' in bareFailed || 'draftID' in bareFailed || 'messageID' in bareFailed) {
+        throw new Error(`absent identity must stay absent: ${JSON.stringify(bareFailed)}`);
+      }
+      // Hostile identity values are dropped loudly, never truncated into a
+      // different draft/message.
+      assertDrop(
+        ingestWebviewMessage({
+          type: 'sendMessage',
+          text: 'x',
+          messageID: 'm'.repeat(BRIDGE_LIMITS.maxStringChars + 1),
+        }),
+        'messageID',
+        'oversized message id',
+      );
+      assertDrop(
+        ingestWebviewMessage({ type: 'sendMessage', text: 'x', draftID: '   ' }),
+        'draftID',
+        'blank draft id',
+      );
     },
   },
   {
@@ -623,6 +728,7 @@ export const bridgeTests = [
           type: 'sendGoal',
           goal: 'goal',
           completionContract: { include_commit: true, include_push: false, include_pr: true },
+          pending: { text: 'goal', sessionId: null, draftId: null, messageId: null, files: [], attachments: [] },
         })
       ) {
         throw new Error(`completion contract mapping wrong: ${JSON.stringify(host)}`);

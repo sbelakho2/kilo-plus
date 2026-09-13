@@ -51,11 +51,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use faktor_agent::AgentRuntime;
+use faktor_core::attachment::AttachmentId;
+use faktor_core::cancellation::CancellationToken;
 use faktor_core::completion::CompletionContract;
 use faktor_core::id::{OpId, SessionId, TaskId, VerificationRecordId, WorktreeId};
-use faktor_core::state::{
-    CheckExecution, CriterionVerification, TaskState, TaskTransition, VerificationStatus,
-};
+use faktor_core::state::{TaskState, TaskTransition, VerificationStatus};
 use faktor_session::{
     CompletionContractGate, SessionManager, TaskBudget, MAX_TASK_CRITERIA,
     MAX_TASK_CRITERION_BYTES, MAX_TASK_GOAL_BYTES,
@@ -141,6 +141,13 @@ pub struct TaskRunRow {
     /// attachment-free run stays byte-identical.
     #[serde(default)]
     pub files: Vec<String>,
+    /// The run's immutable BINARY attachment set (`AttachmentId` rows,
+    /// schema v24) — SEPARATE from `files`: CAS bytes addressed by digest,
+    /// never workspace paths. Persisted here with the same additive
+    /// serde-default rule so a reopened/re-attached daemon reconstructs the
+    /// byte-identical typed set ([`super::validate_attachment_ids`]).
+    #[serde(default)]
+    pub attachments: Vec<AttachmentId>,
     /// The session's durable turn op id of this run (0 until submitted).
     pub op_id: Option<u64>,
     pub model: Option<String>,
@@ -192,6 +199,14 @@ pub struct TaskRunRequest {
     /// vocabulary). They ride the SAME in-session drive submit as a plain
     /// prompt — bounded by the session layer's own prompt bounds.
     pub files: Vec<String>,
+    /// Durable typed binary/image attachments of the run (`AttachmentId`
+    /// rows), SEPARATE from `files` (never workspace paths). Structural
+    /// bounds plus the loud image refusal are enforced by [`Self::validate`]
+    /// before any durable row; durable-row existence is resolved by the
+    /// session layer at admission. They land on the run's durable task row
+    /// and on every child spec so a re-attach reconstructs the identical
+    /// typed set.
+    pub attachments: Vec<AttachmentId>,
     /// Capability ceiling of the parent (children get parent ∩ policies).
     pub parent_caps: CapabilitySet,
     pub ceilings: super::Ceilings,
@@ -224,6 +239,7 @@ impl Default for TaskRunRequest {
             criteria: Vec::new(),
             mutation_mode: None,
             files: Vec::new(),
+            attachments: Vec::new(),
             parent_caps: CapabilitySet::new(),
             ceilings: super::Ceilings::default(),
             completion_contract: None,
@@ -263,6 +279,11 @@ impl TaskRunRequest {
         // bounds the single-session prompt submission enforces, plus the
         // typed hostile-path refusal) BEFORE anything durable is written.
         super::validate_attachment_files(&self.files)?;
+        // Binary attachments are validated with their OWN ONE rule (bounded
+        // count, structural id validity, loud image refusal) BEFORE anything
+        // durable is written; durable-row existence is resolved by the
+        // session layer at admission.
+        super::validate_attachment_ids(&self.attachments)?;
         for c in &self.criteria {
             if c.trim().is_empty() || c.len() > MAX_TASK_CRITERION_BYTES {
                 return Err(ExecError::Oversized(format!(
@@ -369,6 +390,19 @@ pub struct SettlementOutcome {
     /// The shadow finalize outcome (in-session shadowed runs; `None` when
     /// the run carries no live shadow).
     pub finalize: Option<ShadowFinalize>,
+}
+
+/// The materialized integration of one orchestrated run's isolated mutating
+/// children (the exact inputs the root verification binds to).
+#[derive(Debug, Clone)]
+struct RunIntegration {
+    /// The full sorted union of the staged change-set paths (the derived
+    /// check set's change input).
+    changed: Vec<String>,
+    /// The ACTUAL final integration root (owner checkout).
+    final_root: PathBuf,
+    /// The final root's snapshot digest the verification record binds.
+    final_snapshot: String,
 }
 
 /// One active orchestrated execution of the executor (audits 7/8/21/22:
@@ -702,6 +736,18 @@ impl TaskExecutor {
             .session
             .get_session(parent)?
             .ok_or_else(|| ExecError::NotFound(format!("session {parent}")))?;
+        // Admit-time binary-attachment resolution (defense in depth behind
+        // the server DTO): every digest must resolve to a byte-identical
+        // durable row of THIS session BEFORE any shadow/run/task write —
+        // an unknown or mismatched id can never leave a partial durable
+        // admission behind.
+        handle
+            .resolve_attachments(&req.attachments)
+            .map_err(|e| match e.kind {
+                faktor_core::ErrorKind::NotFound => ExecError::NotFound(e.message),
+                faktor_core::ErrorKind::Oversized => ExecError::Oversized(e.message),
+                _ => ExecError::Malformed(e.message),
+            })?;
         if handle.orchestrator_child_identity_get()?.is_some() {
             return Err(ExecError::InvalidState(
                 "the session is itself an orchestrated child; tasks start on root sessions".into(),
@@ -1019,7 +1065,9 @@ impl TaskExecutor {
             }
             Some(_) => {
                 // Re-goal a live row; criteria ride the same patch when the
-                // run carries any (None = the row keeps its criteria).
+                // run carries any (None = the row keeps its criteria). The
+                // binary attachment set is replaced when this run carries
+                // one (None = the row keeps its durable set).
                 handle
                     .update_task(
                         task_id,
@@ -1029,6 +1077,11 @@ impl TaskExecutor {
                                 None
                             } else {
                                 Some(req.criteria.clone())
+                            },
+                            attachments: if req.attachments.is_empty() {
+                                None
+                            } else {
+                                Some(req.attachments.clone())
                             },
                             ..Default::default()
                         },
@@ -1043,6 +1096,7 @@ impl TaskExecutor {
                         goal,
                         acceptance_criteria: req.criteria.clone(),
                         plan: Vec::new(),
+                        attachments: req.attachments.clone(),
                         budget: TaskBudget {
                             max_tokens: req.max_tokens,
                             max_turns: None,
@@ -1095,6 +1149,7 @@ impl TaskExecutor {
             goal: truncate(&req.goal, MAX_GOAL_CHARS),
             item_ids: vec![item.id.clone()],
             files: req.files.clone(),
+            attachments: req.attachments.clone(),
             op_id: Some(receipt.op_id.raw()),
             model: req.model.clone(),
             budget_max_tokens: req.max_tokens,
@@ -1176,11 +1231,12 @@ impl TaskExecutor {
         // path, re-goaling/patching a live row; a terminal row is frozen).
         // Child budget scopes enroll under THIS row, so the run's cap bounds
         // its children's collective spend once children carry their own cost
-        // caps. Without a cap, criteria or a non-default completion contract
-        // no root row is created — previous-wave behavior stays
-        // byte-identical.
+        // caps. Without a cap, criteria, binary attachments or a non-default
+        // completion contract no root row is created — previous-wave
+        // behavior stays byte-identical.
         if req.max_cost_micro.is_some()
             || !req.criteria.is_empty()
+            || !req.attachments.is_empty()
             || req.completion_contract.is_some_and(|c| !c.is_default())
         {
             let task_id = handle.task_id()?;
@@ -1195,12 +1251,21 @@ impl TaskExecutor {
                     )));
                 }
                 Some(_) => {
-                    if !req.criteria.is_empty() {
+                    if !req.criteria.is_empty() || !req.attachments.is_empty() {
                         handle
                             .update_task(
                                 task_id,
                                 faktor_session::TaskPatch {
-                                    acceptance_criteria: Some(req.criteria.clone()),
+                                    acceptance_criteria: if req.criteria.is_empty() {
+                                        None
+                                    } else {
+                                        Some(req.criteria.clone())
+                                    },
+                                    attachments: if req.attachments.is_empty() {
+                                        None
+                                    } else {
+                                        Some(req.attachments.clone())
+                                    },
                                     ..Default::default()
                                 },
                             )
@@ -1217,6 +1282,7 @@ impl TaskExecutor {
                             goal,
                             acceptance_criteria: req.criteria.clone(),
                             plan: Vec::new(),
+                            attachments: req.attachments.clone(),
                             budget: faktor_session::TaskBudget::default(),
                             state: TaskState::Pending,
                             created_ms: now,
@@ -1245,6 +1311,10 @@ impl TaskExecutor {
             // byte-identical set (never memory). `validate()` already
             // enforced the shared bounds/hostile rules.
             s.files = req.files.clone();
+            // The run's BINARY attachment set rides every child spec too —
+            // SEPARATE from the workspace-relative `files`; the durable plan
+            // row reconstructs the exact typed set on re-attach.
+            s.attachments = req.attachments.clone();
             // (audits 7/8/21/22, work-entry unification) Ownership is read
             // from the ITEM alone and lands on the durable wave-A3
             // assignment rows at compile (before any spawn); the child spec
@@ -1551,16 +1621,88 @@ impl TaskExecutor {
         if !all_done || task.state.is_terminal() {
             return Ok(outcome);
         }
-        // (1) Aggregate/root deterministic verification.
-        let criteria = task.acceptance_criteria.clone();
+        // Tournaments KEEP no auto-integration: the winner's worktree is only
+        // PROPOSED for the explicit approved-merge path, so a tournament run
+        // never integrates here and never mints root completion from the
+        // owner checkout's unrelated life.
+        let is_tournament = crate::tournament::Tournament::reopen(&handle)
+            .map_err(tournament_exec_error)?
+            .iter()
+            .any(|t| t.run_family == run_id);
+        if is_tournament {
+            return Ok(outcome);
+        }
+        // (1) Integrate EVERY mutating isolated child into the final root
+        // BEFORE any root verification. The integration record is written
+        // record-first and is the durable binding of the root verification
+        // below; a CAS conflict with the owner checkout is a typed refusal
+        // that blocks completion until the drift is resolved.
+        let integration = self.integrate_isolated_children(
+            &handle,
+            parent,
+            &run_id,
+            task_id,
+            &rows,
+            &spawn_items,
+        )?;
         if !self.route_root_to_verifying(&handle, task_id)? {
             return Ok(outcome);
         }
-        let record = self.aggregate_root_verification_record(&handle, task_id, &criteria, &rows)?;
-        persist_aggregate_verification_fact(&handle, &criteria)?;
-        outcome.verified = true;
+        let criteria = handle
+            .get_task(task_id)
+            .map_err(|e| ExecError::Internal(format!("root task row read: {e}")))?
+            .map(|t| t.acceptance_criteria)
+            .unwrap_or_default();
+        // (2) The REAL shared verification service over the ACTUAL final
+        // integration root: checks derive from the root's component profile
+        // and the integrated change, never from a synthetic aggregate. A
+        // service that cannot run (disabled, no derivation, infra) leaves
+        // the run unverified — completion is refused, never faked.
+        let token = CancellationToken::new();
+        let run = match self
+            .orchestrator
+            .agent()
+            .verify_integrated_root(
+                &handle,
+                &integration.final_root,
+                &integration.changed,
+                &criteria,
+                &token,
+            )
+            .await
+        {
+            Ok(run) => run,
+            Err(e) => {
+                persist_root_verification_fact(&handle, "pending", &[], &integration.changed)?;
+                eprintln!(
+                    "root verification unavailable for orchestrated run {run_id}: {e}; run stays unverified"
+                );
+                return Ok(outcome);
+            }
+        };
+        let record = self.find_or_create_root_verification_record(
+            &handle,
+            task_id,
+            &criteria,
+            &integration.final_snapshot,
+            &run,
+        )?;
+        persist_root_verification_fact(
+            &handle,
+            match run.status {
+                VerificationStatus::Passed => "passed",
+                VerificationStatus::Failed => "failed",
+                _ => "pending",
+            },
+            &run.checks,
+            &integration.changed,
+        )?;
         outcome.verification = Some(record);
-        // (2) The accepted contract's steps against the run's own root.
+        outcome.verified = run.status == VerificationStatus::Passed;
+        if !outcome.verified {
+            return Ok(outcome);
+        }
+        // (3) The accepted contract's steps against the run's own root.
         outcome.steps = match self.run_completion_steps(parent).await {
             Ok(report) => report,
             Err(e) => {
@@ -1568,16 +1710,10 @@ impl TaskExecutor {
                 None
             }
         };
-        // (3) Completion gate: the durable contract gate must be satisfied
-        // (all requested step rows Succeeded) before the aggregate record is
-        // consumed.
+        // (4) Completion gate: the durable contract gate must be satisfied
+        // (all requested step rows Succeeded) before the record is consumed.
         match handle.completion_contract_gate(task_id) {
             Ok(CompletionContractGate::Satisfied) => {
-                // Re-resolve the record at the CURRENT revision (replay-safe:
-                // the record finder reuses the same passing record).
-                let record =
-                    self.aggregate_root_verification_record(&handle, task_id, &criteria, &rows)?;
-                outcome.verification = Some(record);
                 let revision = handle
                     .task_revision(task_id)
                     .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
@@ -1604,6 +1740,280 @@ impl TaskExecutor {
             }
         }
         Ok(outcome)
+    }
+
+    /// Integrate EVERY mutating isolated child of a settled run into the
+    /// final root through the existing [`OrchestratorRuntime::stage_child_changes`]
+    /// and approved-merge path (all staged files approved; the CAS remains the
+    /// conflict authority). Record-first: the integration record is written
+    /// BEFORE any file apply and finalized with the actual final root
+    /// snapshot after the last apply; a replay of the same run resumes the
+    /// idempotent CAS applies and converges.
+    ///
+    /// Reuse: when the task already holds a FINALIZED integration record
+    /// whose snapshot still digests to the CURRENT root and whose staged
+    /// source set is byte-identical, the integration is already in place and
+    /// nothing is applied again (the reattach convergence).
+    fn integrate_isolated_children(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        parent: SessionId,
+        run_id: &str,
+        task_id: TaskId,
+        rows: &[super::ChildRuntime],
+        spawn_items: &[String],
+    ) -> Result<RunIntegration, ExecError> {
+        let owner_root = self.owner_root_of(parent, handle)?;
+        let mut candidates: Vec<&super::ChildRuntime> = rows
+            .iter()
+            .filter(|r| {
+                r.ownership == faktor_session::child::ChildOwnership::IsolatedWorktree
+                    && spawn_items.iter().any(|i| i == &r.item_id)
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.child_id.cmp(&b.child_id));
+        let mut staged: Vec<(String, crate::runtime::merge::ChangeSet)> = Vec::new();
+        let mut sources: Vec<faktor_session::IntegrationSourceRow> = Vec::new();
+        let mut all_paths: BTreeSet<String> = BTreeSet::new();
+        for child in candidates {
+            if child.state != ChildState::Done {
+                return Err(ExecError::InvalidState(format!(
+                    "cannot integrate non-Done isolated child {} (state {:?})",
+                    child.child_id, child.state
+                )));
+            }
+            let cs = self.orchestrator.stage_child_changes(&child.child_id)?;
+            let child_dir = self.orchestrator.child_worktree_dir(child)?;
+            let candidate_root_hash = faktor_session::root_snapshot_digest(
+                &child_dir,
+                faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
+            )
+            .map_err(|e| {
+                ExecError::Internal(format!(
+                    "candidate root snapshot of child {}: {e}",
+                    child.child_id
+                ))
+            })?;
+            for f in &cs.files {
+                all_paths.insert(f.path.to_string_lossy().into_owned());
+            }
+            sources.push(faktor_session::IntegrationSourceRow {
+                child_id: child.child_id.clone(),
+                change_set_id: cs.id(),
+                candidate_root_hash,
+            });
+            staged.push((child.child_id.clone(), cs));
+        }
+        sources.sort_by(|a, b| a.child_id.cmp(&b.child_id));
+        let full_paths: Vec<String> = all_paths.iter().cloned().collect();
+        let sources_digest = if sources.is_empty() {
+            String::new()
+        } else {
+            stable_list_digest(
+                &sources
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{}|{}|{}",
+                            s.child_id, s.change_set_id, s.candidate_root_hash
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let files_digest = if full_paths.is_empty() {
+            String::new()
+        } else {
+            stable_list_digest(&full_paths)
+        };
+        let before = faktor_session::root_snapshot_digest(
+            &owner_root,
+            faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
+        )
+        .map_err(|e| {
+            ExecError::Internal(format!(
+                "pre-integration root snapshot of {}: {e}",
+                owner_root.display()
+            ))
+        })?;
+        // Reattach convergence: the finalized record still binds the CURRENT
+        // root and the staged source set is identical -> nothing to apply.
+        if let Some(existing) = handle
+            .ledger_integration_record_for_task(task_id.raw())
+            .map_err(|e| ExecError::Internal(format!("integration record read: {e}")))?
+        {
+            if !existing.final_snapshot_hash.is_empty()
+                && existing.final_snapshot_hash == before
+                && existing.source_count == sources.len() as u64
+                && existing.sources_digest == sources_digest
+            {
+                return Ok(RunIntegration {
+                    changed: full_paths,
+                    final_root: owner_root,
+                    final_snapshot: before,
+                });
+            }
+        }
+        let now = handle.now_ms();
+        let in_flight = faktor_session::IntegrationRecordRow {
+            run_id: run_id.to_string(),
+            task_id: task_id.raw(),
+            base_revision: sources.first().map(|s| s.change_set_id.clone()),
+            base_snapshot: Some(before.clone()),
+            final_root: owner_root.to_string_lossy().into_owned(),
+            final_snapshot_hash: String::new(),
+            integrated_files: full_paths
+                .iter()
+                .take(faktor_session::MAX_INTEGRATION_FILES)
+                .cloned()
+                .collect(),
+            integrated_file_count: full_paths.len() as u64,
+            integrated_files_digest: files_digest.clone(),
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            sources: sources
+                .iter()
+                .take(faktor_session::MAX_INTEGRATION_SOURCES)
+                .cloned()
+                .collect(),
+            source_count: sources.len() as u64,
+            sources_digest: sources_digest.clone(),
+            at_ms: now,
+        };
+        // Record-first: the in-flight record (empty final hash) is durable
+        // BEFORE any file apply.
+        handle
+            .ledger_integration_record_set(&in_flight)
+            .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))?;
+        let mut merged_paths: BTreeSet<String> = BTreeSet::new();
+        for (child_id, cs) in &staged {
+            let approved: Vec<std::path::PathBuf> =
+                cs.files.iter().map(|f| f.path.clone()).collect();
+            let outcome =
+                self.orchestrator
+                    .approve_and_merge(child_id, &cs.id(), &approved, &[])?;
+            for p in &outcome.merged {
+                merged_paths.insert(p.to_string_lossy().into_owned());
+            }
+            if !outcome.conflicts.is_empty() {
+                let conflicts: Vec<String> = outcome
+                    .conflicts
+                    .iter()
+                    .take(faktor_session::MAX_INTEGRATION_CONFLICTS)
+                    .map(|(p, d)| truncate_bytes(&format!("{}: {d}", p.display()), 256))
+                    .collect();
+                let blocked = faktor_session::IntegrationRecordRow {
+                    final_snapshot_hash: String::new(),
+                    integrated_files: Vec::new(),
+                    integrated_file_count: 0,
+                    integrated_files_digest: String::new(),
+                    conflicts: conflicts.clone(),
+                    conflict_count: outcome.conflicts.len() as u64,
+                    at_ms: handle.now_ms(),
+                    ..in_flight
+                };
+                handle
+                    .ledger_integration_record_set(&blocked)
+                    .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))?;
+                let first = conflicts.first().cloned().unwrap_or_default();
+                return Err(ExecError::IntegrationConflict(format!(
+                    "child {child_id} could not be integrated into {} ({} conflict(s); first: {first}); completion is refused until the drift is resolved and the run re-integrated",
+                    owner_root.display(),
+                    outcome.conflicts.len()
+                )));
+            }
+        }
+        let final_snapshot = faktor_session::root_snapshot_digest(
+            &owner_root,
+            faktor_session::MAX_ROOT_SNAPSHOT_ENTRIES,
+        )
+        .map_err(|e| {
+            ExecError::Internal(format!(
+                "final integration root snapshot of {}: {e}",
+                owner_root.display()
+            ))
+        })?;
+        let integrated: Vec<String> = merged_paths.iter().cloned().collect();
+        let integrated_digest = if integrated.is_empty() {
+            String::new()
+        } else {
+            stable_list_digest(&integrated)
+        };
+        let finalized = faktor_session::IntegrationRecordRow {
+            final_snapshot_hash: final_snapshot.clone(),
+            integrated_files: integrated
+                .iter()
+                .take(faktor_session::MAX_INTEGRATION_FILES)
+                .cloned()
+                .collect(),
+            integrated_file_count: integrated.len() as u64,
+            integrated_files_digest: integrated_digest,
+            conflicts: Vec::new(),
+            conflict_count: 0,
+            at_ms: handle.now_ms(),
+            ..in_flight
+        };
+        handle
+            .ledger_integration_record_set(&finalized)
+            .map_err(|e| ExecError::Internal(format!("integration record write: {e}")))?;
+        Ok(RunIntegration {
+            changed: full_paths,
+            final_root: owner_root,
+            final_snapshot,
+        })
+    }
+
+    /// Find-or-create the root verification record of one orchestrated run at
+    /// the CURRENT revision, bound to the final integration snapshot
+    /// (`tree_hash`) and covering every acceptance criterion. A matching
+    /// record (same revision + integration snapshot + status, criteria
+    /// covered when passing) is reused — replay-idempotent; anything else
+    /// creates a fresh record (an owner edit that changed the snapshot can
+    /// never reuse the old one).
+    fn find_or_create_root_verification_record(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        task_id: TaskId,
+        criteria: &[String],
+        final_snapshot: &str,
+        run: &faktor_agent::IntegratedRootVerification,
+    ) -> Result<VerificationRecordId, ExecError> {
+        let revision = handle
+            .task_revision(task_id)
+            .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
+        let covers = |r: &faktor_session::VerificationRecord| {
+            criteria.iter().all(|c| {
+                r.criteria
+                    .iter()
+                    .any(|cv| cv.criterion_key == *c && cv.passed)
+            })
+        };
+        if let Some(existing) = handle
+            .list_verification_records(task_id)
+            .map_err(|e| ExecError::Internal(format!("verification record list: {e}")))?
+            .into_iter()
+            .find(|r| {
+                r.status == run.status
+                    && r.revision == revision
+                    && r.tree_hash.as_deref() == Some(final_snapshot)
+                    && (run.status != VerificationStatus::Passed || covers(r))
+            })
+        {
+            return Ok(existing.record_id);
+        }
+        handle
+            .create_verification_record(
+                task_id,
+                Some(final_snapshot.to_string()),
+                run.criteria.clone(),
+                run.checks.clone(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                run.status,
+                handle.now_ms(),
+            )
+            .map_err(|e| ExecError::Internal(format!("root verification record write: {e}")))
     }
 
     /// Drive the root task row across the machine's legal edges to
@@ -1646,92 +2056,6 @@ impl TaskExecutor {
         Err(ExecError::Internal(format!(
             "root task {task_id} routing to Verifying exceeded its bounded edge count"
         )))
-    }
-
-    /// Find-or-create the PASSING aggregate verification record of the
-    /// run's root task at its CURRENT revision: one deterministic check per
-    /// acceptance criterion (the tournament-style derived check set over the
-    /// RUN, never per candidate), every criterion covered `passed = true`.
-    /// An existing passing record that covers the current revision and
-    /// criteria is reused (idempotent replay).
-    fn aggregate_root_verification_record(
-        &self,
-        handle: &faktor_session::SessionHandle,
-        task_id: TaskId,
-        criteria: &[String],
-        children: &[super::ChildRuntime],
-    ) -> Result<VerificationRecordId, ExecError> {
-        let revision = handle
-            .task_revision(task_id)
-            .map_err(|e| ExecError::Internal(format!("root task revision read: {e}")))?;
-        let covers = |r: &faktor_session::VerificationRecord| {
-            criteria.iter().all(|c| {
-                r.criteria
-                    .iter()
-                    .any(|cv| cv.criterion_key == *c && cv.passed)
-            })
-        };
-        if let Some(existing) = handle
-            .list_verification_records(task_id)
-            .map_err(|e| ExecError::Internal(format!("verification record list: {e}")))?
-            .into_iter()
-            .find(|r| r.status == VerificationStatus::Passed && r.revision == revision && covers(r))
-        {
-            return Ok(existing.record_id);
-        }
-        // The tournament-style check set: one deterministic derived check
-        // per criterion, in criterion order (byte-stable ids).
-        let check_specs =
-            crate::tournament::aggregate_check_specs(criteria).map_err(tournament_exec_error)?;
-        let now = handle.now_ms();
-        let done = children
-            .iter()
-            .filter(|c| c.state == ChildState::Done)
-            .count();
-        let checks: Vec<CheckExecution> = check_specs
-            .iter()
-            .map(|spec| CheckExecution {
-                check: spec.id.clone(),
-                program: "orchestrator".into(),
-                args: Vec::new(),
-                category: "aggregate".into(),
-                required: true,
-                status: VerificationStatus::Passed,
-                started_ms: now,
-                finished_ms: Some(now),
-                exit: Some(0),
-                summary: Some(format!(
-                    "aggregate run check ({} of {} children Done): {}",
-                    done,
-                    children.len(),
-                    truncate(&spec.spec, 200)
-                )),
-            })
-            .collect();
-        let criterion_rows: Vec<CriterionVerification> = criteria
-            .iter()
-            .map(|c| CriterionVerification {
-                criterion_key: c.clone(),
-                passed: true,
-                evidence: Some(format!(
-                    "aggregate deterministic verification: {done}/{} run children Done",
-                    children.len()
-                )),
-            })
-            .collect();
-        handle
-            .create_verification_record(
-                task_id,
-                None,
-                criterion_rows,
-                checks,
-                Vec::new(),
-                Vec::new(),
-                None,
-                VerificationStatus::Passed,
-                now,
-            )
-            .map_err(|e| ExecError::Internal(format!("aggregate verification record write: {e}")))
     }
 
     // ------------------------------------------------- shadow helpers (P0-48)
@@ -2667,30 +2991,61 @@ fn verification_passed(handle: &faktor_session::SessionHandle) -> bool {
     value.get("status").and_then(|s| s.as_str()) == Some("passed")
 }
 
-/// Write the aggregate root verification fact of an orchestrated run (the
-/// SAME `verification`/`last` shape the agent's genuine ends write): the
-/// derived aggregate check ids all `passed`, no changed files. The durable
-/// completion-step runner reads THIS fact as its fail-closed guard.
-fn persist_aggregate_verification_fact(
+/// Write the REAL root verification fact of an orchestrated run (the SAME
+/// `verification`/`last` shape the agent's genuine ends write): the executed
+/// checks with their real pass/fail verdicts and the integrated change. The
+/// durable completion-step runner reads THIS fact as its fail-closed guard —
+/// only a real passing run lets the steps run.
+fn persist_root_verification_fact(
     handle: &faktor_session::SessionHandle,
-    criteria: &[String],
+    status: &str,
+    checks: &[faktor_core::state::CheckExecution],
+    changed: &[String],
 ) -> Result<(), ExecError> {
-    let specs = crate::tournament::aggregate_check_specs(criteria)
-        .map_err(|e| ExecError::Internal(format!("aggregate check set: {e}")))?;
     let last = serde_json::json!({
-        "status": "passed",
-        "checks": specs
+        "status": status,
+        "checks": checks
             .iter()
-            .map(|spec| serde_json::json!({"id": spec.id, "passed": true}))
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.check,
+                    "passed": c.status == VerificationStatus::Passed,
+                })
+            })
             .collect::<Vec<_>>(),
-        "changed": [],
+        "changed": changed,
     });
     handle
         .upsert_memory_fact("verification", "last", &last.to_string())
         .map(|_| ())
-        .map_err(|e| {
-            ExecError::Internal(format!("aggregate verification fact write: {}", e.message))
-        })
+        .map_err(|e| ExecError::Internal(format!("root verification fact write: {}", e.message)))
+}
+
+/// Deterministic 64-hex digest of a bounded string list (integration record
+/// source/file coverage). FNV-1a folded under four independent seeds and
+/// concatenated: stable across processes and platforms, and only used to
+/// detect list drift (`source_count`/`integrated_file_count` carry the
+/// exact cardinality beside it).
+fn stable_list_digest(items: &[String]) -> String {
+    let mut out = String::with_capacity(64);
+    for seed in [
+        0xcbf2_9ce4_8422_2325u64,
+        0x9e37_79b9_7f4a_7c15,
+        0x2545_f491_4f6c_dd1d,
+        0x94d0_49bb_1331_11ebu64,
+    ] {
+        let mut hash = seed;
+        for item in items {
+            for b in item.as_bytes() {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        out.push_str(&format!("{hash:016x}"));
+    }
+    out
 }
 
 fn truncate_bytes(s: &str, max: usize) -> String {
@@ -2742,6 +3097,7 @@ mod completion_contract_executor_tests {
                 goal: "g".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: TaskBudget::default(),
                 state: TaskState::Pending,
                 created_ms: now,

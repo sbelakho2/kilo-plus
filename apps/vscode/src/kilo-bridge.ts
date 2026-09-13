@@ -45,7 +45,9 @@ export interface WebviewBoundMessage {
   readonly [key: string]: unknown;
 }
 
-/** The host command vocabulary the bridge maps accepted UI messages onto. */
+/**
+ * The host command vocabulary the bridge maps accepted UI messages onto.
+ */
 export interface HostChatMessage {
   readonly type: string;
   readonly [key: string]: unknown;
@@ -54,8 +56,15 @@ export interface HostChatMessage {
 export const BRIDGE_PROTOCOL = 'faktor-kilo-bridge/1';
 
 export const BRIDGE_LIMITS = {
-  /** Inbound envelope cap (serialized JSON bytes). */
-  maxInboundBytes: 256 * 1024,
+  /**
+   * Inbound envelope cap (serialized JSON bytes). Sized so one maximum
+   * attachment (base64 of 7 MiB, ~9.33 MiB) plus its envelope fits: the
+   * server refuses uploads over 7 MiB decoded and refuses request bodies
+   * over 10 MiB, so a larger inbound message could never be admitted
+   * anyway. Bounded everything still holds — this is the documented ceiling
+   * for the frozen UI -> host direction.
+   */
+  maxInboundBytes: 10 * 1024 * 1024,
   /** Outbound `messagesLoaded` cap (serialized JSON bytes). */
   maxOutboundBytes: 1024 * 1024,
   /** Prompt text cap. */
@@ -79,8 +88,10 @@ export const BRIDGE_LIMITS = {
   maxFaktorCockpitLines: 64,
   /** Faktor panel: serialized-byte budget of one additive frame. */
   maxFaktorFrameBytes: 128 * 1024,
-  /** Faktor panel: one inline attachment (decoded bytes). */
-  maxAttachmentBytes: 128 * 1024,
+  /** One inline attachment's decoded bytes. Mirrors the daemon's upload
+   * bound (`MAX_ATTACHMENT_UPLOAD_BYTES` = 7 MiB): base64 inflates by 4/3
+   * and the envelope must stay under the 10 MiB body cap. */
+  maxAttachmentBytes: 7 * 1024 * 1024,
   /** Faktor panel: binary attachment references per message. */
   maxAttachments: 64,
   /** Mirrors faktor_session::MAX_FILES_PER_PROMPT. */
@@ -147,13 +158,47 @@ const MESSAGE_LOAD_MODES: ReadonlySet<string> = new Set([
   'reconcile',
 ]);
 
-/** One validated binary/image attachment: a REFERENCE, never inline bytes. */
+/** One validated binary/image attachment: bytes stay OUT of the prompt. */
 export interface BridgeAttachmentRef {
-  /** `faktor-attachment:sha256:<hex>` — stable, content-addressed, opaque. */
+  /** `faktor-attachment:sha256:<hex>` — stable display identity. */
   readonly ref: string;
   readonly mime: string;
   readonly filename: string | null;
   readonly bytes: number;
+  /** Standard base64 of the raw bytes (the daemon upload payload). */
+  readonly dataBase64: string;
+  /** True for `image/*`: the host must refuse it LOUDLY (media parts are
+   * not wired) and restore the draft instead of uploading. */
+  readonly isImage: boolean;
+}
+
+/**
+ * The restorable identity of ONE submission (the exact frozen-UI fields
+ * `sendMessageFailed` echoes): text, session/draft/message identity and the
+ * ORIGINAL attachments payload. Kept structurally minimal so both the
+ * bridge envelope and the host's re-validated envelope can be restored.
+ */
+export interface RestorableSubmission {
+  readonly text: string;
+  readonly sessionId: string | null;
+  readonly draftId: string | null;
+  readonly messageId: string | null;
+  /** The ORIGINAL upstream `files` payload (data-URL images included),
+   * restored verbatim. Never parsed, never re-encoded. */
+  readonly files: readonly unknown[];
+}
+
+/**
+ * The host-side PENDING SUBMISSION ENVELOPE identity: the original
+ * frozen-UI fields needed to restore the Kilo draft (text + images) through
+ * `sendMessageFailed` until — and unless — the daemon durably accepts the
+ * task. It is retained by the host; nothing is cleared on a failure. Binary
+ * attachments ride the same envelope (exact bytes for the pre-admission
+ * upload) so the host never re-parses the UI payload.
+ */
+export interface BridgePendingSubmission extends RestorableSubmission {
+  /** Binary/image refs with their exact upload payloads. */
+  readonly attachments: readonly BridgeAttachmentRef[];
 }
 
 /** One refused entry of a Kilo file payload (kept, never a whole drop). */
@@ -226,6 +271,8 @@ export type BridgeCommand =
       readonly kind: 'sendMessage';
       readonly text: string;
       readonly sessionId: string | null;
+      /** The pending-submission identity retained until durable acceptance. */
+      readonly pending: BridgePendingSubmission;
       readonly files: readonly string[];
       readonly attachments: readonly BridgeAttachmentRef[];
       readonly refusedAttachments: readonly BridgeAttachmentRefusal[];
@@ -470,6 +517,8 @@ function binaryAttachmentRef(
     mime,
     filename: sanitizeFilename(filename),
     bytes: bytes.byteLength,
+    dataBase64: bytes.toString('base64'),
+    isImage: mime.startsWith('image/'),
   };
 }
 
@@ -636,9 +685,27 @@ export function ingestWebviewMessage(
         return drop(rawType, 'sendMessage.sessionID must be a bounded non-empty string', bytes);
       }
     }
+    // The Kilo submission identity: retained in the pending envelope and
+    // echoed back verbatim by `sendMessageFailed` so the vendored composer
+    // restores the EXACT draft/message (never a new identity).
+    let messageId: string | null = null;
+    if (message.messageID !== undefined && message.messageID !== null) {
+      messageId = boundedString(message.messageID, BRIDGE_LIMITS.maxStringChars);
+      if (messageId === null) {
+        return drop(rawType, 'sendMessage.messageID must be a bounded non-empty string', bytes);
+      }
+    }
+    let draftId: string | null = null;
+    if (message.draftID !== undefined && message.draftID !== null) {
+      draftId = boundedString(message.draftID, BRIDGE_LIMITS.maxStringChars);
+      if (draftId === null) {
+        return drop(rawType, 'sendMessage.draftID must be a bounded non-empty string', bytes);
+      }
+    }
     // Attachments are mapped, never refused wholesale: valid entries become
-    // workspace-relative daemon paths and/or content-addressed binary refs;
-    // malformed entries are refused individually with a reason.
+    // workspace-relative daemon paths and/or content-addressed binary refs
+    // (with their exact bytes for the upload); malformed entries are refused
+    // individually with a reason.
     const mapping = mapKiloFiles(message.files, options.workspaceDirectory ?? null);
     // The Task-mode completion contract is strict: a malformed contract is
     // a loud drop (starting the task contract-free would lie about the
@@ -651,6 +718,14 @@ export function ingestWebviewMessage(
       kind: 'sendMessage',
       text: message.text,
       sessionId,
+      pending: {
+        text: message.text,
+        sessionId,
+        draftId,
+        messageId,
+        files: Array.isArray(message.files) ? message.files : [],
+        attachments: mapping.attachments,
+      },
       files: mapping.files,
       attachments: mapping.attachments,
       refusedAttachments: mapping.refused,
@@ -951,6 +1026,7 @@ export function bridgeCommandToHostMessage(command: BridgeCommand): HostChatMess
         ...(command.completionContract !== null
           ? { completionContract: command.completionContract }
           : {}),
+        pending: command.pending,
       };
     case 'abort':
       return { type: 'cancelRun' };
@@ -1004,6 +1080,30 @@ export function bridgeCommandToHostMessage(command: BridgeCommand): HostChatMess
 }
 
 // -------------------------------------------------------------- outbound ABI
+
+/**
+ * The Kilo-compatible restore message for ONE failed pending submission:
+ * `sendMessageFailed` carrying the ORIGINAL text, session/draft/message
+ * identity and attachment payload. The frozen `PromptInput.restoreFailed`
+ * handler rebuilds the draft text and image attachments from exactly these
+ * fields; the host sends this on EVERY admission failure and never clears
+ * the pending envelope before a durable acceptance.
+ */
+export function sendMessageFailedMessage(
+  pending: RestorableSubmission,
+  error: string,
+): WebviewBoundMessage {
+  const bounded = error.length > 2000 ? `${error.slice(0, 2000)}…` : error;
+  return {
+    type: 'sendMessageFailed',
+    error: bounded,
+    text: pending.text,
+    ...(pending.sessionId !== null ? { sessionID: pending.sessionId } : {}),
+    ...(pending.draftId !== null ? { draftID: pending.draftId } : {}),
+    ...(pending.messageId !== null ? { messageID: pending.messageId } : {}),
+    ...(pending.files.length > 0 ? { files: pending.files } : {}),
+  };
+}
 
 export interface BridgeContext {
   readonly extensionVersion: string;

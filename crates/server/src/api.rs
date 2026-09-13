@@ -456,6 +456,23 @@ pub async fn serve(mut deps: ServerDeps, port: u16) -> std::io::Result<ServerHan
             "/native/session/{id}/task-runs/{run_id}/cancel",
             post(native_task_run_cancel),
         )
+        // Native binary attachments (additive, strict): upload ONE bounded
+        // payload into the session's durable CAS-backed store, resolve its
+        // typed metadata by digest, and fetch the verified bytes. IMAGES are
+        // refused loudly with code `unsupported` until provider
+        // media/content parts can carry bytes to a model.
+        .route(
+            "/native/session/{id}/attachments",
+            post(native_attachment_upload),
+        )
+        .route(
+            "/native/session/{id}/attachments/{digest}",
+            get(native_attachment_get),
+        )
+        .route(
+            "/native/session/{id}/attachments/{digest}/bytes",
+            get(native_attachment_bytes),
+        )
         // Multi-candidate implementation tournaments (additive): start an
         // N = 2..=4 candidate tournament through the executor's ONE entry
         // (identical goal+criteria, isolated candidate worktrees) and read
@@ -7715,6 +7732,7 @@ mod tests {
                 goal: goal.into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget {
                     max_tokens,
                     max_turns,

@@ -173,6 +173,16 @@ pub(crate) struct StartTaskRunRequest {
     /// attachment-free; the daemon never reads the filesystem at THIS
     /// boundary (the drive's own permission requester gates every tool).
     files: Option<Vec<String>>,
+    /// Durable typed binary/image attachments (`AttachmentId` rows) uploaded
+    /// through `POST /native/session/{id}/attachments` BEFORE this start.
+    /// SEPARATE from `files`: CAS bytes addressed by digest, never workspace
+    /// paths. Strict (`deny_unknown_fields` on the id itself); every digest
+    /// must resolve to a byte-identical durable row of THIS session and an
+    /// image id is refused loudly (code `unsupported`) — provider
+    /// media/content parts are not wired, so the server never pretends an
+    /// attachment reached a model. Absent/empty = the attachment-free path.
+    #[serde(default)]
+    attachments: Option<Vec<faktor_core::attachment::AttachmentId>>,
     /// The PR/CI-fix completion contract of this run (P2): when present with
     /// at least one requested step, the executor records it durably BEFORE
     /// the first model call and `VerifiedComplete` requires a durable
@@ -305,6 +315,14 @@ pub(crate) async fn native_task_run_start(
     if let Err(e) = faktor_orchestrator::runtime::validate_attachment_files(&files) {
         return exec_error_response(&e);
     }
+    // Binary attachments: every digest must resolve to a byte-identical
+    // durable row of THIS session (uploaded first) and images are refused
+    // loudly — BEFORE any shadow/task/run row, so a refused start leaves no
+    // partial durable admission.
+    let attachments = req.attachments.take().unwrap_or_default();
+    if let Err(e) = validate_wire_attachments(&handle, &attachments) {
+        return wire_status(e);
+    }
     // P2: the plain-prompt path (`work_items` absent) carries no completion
     // contract seam; a non-default contract is refused loudly here, never
     // silently dropped. The default all-false contract is accepted and
@@ -350,6 +368,7 @@ pub(crate) async fn native_task_run_start(
                 criteria: req.criteria.unwrap_or_default(),
                 mutation_mode: req.mutation_mode,
                 files,
+                attachments: attachments.clone(),
                 parent_caps: native_run_parent_caps(),
                 completion_contract: req.completion_contract,
                 ..Default::default()
@@ -365,6 +384,7 @@ pub(crate) async fn native_task_run_start(
             let request = PromptRequest {
                 prompt: req.goal,
                 files,
+                attachments,
                 model: req.model,
                 criteria: req.criteria.unwrap_or_default(),
                 mutation_mode: req.mutation_mode,
@@ -789,6 +809,56 @@ mod attachment_dto_tests {
         ] {
             assert_eq!(status_of(&[hostile.to_string()]), 400, "{hostile:?}");
         }
+    }
+
+    /// The additive binary `attachments` DTO member is STRICT and SEPARATE
+    /// from `files`: a valid typed id parses, unknown/missing/hostile
+    /// members are 400s, and a typo of the field name never silently drops
+    /// the attachments.
+    #[test]
+    fn task_binary_attachments_are_strict_and_separate_from_files() {
+        use super::StartTaskRunRequest;
+        let digest = "a".repeat(64);
+        let valid = serde_json::json!({
+            "goal": "g",
+            "files": ["src/a.rs"],
+            "attachments": [
+                {"digest": digest, "mime": "application/pdf", "filename": "spec.pdf", "size": 7},
+            ],
+        });
+        let req: StartTaskRunRequest = serde_json::from_value(valid).unwrap();
+        let attachments = req.attachments.expect("attachments parsed");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime, "application/pdf");
+        assert_eq!(req.files.as_deref(), Some(&["src/a.rs".to_string()][..]));
+        // A missing REQUIRED id member (`size`) is a serde 400 (never a
+        // silently partial id); `filename` is legitimately optional.
+        let missing = serde_json::json!({
+            "goal": "g",
+            "attachments": [{"digest": digest, "mime": "application/pdf"}],
+        });
+        assert!(serde_json::from_value::<StartTaskRunRequest>(missing).is_err());
+        // An unknown id member is a 400 (AttachmentId is deny_unknown_fields).
+        let unknown_member = serde_json::json!({
+            "goal": "g",
+            "attachments": [
+                {"digest": digest, "mime": "application/pdf", "filename": null, "size": 7, "url": "data:x"},
+            ],
+        });
+        assert!(serde_json::from_value::<StartTaskRunRequest>(unknown_member).is_err());
+        // A typo of the field name is a 400: the DTO never silently drops
+        // attachments into a run that never declared them.
+        let typo = serde_json::json!({
+            "goal": "g",
+            "attachment": [{"digest": digest, "mime": "application/pdf", "filename": null, "size": 7}],
+        });
+        assert!(serde_json::from_value::<StartTaskRunRequest>(typo).is_err());
+        // A malformed digest (not 64 hex) is a 400.
+        let bad_digest = serde_json::json!({
+            "goal": "g",
+            "attachments": [{"digest": "zz", "mime": "application/pdf", "filename": null, "size": 7}],
+        });
+        assert!(serde_json::from_value::<StartTaskRunRequest>(bad_digest).is_err());
     }
 }
 

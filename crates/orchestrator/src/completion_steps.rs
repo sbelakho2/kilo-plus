@@ -907,6 +907,7 @@ mod tests {
             goal: goal.into(),
             acceptance_criteria: vec![],
             plan: vec![],
+            attachments: Vec::new(),
             budget: TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: now,

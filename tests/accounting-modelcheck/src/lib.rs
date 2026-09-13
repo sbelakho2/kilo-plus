@@ -745,6 +745,7 @@ fn task_for(fixture: &Fixture, trace: u64, cap: Option<u64>) -> TaskId {
             goal: format!("modelcheck trace {trace}"),
             acceptance_criteria: Vec::new(),
             plan: Vec::new(),
+            attachments: Vec::new(),
             budget: faktor_session::TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: 1,

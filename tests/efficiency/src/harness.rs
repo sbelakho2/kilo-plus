@@ -531,6 +531,7 @@ pub fn run_scripted_task(
         goal: format!("efficiency task {}", task.id),
         acceptance_criteria: acceptance_criteria.clone(),
         plan: Vec::new(),
+        attachments: Vec::new(),
         max_tokens: None,
         max_turns: None,
         spent_tokens: 0,

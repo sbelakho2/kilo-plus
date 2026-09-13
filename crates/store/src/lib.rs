@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+use faktor_core::attachment::AttachmentId;
 use faktor_core::event::{Event, EventKind, JournalInvariants};
 use faktor_core::id::{
     EventSeq, OpId, SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
@@ -498,6 +499,13 @@ pub struct TaskRow {
     pub acceptance_criteria: Vec<String>,
     /// Ordered steps, append-only durable.
     pub plan: Vec<String>,
+    /// Durable typed binary/image attachments of the task (schema v24,
+    /// migration index 24). SEPARATE from the workspace-relative `files`
+    /// vocabulary: bytes live in the CAS under each `digest`, the metadata
+    /// rides this JSON column. Rows written before v24 decode with an empty
+    /// list (`'[]'` column default) — the attachment-free row stays
+    /// byte-identical.
+    pub attachments: Vec<AttachmentId>,
     pub max_tokens: Option<u64>,
     pub max_turns: Option<u32>,
     pub spent_tokens: u64,
@@ -2868,8 +2876,8 @@ impl Store {
         tx.execute(
             "INSERT INTO task(task_id, session_id, goal, acceptance_criteria, plan,
                               max_tokens, max_turns, spent_tokens, spent_turns,
-                              state, created_ms, updated_ms, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                              state, created_ms, updated_ms, revision, attachments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(session_id, task_id) DO UPDATE SET
                 goal = excluded.goal,
                 acceptance_criteria = excluded.acceptance_criteria,
@@ -2881,7 +2889,8 @@ impl Store {
                 state = excluded.state,
                 created_ms = excluded.created_ms,
                 updated_ms = excluded.updated_ms,
-                revision = excluded.revision",
+                revision = excluded.revision,
+                attachments = excluded.attachments",
             params![
                 t.task_id.raw() as i64,
                 t.session_id.raw() as i64,
@@ -2899,6 +2908,7 @@ impl Store {
                 t.created_ms,
                 t.updated_ms,
                 t.revision.raw() as i64,
+                serde_json::to_string(&t.attachments).unwrap_or_else(|_| "[]".into()),
             ],
         )?;
         tx.commit()?;
@@ -2910,7 +2920,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                     max_tokens, max_turns, spent_tokens, spent_turns,
-                    state, created_ms, updated_ms, revision
+                    state, created_ms, updated_ms, revision, attachments
              FROM task WHERE session_id = ?1 AND task_id = ?2",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
@@ -2974,7 +2984,7 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                         max_tokens, max_turns, spent_tokens, spent_turns,
-                        state, created_ms, updated_ms, revision
+                        state, created_ms, updated_ms, revision, attachments
                  FROM task WHERE session_id = ?1 AND task_id = ?2",
             )?;
             let mut rows = stmt.query(params![session_id.raw() as i64, task_id.raw() as i64])?;
@@ -3844,7 +3854,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT task_id, session_id, goal, acceptance_criteria, plan,
                     max_tokens, max_turns, spent_tokens, spent_turns,
-                    state, created_ms, updated_ms, revision
+                    state, created_ms, updated_ms, revision, attachments
              FROM task WHERE session_id = ?1 ORDER BY created_ms ASC, task_id ASC",
         )?;
         let mut rows = stmt.query(params![session_id.raw() as i64])?;
@@ -4715,6 +4725,159 @@ impl Store {
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .ok();
+        Ok(out)
+    }
+
+    // -------------------------------------------------------------- attachments
+
+    /// Persist one binary/image attachment's typed metadata (schema v24).
+    /// Dedupe IS the primary key `(session_id, digest)`: an identical digest
+    /// is a no-op and the FIRST-written row is read back and returned, so
+    /// repeated uploads of the same bytes resolve to one byte-identical
+    /// `AttachmentId`. The caller (session layer) validates the id before
+    /// this write; the store only persists/reads the typed row.
+    pub fn put_attachment(
+        &self,
+        session_id: SessionId,
+        attachment: &AttachmentId,
+    ) -> StoreResult<AttachmentId> {
+        let conn = self.write();
+        conn.execute(
+            "INSERT OR IGNORE INTO attachment(session_id, digest, mime, filename, size)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session_id.raw() as i64,
+                attachment.digest.to_hex(),
+                attachment.mime.as_str(),
+                attachment.filename.as_deref(),
+                attachment.size as i64,
+            ],
+        )?;
+        let stored = conn.query_row(
+            "SELECT digest, mime, filename, size FROM attachment
+             WHERE session_id = ?1 AND digest = ?2",
+            params![session_id.raw() as i64, attachment.digest.to_hex()],
+            |r| {
+                let digest: String = r.get(0)?;
+                let mime: String = r.get(1)?;
+                let filename: Option<String> = r.get(2)?;
+                let size: i64 = r.get(3)?;
+                let digest = faktor_core::hash::FileHash::from_hex(&digest).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("attachment digest {digest:?} is not 32-byte hex"),
+                        )),
+                    )
+                })?;
+                if size < 0 {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("attachment size {size} is negative"),
+                        )),
+                    ));
+                }
+                Ok(AttachmentId {
+                    digest,
+                    mime,
+                    filename,
+                    size: size as u64,
+                })
+            },
+        )?;
+        Ok(stored)
+    }
+
+    /// Resolve one durable attachment row by its digest (restart-safe: reads
+    /// the typed metadata, never a process-local map).
+    pub fn attachment(
+        &self,
+        session_id: SessionId,
+        digest: faktor_core::hash::FileHash,
+    ) -> StoreResult<Option<AttachmentId>> {
+        let conn = self.read()?;
+        let out = conn
+            .query_row(
+                "SELECT digest, mime, filename, size FROM attachment
+                 WHERE session_id = ?1 AND digest = ?2",
+                params![session_id.raw() as i64, digest.to_hex()],
+                |r| {
+                    let digest_raw: String = r.get(0)?;
+                    let mime: String = r.get(1)?;
+                    let filename: Option<String> = r.get(2)?;
+                    let size: i64 = r.get(3)?;
+                    let digest =
+                        faktor_core::hash::FileHash::from_hex(&digest_raw).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("attachment digest {digest_raw:?} is not 32-byte hex"),
+                                )),
+                            )
+                        })?;
+                    if size < 0 {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Integer,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("attachment size {size} is negative"),
+                            )),
+                        ));
+                    }
+                    Ok(AttachmentId {
+                        digest,
+                        mime,
+                        filename,
+                        size: size as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(out)
+    }
+
+    /// The session's durable attachment metadata, newest digest order (a
+    /// bounded, deterministic page: at most `limit` rows).
+    pub fn list_attachments(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> StoreResult<Vec<AttachmentId>> {
+        let conn = self.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT digest, mime, filename, size FROM attachment
+             WHERE session_id = ?1 ORDER BY digest ASC LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![session_id.raw() as i64, limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let digest_raw: String = r.get(0)?;
+            let Some(digest) = faktor_core::hash::FileHash::from_hex(&digest_raw) else {
+                return Err(StoreError::Corrupt(vec![format!(
+                    "attachment digest {digest_raw:?} is not 32-byte hex"
+                )]));
+            };
+            let size: i64 = r.get(3)?;
+            if size < 0 {
+                return Err(StoreError::Corrupt(vec![format!(
+                    "attachment size {size} is negative"
+                )]));
+            }
+            out.push(AttachmentId {
+                digest,
+                mime: r.get(1)?,
+                filename: r.get(2)?,
+                size: size as u64,
+            });
+        }
         Ok(out)
     }
 
@@ -8623,6 +8786,23 @@ const MIGRATIONS: &[&str] = &[
         last_progress_ms INTEGER,
         updated_ms INTEGER NOT NULL
      );",
+    // v24 — durable binary/image attachments (schema target 25; array index
+    // 24). ONE row per `(session_id, digest)`: the CAS address of the bytes
+    // plus the typed metadata `AttachmentId { digest, mime, filename, size }`.
+    // Dedupe IS the primary key: an identical digest resolves to the row's
+    // first-written metadata (the write path is `INSERT OR IGNORE` + read
+    // back). The `task.attachments` column carries the per-task typed list
+    // (bounded JSON; `'[]'` for every pre-v24 row), SEPARATE from the
+    // workspace-relative `files`/`plan` vocabulary.
+    "CREATE TABLE IF NOT EXISTS attachment (
+        session_id INTEGER NOT NULL REFERENCES session(id),
+        digest TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        filename TEXT,
+        size INTEGER NOT NULL,
+        PRIMARY KEY (session_id, digest)
+     );
+     ALTER TABLE task ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]';",
 ];
 
 /// Array index of the v9 block above (migration list position, not the
@@ -9504,6 +9684,10 @@ fn task_row_map(r: &rusqlite::Row<'_>, session_id: SessionId) -> StoreResult<Tas
         plan: parse_json(
             &format!("task {session_id}/{task_id} plan"),
             &r.get::<_, String>(4)?,
+        )?,
+        attachments: parse_json(
+            &format!("task {session_id}/{task_id} attachments"),
+            &r.get::<_, String>(13)?,
         )?,
         max_tokens: r.get::<_, Option<i64>>(5)?.map(|m| m.max(0) as u64),
         max_turns: r.get::<_, Option<i64>>(6)?.map(|m| m.max(0) as u32),
@@ -12489,6 +12673,38 @@ mod tests {
     }
 
     #[test]
+    fn durable_attachment_rows_dedupe_by_digest_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), true).unwrap();
+        let ws = store.create_workspace("/w").unwrap();
+        let s1 = store.create_session(ws, "att", "p", "m").unwrap();
+        let ws2 = store.create_workspace("/w2").unwrap();
+        let s2 = store.create_session(ws2, "other", "p", "m").unwrap();
+        let digest = faktor_core::hash::FileHash::from([7; 32]);
+        let id = AttachmentId::new(digest, "image/png", Some("shot.png"), 123).unwrap();
+        let first = store.put_attachment(s1.id, &id).unwrap();
+        assert_eq!(first, id);
+        // Dedupe by digest: a second write of the same digest is a no-op and
+        // the FIRST row's metadata is authoritative (never rewritten).
+        let conflicting = AttachmentId::new(digest, "application/pdf", Some("other"), 123).unwrap();
+        assert_eq!(store.put_attachment(s1.id, &conflicting).unwrap(), first);
+        assert_eq!(
+            store.attachment(s1.id, digest).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.list_attachments(s1.id, 10).unwrap(),
+            vec![first.clone()]
+        );
+        // Session scope: another session never sees the row.
+        assert!(store.attachment(s2.id, digest).unwrap().is_none());
+        // Reopen: the typed row resolves identically from disk.
+        drop(store);
+        let store = Store::open(dir.path(), true).unwrap();
+        assert_eq!(store.attachment(s1.id, digest).unwrap(), Some(first));
+    }
+
+    #[test]
     fn migration_v10_replays_cleanly_on_a_v9_store() {
         // Simulate a v9 store (the legacy one-row-per-session ledger table
         // only; no typed task rows), reopen: the v10 block must rename the
@@ -12575,6 +12791,7 @@ mod tests {
             goal: "typed goal".into(),
             acceptance_criteria: vec!["cargo check".into()],
             plan: vec![],
+            attachments: vec![],
             max_tokens: Some(10_000),
             max_turns: None,
             spent_tokens: 0,
@@ -12612,6 +12829,7 @@ mod tests {
             goal: "g".into(),
             acceptance_criteria: vec![],
             plan: vec!["step one".into()],
+            attachments: vec![],
             max_tokens: Some(1000),
             max_turns: Some(5),
             spent_tokens: 0,
@@ -14278,6 +14496,7 @@ mod typed_ledger_tests {
                 goal: "legacy goal".into(),
                 acceptance_criteria: vec!["cargo check".into()],
                 plan: vec![],
+                attachments: vec![],
                 max_tokens: None,
                 max_turns: None,
                 spent_tokens: 0,
@@ -14579,6 +14798,7 @@ mod typed_ledger_tests {
             goal: "g".into(),
             acceptance_criteria: criteria,
             plan: vec![],
+            attachments: vec![],
             max_tokens: None,
             max_turns: None,
             spent_tokens: 0,
@@ -16405,10 +16625,7 @@ mod typed_ledger_tests {
             conn.query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap()
         };
-        assert_eq!(
-            v, 24,
-            "schema target 24 after the v23 child-runtime blocker migration"
-        );
+        assert_eq!(v, 25, "schema target 25 after the v24 attachment migration");
         let fold = store
             .model_outcome_stats_phase("cheap", "m1", phase)
             .unwrap()
@@ -16950,7 +17167,7 @@ mod evidence_store_tests {
             let version: i64 = conn
                 .query_row("PRAGMA user_version", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 24, "v23 is the migration head");
+            assert_eq!(version, 25, "v24 is the migration head");
             let ws_ok: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='evidence'",

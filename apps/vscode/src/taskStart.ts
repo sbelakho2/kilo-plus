@@ -12,10 +12,143 @@
 
 import { NativeApiError } from './nativeClient.ts';
 import type {
+  NativeAttachmentId,
   NativeCompletionContract,
   NativeTaskRunStarted,
   StartTaskRunRequest,
 } from './nativeClient.ts';
+
+/** One durable typed attachment id a task start accepts (native DTO mirror). */
+export type TaskAttachmentId = NativeAttachmentId;
+
+/** One binary attachment of a pending submission: exact bytes as base64. */
+export interface PendingBinaryAttachment {
+  readonly mime: string;
+  readonly filename: string | null;
+  readonly bytes: number;
+  readonly dataBase64: string;
+  readonly isImage: boolean;
+}
+
+/**
+ * The host-side PENDING SUBMISSION ENVELOPE. It is built from the frozen
+ * UI's `sendMessage` (text + session/draft/message identity + the ORIGINAL
+ * `files` payload) and retained until the daemon durably accepts the task.
+ * On ANY admission failure the host sends the Kilo-compatible
+ * `sendMessageFailed` with exactly these fields, which restores the draft
+ * text and image attachments in the vendored composer. The envelope is
+ * never cleared before acceptance and never emptied on failure.
+ */
+export interface PendingSubmission {
+  readonly text: string;
+  readonly sessionId: string | null;
+  readonly draftId: string | null;
+  readonly messageId: string | null;
+  readonly files: readonly unknown[];
+  readonly attachments: readonly PendingBinaryAttachment[];
+}
+
+/** Decoded-byte ceiling of one upload (mirrors the daemon's 7 MiB bound). */
+export const MAX_PENDING_ATTACHMENT_BYTES = 7 * 1024 * 1024;
+
+const MAX_PENDING_FILES = 64;
+const MAX_PENDING_ID_CHARS = 4096;
+const MAX_PENDING_BASE64_CHARS = Math.ceil(MAX_PENDING_ATTACHMENT_BYTES / 3) * 4 + 8;
+
+function pendingString(value: unknown, max = MAX_PENDING_ID_CHARS): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > max) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
+ * Defensive re-validation of one pending envelope arriving from the
+ * webview layer. Returns `null` for any hostile/oversized shape so the
+ * caller drops the start loudly instead of fabricating an identity; a
+ * `null` id means the field was absent (optional by design), not invalid.
+ */
+export function parsePendingSubmission(raw: unknown): PendingSubmission | null {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const text = typeof record.text === 'string' ? record.text : null;
+  if (text === null || text.trim().length === 0 || text.length > 64 * 1024) {
+    return null;
+  }
+  const optionalId = (value: unknown): string | null | undefined => {
+    if (value === undefined || value === null) {
+      return null;
+    }
+    return pendingString(value) ?? undefined;
+  };
+  const sessionId = optionalId(record.sessionId);
+  const draftId = optionalId(record.draftId);
+  const messageId = optionalId(record.messageId);
+  if (sessionId === undefined || draftId === undefined || messageId === undefined) {
+    return null;
+  }
+  const files = record.files;
+  if (files !== undefined && files !== null && !Array.isArray(files)) {
+    return null;
+  }
+  if (Array.isArray(files) && files.length > MAX_PENDING_FILES) {
+    return null;
+  }
+  const attachments: PendingBinaryAttachment[] = [];
+  const rawAttachments = record.attachments;
+  if (rawAttachments !== undefined && rawAttachments !== null) {
+    if (!Array.isArray(rawAttachments) || rawAttachments.length > MAX_PENDING_FILES) {
+      return null;
+    }
+    for (const entry of rawAttachments) {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        return null;
+      }
+      const item = entry as Record<string, unknown>;
+      const mime = pendingString(item.mime, 128);
+      const filename =
+        item.filename === undefined || item.filename === null
+          ? null
+          : pendingString(item.filename, 255);
+      const dataBase64 = typeof item.dataBase64 === 'string' ? item.dataBase64 : null;
+      const bytes =
+        typeof item.bytes === 'number' && Number.isInteger(item.bytes) && item.bytes >= 0
+          ? item.bytes
+          : null;
+      if (
+        mime === null ||
+        (filename === null && item.filename !== undefined && item.filename !== null) ||
+        dataBase64 === null ||
+        dataBase64.length > MAX_PENDING_BASE64_CHARS ||
+        bytes === null ||
+        bytes > MAX_PENDING_ATTACHMENT_BYTES
+      ) {
+        return null;
+      }
+      attachments.push({
+        mime,
+        filename,
+        bytes,
+        dataBase64,
+        isImage: typeof item.isImage === 'boolean' ? item.isImage : mime.startsWith('image/'),
+      });
+    }
+  }
+  return {
+    text,
+    sessionId,
+    draftId,
+    messageId,
+    files: Array.isArray(files) ? files : [],
+    attachments,
+  };
+}
 
 /** The `faktor.mutationMode` setting vocabulary. `''` = inherit-daemon. */
 export type MutationModeSetting = '' | 'shadow' | 'direct_compat';
@@ -146,6 +279,8 @@ export interface StartTaskSettings {
   readonly maxCostMicro: number;
   /** Workspace-relative attachment paths forwarded from the composer. */
   readonly files?: readonly string[];
+  /** Durable typed binary attachments (uploaded BEFORE this start). */
+  readonly attachments?: readonly TaskAttachmentId[];
   /** The Task-mode completion contract (null / all-false = default path). */
   readonly completionContract?: NativeCompletionContract | null;
 }
@@ -223,6 +358,9 @@ export function startTaskRequest(goal: string, settings: StartTaskSettings): Sta
     ...(settings.maxCostMicro > 0 ? { max_cost_micro: settings.maxCostMicro } : {}),
     ...(settings.files !== undefined && settings.files.length > 0
       ? { files: settings.files }
+      : {}),
+    ...(settings.attachments !== undefined && settings.attachments.length > 0
+      ? { attachments: settings.attachments }
       : {}),
     ...(contract !== null
       ? {
@@ -311,3 +449,148 @@ export async function startTaskRun(input: {
     return { ok: false, runId: null, started: null, failure };
   }
 }
+
+// ------------------------------------------------- pending submissions
+
+/** The upload half of the native client the admission flow needs. */
+export interface AttachmentUploadClient {
+  uploadAttachment(
+    sessionId: string,
+    request: { mime: string; filename?: string | null; data_base64: string },
+  ): Promise<TaskAttachmentId>;
+}
+
+export type AdmitFailureStage = 'upload' | 'start';
+
+/**
+ * One admission failure. `kind` `image_unsupported` is the LOUD refusal of
+ * an image submission while provider media/content parts are not wired;
+ * `upload` covers a refused/failed byte upload; the remaining kinds are the
+ * task-start classifications ([`StartFailureKind`]).
+ */
+export interface AdmitFailure {
+  readonly kind: StartFailureKind | 'upload' | 'image_unsupported';
+  readonly stage: AdmitFailureStage;
+  readonly status: number | null;
+  readonly code: string | null;
+  readonly message: string;
+}
+
+export interface AdmitOutcome {
+  readonly ok: boolean;
+  readonly runId: string | null;
+  /** The durable typed ids the run was admitted with (empty on failure). */
+  readonly attachmentIds: readonly string[];
+  readonly failure: AdmitFailure | null;
+}
+
+function uploadFailureOf(error: unknown, sessionId: string): AdmitFailure {
+  if (error instanceof NativeApiError) {
+    return {
+      kind: 'upload',
+      stage: 'upload',
+      status: error.status,
+      code: error.code,
+      message: `cannot upload attachment to session ${sessionId}: ${error.message}`,
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    kind: 'upload',
+    stage: 'upload',
+    status: null,
+    code: null,
+    message: `cannot upload attachment to session ${sessionId}: ${message}`,
+  };
+}
+
+/**
+ * Admit ONE pending submission through the daemon: upload every binary
+ * attachment FIRST (images are refused loudly without uploading — provider
+ * media/content parts are not wired), then start ONE task run carrying the
+ * durable typed ids. The pending envelope is retained by the caller for the
+ * entire call; `restore` is invoked EXACTLY ONCE on any failure (upload,
+ * image refusal, validation/model/conflict/transport start failure) and
+ * never on success — the draft is restored through the Kilo-compatible
+ * `sendMessageFailed`, never silently lost. A failure before the start
+ * request leaves no daemon-side admission at all.
+ */
+export async function admitPendingSubmission(input: {
+  readonly client: StartRunClient & AttachmentUploadClient;
+  readonly sessionId: string;
+  readonly pending: PendingSubmission;
+  readonly settings: Omit<StartTaskSettings, 'attachments'>;
+  readonly onStarted: (started: NativeTaskRunStarted) => void;
+  readonly onFailure: (failure: AdmitFailure) => void;
+  readonly restore: (failure: AdmitFailure) => void;
+}): Promise<AdmitOutcome> {
+  const uploaded: TaskAttachmentId[] = [];
+  // Pre-scan: one image refuses the WHOLE submission BEFORE any upload, so
+  // a submission that can never reach a model leaves no partial bytes in
+  // the durable store.
+  const image = input.pending.attachments.find(
+    (attachment) => attachment.isImage || attachment.mime.startsWith('image/'),
+  );
+  if (image !== undefined) {
+    const failure: AdmitFailure = {
+      kind: 'image_unsupported',
+      stage: 'upload',
+      status: 400,
+      code: 'unsupported',
+      message:
+        'image attachments cannot be submitted: provider media/content parts are not wired, so the bytes can never reach a model; the draft and images were kept — retry without the image',
+    };
+    input.onFailure(failure);
+    input.restore(failure);
+    return { ok: false, runId: null, attachmentIds: [], failure };
+  }
+  for (const attachment of input.pending.attachments) {
+    try {
+      const id = await input.client.uploadAttachment(input.sessionId, {
+        mime: attachment.mime,
+        filename: attachment.filename,
+        data_base64: attachment.dataBase64,
+      });
+      uploaded.push(id);
+    } catch (error) {
+      const failure = uploadFailureOf(error, input.sessionId);
+      input.onFailure(failure);
+      input.restore(failure);
+      return { ok: false, runId: null, attachmentIds: uploaded.map((id) => id.digest), failure };
+    }
+  }
+  const startRun = await startTaskRun({
+    client: input.client,
+    sessionId: input.sessionId,
+    goal: input.pending.text,
+    settings: { ...input.settings, attachments: uploaded },
+    onStarted: input.onStarted,
+    onFailure: (failure) => {
+      input.onFailure({ ...failure, stage: 'start' });
+    },
+  });
+  if (startRun.ok) {
+    return {
+      ok: true,
+      runId: startRun.runId,
+      attachmentIds: uploaded.map((id) => id.digest),
+      failure: null,
+    };
+  }
+  const startFailure = startRun.failure as StartFailure;
+  const failure: AdmitFailure = {
+    kind: startFailure.kind,
+    stage: 'start',
+    status: startFailure.status,
+    code: startFailure.code,
+    message: startFailure.message,
+  };
+  input.restore(failure);
+  return {
+    ok: false,
+    runId: null,
+    attachmentIds: uploaded.map((id) => id.digest),
+    failure,
+  };
+}
+

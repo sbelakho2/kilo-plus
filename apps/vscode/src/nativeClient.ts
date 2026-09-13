@@ -454,6 +454,19 @@ export interface NativeTaskRunCancelled {
   readonly cancelled: boolean;
 }
 
+/**
+ * One durable typed binary attachment (`POST /native/session/{id}/attachments`).
+ * `digest` is the daemon's BLAKE3 CAS address (64 hex chars), `size` the
+ * decompressed byte count. This is the ONLY identity accepted by a task
+ * start's additive `attachments` member — never a workspace path.
+ */
+export interface NativeAttachmentId {
+  readonly digest: string;
+  readonly mime: string;
+  readonly filename: string | null;
+  readonly size: number;
+}
+
 export interface NativeAgentEntry {
   readonly agent_id: string;
   readonly kind: 'self' | 'child';
@@ -776,6 +789,10 @@ export interface StartTaskRunRequest {
   readonly mutation_mode?: string;
   /** Workspace-relative attachment paths (the same vocabulary as a prompt). */
   readonly files?: readonly string[];
+  /** Durable typed binary attachments uploaded BEFORE this start. Each id
+   * must resolve to a byte-identical durable row of the same session; an
+   * image id is refused loudly (provider media parts are not wired). */
+  readonly attachments?: readonly NativeAttachmentId[];
   /** A non-default PR/CI-fix completion contract. The daemon refuses it on
    * the plain-prompt path, so callers pair it with an explicit work item. */
   readonly completion_contract?: NativeCompletionContract;
@@ -1355,6 +1372,27 @@ export function validateTaskRunCancelled(json: Json): NativeTaskRunCancelled {
   const object = asObject(json, path);
   checkResponseKeys(object, path, ['run_id', 'cancelled']);
   return { run_id: fString(object, 'run_id', path), cancelled: fBool(object, 'cancelled', path) };
+}
+
+/** Strict decode of one durable attachment id (the upload response). */
+export function validateAttachmentId(json: Json): NativeAttachmentId {
+  const path = 'POST /native/session/{id}/attachments';
+  const object = asObject(json, path);
+  checkResponseKeys(object, path, ['digest', 'mime', 'filename', 'size']);
+  const digest = fString(object, 'digest', path);
+  if (!/^[0-9a-f]{64}$/.test(digest)) {
+    fail(path, `expected a 64-char lowercase hex digest, got ${JSON.stringify(digest)}`);
+  }
+  const size = fInt(object, 'size', path);
+  if (size < 0) {
+    fail(path, `expected a non-negative size, got ${size}`);
+  }
+  return {
+    digest,
+    mime: fString(object, 'mime', path),
+    filename: fNullableString(object, 'filename', path),
+    size,
+  };
 }
 
 function presentationTag(object: JsonObject, key: string, path: string): 'foreground' | 'background' {
@@ -2249,6 +2287,29 @@ export class NativeClient {
     return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/task-runs`, {
       body: request as unknown as Json,
       validate: validateTaskRunStarted,
+    });
+  }
+
+  /**
+   * Upload ONE bounded binary attachment (standard base64) into the
+   * session's durable CAS-backed store. The response is the typed
+   * `AttachmentId` a task start's `attachments` member accepts. The daemon
+   * refuses images loudly (code `unsupported`) while provider media/content
+   * parts are not wired; callers must restore the draft on that refusal.
+   */
+  uploadAttachment(
+    sessionId: string,
+    request: { mime: string; filename?: string | null; data_base64: string },
+  ): Promise<NativeAttachmentId> {
+    return this.request('POST', `/native/session/${encodeURIComponent(sessionId)}/attachments`, {
+      body: {
+        mime: request.mime,
+        ...(request.filename !== undefined && request.filename !== null
+          ? { filename: request.filename }
+          : {}),
+        data_base64: request.data_base64,
+      },
+      validate: validateAttachmentId,
     });
   }
 

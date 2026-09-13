@@ -651,6 +651,7 @@ mod tests {
             goal: "parity goal".into(),
             acceptance_criteria: vec![],
             plan: vec![],
+            attachments: Vec::new(),
             budget: crate::TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: 1,

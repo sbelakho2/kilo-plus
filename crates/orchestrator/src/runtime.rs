@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use faktor_agent::{AgentRuntime, TurnOutcome};
+use faktor_core::attachment::AttachmentId;
 use faktor_core::cancellation::CancellationToken;
 use faktor_core::id::{OpId, SessionId, TaskId, WorktreeId};
 use faktor_core::op::{OpMeta, RecoveryStrategy};
@@ -188,6 +189,13 @@ pub enum ExecError {
     SemanticConflict(String),
     #[error("merge decision incomplete: {0}")]
     UndecidedPaths(String),
+    /// An isolated child's staged change set could not be integrated into
+    /// the final root before root verification (commit-time CAS conflict
+    /// with the owner checkout). Completion is refused until the drift is
+    /// resolved and the run is re-integrated; no synthetic verification ever
+    /// papers over it.
+    #[error("integration conflict: {0}")]
+    IntegrationConflict(String),
     /// An AUTHORITATIVE durable write or control-queue ack failed. The
     /// transition was NOT claimed applied, the effect is idempotent, and the
     /// underlying failure classifies as retryable — the SAME call may be
@@ -313,6 +321,15 @@ pub struct ChildSpec {
     /// decode with an empty list (field-level serde default): the
     /// attachment-free run stays byte-identical.
     pub files: Vec<String>,
+    /// Durable typed binary/image attachments of the child (schema v24
+    /// `AttachmentId` rows). SEPARATE from `files`: these are CAS bytes
+    /// addressed by digest, never workspace paths. Durable with the spec, so
+    /// a re-attach decodes the byte-identical set; every id is re-validated
+    /// ([`validate_attachment_ids`]) before any spawn. Old rows decode with
+    /// an empty list (field-level serde default). Provider delivery is not
+    /// wired yet, so image ids are refused loudly at admission.
+    #[serde(default)]
+    pub attachments: Vec<AttachmentId>,
     /// Task-level typed policy.
     pub task_caps: CapabilitySet,
     /// Child-level typed policy.
@@ -327,6 +344,7 @@ impl Default for ChildSpec {
             model: None,
             max_tokens: None,
             files: Vec::new(),
+            attachments: Vec::new(),
             task_caps: CapabilitySet::new(),
             child_caps: CapabilitySet::new(),
         }
@@ -1378,6 +1396,12 @@ impl OrchestratorRuntime {
             validate_attachment_files(&spec.files).map_err(|e| {
                 ExecError::InvalidPlan(format!(
                     "durable attached files of work item {}: {e}",
+                    spec.item_id
+                ))
+            })?;
+            validate_attachment_ids(&spec.attachments).map_err(|e| {
+                ExecError::InvalidPlan(format!(
+                    "durable binary attachments of work item {}: {e}",
                     spec.item_id
                 ))
             })?;
@@ -3019,6 +3043,12 @@ fn validate_specs(
         validate_attachment_files(&s.files).map_err(|e| {
             ExecError::InvalidPlan(format!("attached files of work item {}: {e}", s.item_id))
         })?;
+        validate_attachment_ids(&s.attachments).map_err(|e| {
+            ExecError::InvalidPlan(format!(
+                "binary attachments of work item {}: {e}",
+                s.item_id
+            ))
+        })?;
     }
     Ok(map)
 }
@@ -3076,6 +3106,38 @@ pub fn validate_attachment_files(files: &[String]) -> Result<(), ExecError> {
         if f.split(['/', '\\']).any(|segment| segment == "..") {
             return Err(ExecError::Malformed(format!(
                 "attached file path {f:?} traverses outside the workspace ('..')"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The ONE durable binary-attachment validation rule of a run (shared by
+/// the request boundary, the durable spec decode and the server DTO): the
+/// set is bounded by [`faktor_session::MAX_ATTACHMENTS_PER_TASK`], every id
+/// is structurally validated (hostile mime/filename/size are typed
+/// refusals), and — until provider media/content parts carry bytes — an
+/// `is_image()` id is refused LOUDLY here as well as at the wire boundary:
+/// silently admitting an image the model can never see would lie about
+/// delivery. Durable-row existence is resolved by the session layer at
+/// admission ([`faktor_session::SessionHandle::resolve_attachments`]).
+pub fn validate_attachment_ids(
+    ids: &[faktor_core::attachment::AttachmentId],
+) -> Result<(), ExecError> {
+    use faktor_core::attachment::MAX_ATTACHMENTS_PER_TASK;
+    if ids.len() > MAX_ATTACHMENTS_PER_TASK {
+        return Err(ExecError::Oversized(format!(
+            "{} binary attachments exceed MAX_ATTACHMENTS_PER_TASK ({MAX_ATTACHMENTS_PER_TASK})",
+            ids.len()
+        )));
+    }
+    for id in ids {
+        id.validate()
+            .map_err(|e| ExecError::Malformed(format!("binary attachment {}: {e}", id.digest)))?;
+        if id.is_image() {
+            return Err(ExecError::Malformed(format!(
+                "image attachment {} ({}) cannot be delivered: provider media/content parts are not wired (the agent cannot send bytes to a provider); remove it or use a text/binary attachment",
+                id.digest, id.mime
             )));
         }
     }

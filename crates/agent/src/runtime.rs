@@ -1255,6 +1255,20 @@ impl AgentDeps {
     }
 }
 
+/// The typed outcome of ONE integrated-root verification run: the checks the
+/// REAL shared [`crate::VerificationService`] executed over the final
+/// integration root, their proof rows, and one criterion verdict per
+/// acceptance criterion of the parent run.
+#[derive(Debug, Clone)]
+pub struct IntegratedRootVerification {
+    pub status: VerificationStatus,
+    pub checks: Vec<CheckExecution>,
+    pub criteria: Vec<CriterionVerification>,
+    /// The integrated change the checks were derived from.
+    pub changed: Vec<String>,
+    pub summary: String,
+}
+
 pub struct AgentRuntime {
     deps: Arc<AgentDeps>,
     /// Sessions with a live queue-runner task (single runner per session).
@@ -2241,6 +2255,7 @@ impl AgentRuntime {
                     goal,
                     acceptance_criteria: Vec::new(),
                     plan: Vec::new(),
+                    attachments: Vec::new(),
                     budget: faktor_session::TaskBudget {
                         max_tokens: caps.max_tokens,
                         max_turns: caps.max_turns,
@@ -6384,6 +6399,193 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Run the REAL shared verification on an ORCHESTRATED run's ACTUAL
+    /// final integration root (P0 orchestrated-completion binding): the
+    /// derived check set comes from the multi-component project profile
+    /// detected over `root` (never a synthetic one-check-per-criterion
+    /// aggregate), the checks execute through the wired
+    /// [`crate::VerificationService`] under policy budgets, and each parent
+    /// acceptance criterion is certified only when the whole required check
+    /// set passed.
+    ///
+    /// Typed refusals (never a silent PASS): a disabled service, an empty
+    /// repo map, a derivation cap refusal, no derived check applying to the
+    /// integrated change, or any check that could not produce a verdict all
+    /// return `Err`/`Unavailable` — the caller refuses completion instead of
+    /// minting proof from nothing. The checks run against `root` exactly
+    /// (the caller passes the integration root), never the daemon cwd.
+    pub async fn verify_integrated_root(
+        &self,
+        handle: &faktor_session::SessionHandle,
+        root: &std::path::Path,
+        changed: &[String],
+        criteria: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<IntegratedRootVerification, String> {
+        let service = self.deps.verification.clone();
+        if service.is_disabled() {
+            return Err(
+                "no verifier configured (no objective mechanism for this deployment)".into(),
+            );
+        }
+        if !root.is_dir() {
+            return Err(format!(
+                "integration root {} is not a directory",
+                root.display()
+            ));
+        }
+        let row = handle
+            .row()
+            .map_err(|e| format!("session row unresolvable: {e}"))?;
+        let ws = self
+            .deps
+            .workspaces
+            .open(row.workspace_id, root.to_path_buf())
+            .map_err(|e| format!("integration root could not be opened: {e}"))?;
+        let repo_files = Self::integrated_root_repo_files(&ws, 500, 6);
+        if repo_files.is_empty() {
+            return Err("repository file map empty (no project type detectable)".into());
+        }
+        let profile = faktor_verify::derive::detect_project_profile(root, &repo_files);
+        let changed_paths: Vec<std::path::PathBuf> =
+            changed.iter().map(std::path::PathBuf::from).collect();
+        let specs = faktor_verify::derive::derive_checks(&profile, &changed_paths)
+            .map_err(|e| format!("verification derivation refused: {e}"))?;
+        if specs.is_empty() {
+            return Err("no derived checks apply to the integrated change".into());
+        }
+        let checks: Vec<faktor_verify::Check> = specs.iter().map(legacy_mirror_of_spec).collect();
+        let base_ctx = faktor_verify::exec::VerificationContext {
+            session_id: handle.id().raw(),
+            task_id: row.task_id.raw(),
+            operation_id: self.deps.session.next_op_id().raw(),
+            workspace_id: row.workspace_id.raw(),
+            worktree_id: row.worktree_id.raw(),
+            root: root.to_path_buf(),
+            deadline: std::time::Instant::now(),
+            cancellation: cancel.child(),
+        };
+        let mut results: Vec<(String, bool)> = Vec::new();
+        let mut executed: Vec<CheckExecution> = Vec::new();
+        let mut unavailable: Vec<(String, String)> = Vec::new();
+        for spec in specs.iter().filter(|s| s.required) {
+            let budget = match service.budget_for(spec) {
+                BudgetDecision::RunInline(budget) => budget,
+                BudgetDecision::RunAsTaskOwnedOperation => service.policy().unit_max,
+            };
+            if budget.is_zero() {
+                unavailable.push((spec.id.clone(), spec.program.to_string_lossy().into_owned()));
+                continue;
+            }
+            let mut vctx = base_ctx.clone();
+            vctx.deadline = std::time::Instant::now() + budget;
+            let outcome = service.execute(spec, &vctx).await;
+            let status = match outcome.status {
+                CheckRunStatus::Passed => VerificationStatus::Passed,
+                CheckRunStatus::Failed => VerificationStatus::Failed,
+                CheckRunStatus::Unavailable => VerificationStatus::Unavailable,
+            };
+            match outcome.status {
+                CheckRunStatus::Passed => results.push((spec.id.clone(), true)),
+                CheckRunStatus::Failed => results.push((spec.id.clone(), false)),
+                CheckRunStatus::Unavailable => {
+                    unavailable
+                        .push((spec.id.clone(), spec.program.to_string_lossy().into_owned()));
+                }
+            }
+            executed.push(CheckExecution {
+                check: spec.id.clone(),
+                program: spec.program.to_string_lossy().into_owned(),
+                args: spec
+                    .args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect(),
+                category: format!("{:?}", spec.category).to_ascii_lowercase(),
+                required: spec.required,
+                status,
+                started_ms: outcome.started_ms,
+                finished_ms: Some(outcome.finished_ms),
+                exit: outcome.exit,
+                summary: outcome.summary.clone(),
+            });
+        }
+        let status = match faktor_verify::acceptance(&checks, &results) {
+            faktor_verify::Acceptance::Pass => VerificationStatus::Passed,
+            faktor_verify::Acceptance::Fail => VerificationStatus::Failed,
+            faktor_verify::Acceptance::Pending => VerificationStatus::Unavailable,
+        };
+        let summary = format!(
+            "integrated-root verification: {} required check(s) derived ({} executed, {} unavailable, {} failed); root {}",
+            checks.iter().filter(|c| c.required).count(),
+            results.len(),
+            unavailable.len(),
+            results.iter().filter(|(_, ok)| !ok).count(),
+            root.display()
+        );
+        let criteria_rows: Vec<CriterionVerification> = criteria
+            .iter()
+            .map(|c| CriterionVerification {
+                criterion_key: c.clone(),
+                passed: status == VerificationStatus::Passed,
+                evidence: Some(summary.clone()),
+            })
+            .collect();
+        Ok(IntegratedRootVerification {
+            status,
+            checks: executed,
+            criteria: criteria_rows,
+            changed: changed.to_vec(),
+            summary,
+        })
+    }
+
+    /// Bounded deterministic repo file map of one integrated root (the same
+    /// skip set and caps `repo_knowledge` uses): sorted relative paths, depth
+    /// capped, unreadable directories skipped — the derivation input only,
+    /// never a claim about the tree.
+    fn integrated_root_repo_files(
+        ws: &faktor_fs::WorkspaceHandle,
+        max_entries: usize,
+        max_depth: usize,
+    ) -> Vec<String> {
+        const SKIP: &[&str] = &[".git", "target", "node_modules", ".venv", "dist", ".hg"];
+        let mut entries: Vec<String> = Vec::new();
+        let mut stack: Vec<(usize, String)> = vec![(0, String::new())];
+        while let Some((depth, rel)) = stack.pop() {
+            if depth > max_depth || entries.len() >= max_entries {
+                break;
+            }
+            let Ok(list) = ws.list(std::path::Path::new(&rel), 200) else {
+                continue;
+            };
+            for meta in list {
+                if entries.len() >= max_entries {
+                    break;
+                }
+                let name = meta
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let child = if rel.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{rel}/{name}")
+                };
+                if meta.path.is_dir() {
+                    if !SKIP.contains(&name.as_str()) {
+                        stack.push((depth + 1, child));
+                    }
+                } else {
+                    entries.push(child);
+                }
+            }
+        }
+        entries.sort();
+        entries
+    }
+
     /// End-of-turn verification + completion gating (audits 4/6/7 — the
     /// typed-verifier migration P0-9/10 — verification must not depend on
     /// the model's discretion and must not be advisory): derive the checks
@@ -7502,6 +7704,7 @@ impl AgentRuntime {
                         goal: ledger.goal.clone(),
                         acceptance_criteria: Vec::new(),
                         plan: Vec::new(),
+                        attachments: Vec::new(),
                         budget: Default::default(),
                         state: faktor_core::state::TaskState::Pending,
                         created_ms: now,
@@ -7591,6 +7794,7 @@ impl AgentRuntime {
                     goal: ledger.goal.clone(),
                     acceptance_criteria: Vec::new(),
                     plan: Vec::new(),
+                    attachments: Vec::new(),
                     budget: Default::default(),
                     state: faktor_core::state::TaskState::Pending,
                     created_ms: now,
@@ -7678,6 +7882,7 @@ impl AgentRuntime {
             goal: Some(task.goal.clone()),
             acceptance_criteria: Some(task.acceptance_criteria.clone()),
             plan: Some(task.plan.clone()),
+            attachments: Some(task.attachments.clone()),
             budget: Some(faktor_session::TaskBudget {
                 max_tokens: task.budget.max_tokens,
                 max_turns: task.budget.max_turns,
@@ -14859,6 +15064,7 @@ mod tests {
                 goal: "ship the PR".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget::default(),
                 state: TaskState::Pending,
                 created_ms: now,
@@ -17529,6 +17735,7 @@ mod tests {
                 goal: "fingerprint".into(),
                 acceptance_criteria: vec!["goal: fingerprint".into()],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: Default::default(),
                 state: TaskState::Pending,
                 created_ms: now,
@@ -17733,6 +17940,7 @@ mod tests {
                 "required check: cargo check".into(),
             ],
             plan: vec![],
+            attachments: Vec::new(),
             budget: Default::default(),
             state: TaskState::Running,
             created_ms: now,
@@ -17996,6 +18204,7 @@ mod tests {
             goal: "gating task".into(),
             acceptance_criteria: vec![],
             plan: vec![],
+            attachments: Vec::new(),
             budget: Default::default(),
             state: TaskState::Running,
             created_ms: now,
@@ -18419,6 +18628,7 @@ mod tests {
             goal: "gating task".into(),
             acceptance_criteria: vec![],
             plan: vec![],
+            attachments: Vec::new(),
             budget: faktor_session::TaskBudget {
                 max_tokens: Some(10),
                 max_turns: None,
@@ -18778,6 +18988,7 @@ mod tests {
             goal: "gating task".into(),
             acceptance_criteria: vec![],
             plan: vec![],
+            attachments: Vec::new(),
             budget: faktor_session::TaskBudget {
                 max_tokens: Some(10),
                 max_turns: None,
@@ -23936,6 +24147,7 @@ mod tests {
                 goal: "budgeted".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget::default(),
                 state: faktor_core::state::TaskState::Pending,
                 created_ms: now,
@@ -24307,6 +24519,7 @@ mod tests {
                 goal: "routed".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget::default(),
                 state: faktor_core::state::TaskState::Pending,
                 created_ms: now,
@@ -24482,6 +24695,7 @@ mod tests {
                 goal: "routed".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget::default(),
                 state: faktor_core::state::TaskState::Pending,
                 created_ms: now,
@@ -24618,6 +24832,7 @@ mod tests {
                 goal: "budgeted".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget::default(),
                 state: faktor_core::state::TaskState::Pending,
                 created_ms: now,
@@ -27242,6 +27457,7 @@ mod tests {
                 goal: "routed retry".into(),
                 acceptance_criteria: vec![],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: faktor_session::TaskBudget::default(),
                 state: faktor_core::state::TaskState::Pending,
                 created_ms: now,
@@ -27389,6 +27605,7 @@ mod tests {
                     goal: "crash-reconcile".into(),
                     acceptance_criteria: vec![],
                     plan: vec![],
+                    attachments: Vec::new(),
                     budget: faktor_session::TaskBudget::default(),
                     state: faktor_core::state::TaskState::Pending,
                     created_ms: now,
@@ -27747,6 +27964,7 @@ mod tests {
                 goal: "DURABLE-GOAL-Ω".into(),
                 acceptance_criteria: vec!["DURABLE-CRITERION-Ω".into()],
                 plan: vec![],
+                attachments: Vec::new(),
                 budget: Default::default(),
                 state: TaskState::Running,
                 created_ms: now,
@@ -28938,6 +29156,7 @@ mod tests {
                     "beta requirement".to_string(),
                 ],
                 plan: vec![],
+                attachments: Vec::new(),
                 max_tokens: None,
                 max_turns: None,
                 spent_tokens: 0,

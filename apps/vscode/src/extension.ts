@@ -62,12 +62,15 @@ import {
 import { CockpitTaskVerification, buildCockpit, cockpitSections, tournamentViewOf } from './cockpit';
 import type { PixelPresence } from './pixelAgents';
 import {
+  AdmitFailure,
+  PendingSubmission,
   StartFailure,
   StartTaskSettings,
+  admitPendingSubmission,
   boundedWebviewFiles,
   hasCompletionSteps,
   parseCompletionContract,
-  startTaskRun,
+  parsePendingSubmission,
 } from './taskStart';
 import {
   SessionBindings,
@@ -899,12 +902,31 @@ function runSummary(run: NativeTaskRun): RunSummary {
 
 // ---------------------------------------------------------------- task actions
 
+/** One synthetic pending envelope for non-webview starts (command path). */
+function pendingEnvelope(text: string): PendingSubmission {
+  return {
+    text,
+    sessionId: null,
+    draftId: null,
+    messageId: null,
+    files: [],
+    attachments: [],
+  };
+}
+
 async function startTask(
   goal: string,
   files: readonly string[],
   contract: NativeCompletionContract | null,
   context: vscode.ExtensionContext,
+  pending: PendingSubmission,
 ): Promise<void> {
+  const restore = (failure: AdmitFailure): void => {
+    reportError(new Error(failure.message));
+    // NEVER clear before acceptance: the Kilo-compatible sendMessageFailed
+    // carries the original identity + attachments and rebuilds the draft.
+    chatProvider?.postSendMessageFailed(pending, failure.message);
+  };
   try {
     if (!active.client || !active.sessionId) {
       await startServer(context);
@@ -912,7 +934,13 @@ async function startTask(
     const client = active.client;
     const sessionId = active.sessionId;
     if (!client || !sessionId) {
-      chatProvider?.postStartResult(goal, false);
+      restore({
+        kind: 'transport',
+        stage: 'start',
+        status: null,
+        code: null,
+        message: 'daemon/session unavailable; the draft and attachments were kept',
+      });
       return;
     }
     const settings: StartTaskSettings = {
@@ -925,16 +953,17 @@ async function startTask(
       files,
       completionContract: contract,
     };
-    const outcome = await startTaskRun({
+    const outcome = await admitPendingSubmission({
       client,
       sessionId,
-      goal,
+      pending,
       settings,
       onStarted: (started) => {
         active.activeRunId = started.run_id;
         active.completionContract = contract;
         store.patch({ activeRunId: started.run_id, busy: true, lastError: null });
-        const attachments = files.length > 0 ? ` with ${files.length} attachment(s)` : '';
+        const attached = files.length + pending.attachments.length;
+        const attachments = attached > 0 ? ` with ${attached} attachment(s)` : '';
         const steps = contract !== null ? ' + completion contract' : '';
         chatProvider?.postNotice(
           'info',
@@ -942,16 +971,21 @@ async function startTask(
         );
         scheduleRefresh(0);
       },
-      onFailure: (failure: StartFailure) => {
+      onFailure: (failure: StartFailure | AdmitFailure) => {
         reportError(new Error(failure.message));
       },
+      restore,
     });
-    // The composer draft is retained on EVERY failure and cleared only on a
-    // successful start ack.
-    chatProvider?.postStartResult(goal, outcome.ok);
+    if (outcome.ok) {
+      // Durable acceptance: ONLY now may the pending envelope be dropped.
+      chatProvider?.postStartResult(goal, true);
+    }
   } catch (error) {
     reportError(error);
-    chatProvider?.postStartResult(goal, false);
+    chatProvider?.postSendMessageFailed(
+      pending,
+      error instanceof Error ? error.message : String(error),
+    );
   }
 }
 
@@ -995,7 +1029,7 @@ async function newTaskFromCommand(context: vscode.ExtensionContext): Promise<voi
     return;
   }
   const contract = await promptCompletionContract();
-  await startTask(goal.trim(), [], contract, context);
+  await startTask(goal.trim(), [], contract, context, pendingEnvelope(goal.trim()));
 }
 
 async function cancelActiveRun(): Promise<void> {
@@ -1231,9 +1265,28 @@ async function handleWebviewMessage(
           `${refused.length} attachment(s) refused: ${reasons}`,
         );
       }
-      // Binary attachment references never ride the native DTO (it carries
-      // workspace-relative paths only). Surface the count instead of a
-      // silent drop; the goal still starts with its file paths.
+      const contract = parseCompletionContract(message.completionContract);
+      if ('reason' in contract) {
+        chatProvider?.postNotice('error', `task start refused: ${contract.reason}`);
+        chatProvider?.postStartResult(goal, false);
+        return;
+      }
+      // Vendored pending submission: the Kilo identity + original files
+      // payload + binary attachments are re-validated by the host and kept
+      // for restore until durable acceptance. The built-in composer never
+      // sends `pending` and keeps its path-only behavior.
+      if (message.pending !== undefined && message.pending !== null) {
+        const pending = parsePendingSubmission(message.pending);
+        if (pending === null) {
+          const reason = 'task start refused: malformed pending submission envelope; the draft was kept';
+          chatProvider?.postNotice('error', reason);
+          return;
+        }
+        await startTask(goal, files, contract.contract, context, pending);
+        return;
+      }
+      // Legacy built-in composer: binary refs cannot ride this path (the
+      // built-in surface maps workspace-relative paths only).
       const binaryRefs = Array.isArray(message.attachments) ? message.attachments.length : 0;
       if (binaryRefs > 0) {
         chatProvider?.postNotice(
@@ -1241,13 +1294,7 @@ async function handleWebviewMessage(
           `${binaryRefs} binary attachment reference(s) noted; only workspace-relative file paths reach the native run`,
         );
       }
-      const contract = parseCompletionContract(message.completionContract);
-      if ('reason' in contract) {
-        chatProvider?.postNotice('error', `task start refused: ${contract.reason}`);
-        chatProvider?.postStartResult(goal, false);
-        return;
-      }
-      await startTask(goal, files, contract.contract, context);
+      await startTask(goal, files, contract.contract, context, pendingEnvelope(goal));
       return;
     }
     case 'newTask':

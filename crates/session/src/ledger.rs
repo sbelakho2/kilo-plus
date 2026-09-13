@@ -35,6 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::child::PresentationState;
 use crate::handle::SessionHandle;
+use crate::task::MAX_VERIFICATION_TREE_HASH_BYTES;
 use crate::{json_bytes, map_store_err, SessionError, MAX_LEDGER_BYTES};
 
 // ---------------------------------------------------------------- bounds
@@ -194,10 +195,45 @@ pub const MAX_BOARD_RECEIPTS_PER_POST: usize = 256;
 pub const ENTRY_COMPLETION_CONTRACT_SET: &str = "completion_contract_set";
 pub const ENTRY_COMPLETION_STEP_STATUS: &str = "completion_step_status";
 
+// Durable integration records (P0 orchestrated-completion binding): one
+// `integration_record` row per integration attempt of an orchestrated run.
+// It binds the run's root verification (and every completion-contract step
+// status) to the ACTUAL final integration root snapshot, so an unrelated
+// owner-checkout edit invalidates the verification instead of silently
+// satisfying completion. Integration rows are the durable authority a
+// restarted executor re-opens from; they fold nowhere in the head and are
+// PINNED across compaction (a pruned record would silently unbind a passing
+// verification record from the root it certified).
+pub const ENTRY_INTEGRATION_RECORD: &str = "integration_record";
+
 // ---------------------------------------------------------------- completion bounds
 
 /// Hard bound on the bounded detail text of one step-status row.
 pub const MAX_COMPLETION_STEP_DETAIL: usize = MAX_LEDGER_TEXT;
+
+// ---------------------------------------------------------------- integration bounds
+
+/// Hard bound on the number of source rows of one integration record (one
+/// row per integrated isolated child). A run beyond this bound records the
+/// deterministic prefix plus `source_count`/`sources_digest` in the record
+/// (explicit, never a silent omission).
+pub const MAX_INTEGRATION_SOURCES: usize = 32;
+/// Hard bound on the stored integrated-file path sample (the FULL list is
+/// covered by `integrated_files_digest` + `integrated_file_count`).
+pub const MAX_INTEGRATION_FILES: usize = 16;
+/// Hard bound on one stored integrated-file path.
+pub const MAX_INTEGRATION_PATH_BYTES: usize = 256;
+/// Hard bound on the stored conflict summaries (the FULL count rides
+/// `conflict_count`).
+pub const MAX_INTEGRATION_CONFLICTS: usize = 8;
+/// Hard bound on one stored conflict summary line.
+pub const MAX_INTEGRATION_CONFLICT_BYTES: usize = 256;
+/// Hard bound on the integration root path.
+pub const MAX_INTEGRATION_ROOT_BYTES: usize = 1024;
+/// Hard bound on a run id / change-set id / child id inside the record.
+pub const MAX_INTEGRATION_ID_BYTES: usize = 128;
+/// The entry tag of one integration record (mirrors the enum tag).
+pub const INTEGRATION_RECORDED_TAG: &str = "integration_recorded";
 
 // ---------------------------------------------------------------- edit txn bounds
 
@@ -528,8 +564,18 @@ pub enum LedgerPayload {
         step: CompletionStep,
         status: CompletionStepOutcome,
         detail: String,
+        /// The final integration snapshot the outcome was recorded against.
+        /// Additive with a serde default: rows written before the
+        /// integration binding decode with `None` (the legacy behavior).
+        #[serde(default)]
+        snapshot: Option<String>,
         at_ms: i64,
     },
+    /// One durable integration record of an orchestrated run (P0
+    /// orchestrated-completion binding): the staged sources, the final
+    /// integration root and its snapshot digest, the integrated files and
+    /// any conflicts. Record-first and pinned across compaction.
+    IntegrationRecorded { record: IntegrationRecordRow },
 }
 
 /// One decoded ledger row.
@@ -670,6 +716,74 @@ pub struct CompletionStepStatusRow {
     pub step: CompletionStep,
     pub status: CompletionStepOutcome,
     pub detail: String,
+    /// The final integration snapshot the step outcome was recorded against
+    /// (`None` for runs without an integration record, e.g. single-session
+    /// drives — the legacy behavior, byte-identical). A step recorded with a
+    /// snapshot does not satisfy the completion gate once the root snapshot
+    /// moved away from it.
+    pub snapshot: Option<String>,
+    pub at_ms: i64,
+}
+
+/// One integrated isolated child of an [`IntegrationRecordRow`]: the child,
+/// the staged change-set it contributed and the content digest of its
+/// candidate root at integration time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationSourceRow {
+    pub child_id: String,
+    pub change_set_id: String,
+    /// Lowercase 64-hex BLAKE3 digest of the child's candidate root.
+    pub candidate_root_hash: String,
+}
+
+/// The durable integration record of ONE orchestrated run (P0
+/// orchestrated-completion binding). Written record-first (an in-flight row
+/// with an empty `final_snapshot_hash` before any file apply, finalized
+/// after every apply) and pinned across compaction. The root verification
+/// record and every completion step status of the run reference
+/// `final_snapshot_hash`; completion re-derives the root snapshot and
+/// refuses a record whose snapshot no longer matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationRecordRow {
+    pub run_id: String,
+    /// The root task row the integration serves.
+    pub task_id: u64,
+    /// The base revision the integration started from (the first staged
+    /// change set's durable base id), when one exists.
+    #[serde(default)]
+    pub base_revision: Option<String>,
+    /// The base root snapshot digest before any child apply, when one exists.
+    #[serde(default)]
+    pub base_snapshot: Option<String>,
+    pub final_root: String,
+    /// Lowercase 64-hex BLAKE3 digest of the final integration root; EMPTY
+    /// while the record is in-flight (record-first, before any apply).
+    pub final_snapshot_hash: String,
+    /// A bounded, deterministic sample of the integrated file paths (the
+    /// FULL list is covered by `integrated_files_digest`).
+    #[serde(default)]
+    pub integrated_files: Vec<String>,
+    /// Exact number of files the integration applied (0 = no mutating
+    /// children / no changes).
+    pub integrated_file_count: u64,
+    /// Deterministic digest of the FULL sorted integrated-file list
+    /// (empty when no files were integrated). Never a silent truncation:
+    /// the sample plus the digest plus the count are the honest bounds.
+    #[serde(default)]
+    pub integrated_files_digest: String,
+    /// A bounded sample of the conflict summaries that blocked the
+    /// integration (empty = clean).
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+    /// Exact number of conflicts surfaced.
+    pub conflict_count: u64,
+    pub sources: Vec<IntegrationSourceRow>,
+    /// Exact number of sources (may exceed `sources.len()`).
+    #[serde(default)]
+    pub source_count: u64,
+    /// Digest of the FULL source list, for the bounded case.
+    #[serde(default)]
+    pub sources_digest: String,
     pub at_ms: i64,
 }
 
@@ -718,6 +832,7 @@ fn entry_tag_of(payload: &LedgerPayload) -> &'static str {
         LedgerPayload::BoardReset { .. } => ENTRY_BOARD_RESET,
         LedgerPayload::CompletionContractSet { .. } => ENTRY_COMPLETION_CONTRACT_SET,
         LedgerPayload::CompletionStepStatus { .. } => ENTRY_COMPLETION_STEP_STATUS,
+        LedgerPayload::IntegrationRecorded { .. } => ENTRY_INTEGRATION_RECORD,
     }
 }
 
@@ -924,10 +1039,24 @@ fn decode_payload(
                 revision,
                 detail,
                 at_ms,
+                snapshot,
                 ..
             } = &decoded
             {
-                validate_completion_step_status(*task_id, *revision, detail, *at_ms)?;
+                validate_completion_step_status(
+                    *task_id,
+                    *revision,
+                    detail,
+                    *at_ms,
+                    snapshot.as_deref(),
+                )?;
+            }
+            Ok(decoded)
+        }
+        ENTRY_INTEGRATION_RECORD => {
+            let decoded = decode(entry_type)?;
+            if let LedgerPayload::IntegrationRecorded { record } = &decoded {
+                validate_integration_record(record)?;
             }
             Ok(decoded)
         }
@@ -1389,6 +1518,7 @@ pub(crate) fn validate_completion_step_status(
     revision: u64,
     detail: &str,
     at_ms: i64,
+    snapshot: Option<&str>,
 ) -> Result<(), SessionError> {
     if task_id == 0 {
         return Err(SessionError::Malformed(
@@ -1406,9 +1536,149 @@ pub(crate) fn validate_completion_step_status(
             detail.len()
         )));
     }
+    if let Some(hash) = snapshot {
+        if hash.is_empty()
+            || hash.len() > MAX_VERIFICATION_TREE_HASH_BYTES
+            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(SessionError::Malformed(
+                "ledger completion_step_status snapshot must be non-empty hex within \
+                 MAX_VERIFICATION_TREE_HASH_BYTES"
+                    .into(),
+            ));
+        }
+    }
     if at_ms <= 0 {
         return Err(SessionError::Malformed(
             "ledger completion_step_status at_ms must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Shape bounds of one `integration_recorded` row, shared by the appender
+/// and the strict decoder (a hostile raw row must fail loudly on read too).
+/// Bounded fields are explicit: the stored file/conflict/source lists are
+/// samples with exact counts and content digests beside them.
+pub(crate) fn validate_integration_record(
+    record: &IntegrationRecordRow,
+) -> Result<(), SessionError> {
+    let check_id = |value: &str, what: &str| -> Result<(), SessionError> {
+        if value.is_empty() || value.len() > MAX_INTEGRATION_ID_BYTES {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_record {what} must be 1..={MAX_INTEGRATION_ID_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    };
+    let check_hex = |value: &str, what: &str| -> Result<(), SessionError> {
+        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_record {what} must be the 64-char hex BLAKE3"
+            )));
+        }
+        Ok(())
+    };
+    check_id(&record.run_id, "run_id")?;
+    if record.task_id == 0 {
+        return Err(SessionError::Malformed(
+            "ledger integration_record task_id must be non-zero".into(),
+        ));
+    }
+    if let Some(base) = &record.base_revision {
+        check_id(base, "base_revision")?;
+    }
+    if let Some(base) = &record.base_snapshot {
+        check_hex(base, "base_snapshot")?;
+    }
+    if record.final_root.is_empty() || record.final_root.len() > MAX_INTEGRATION_ROOT_BYTES {
+        return Err(SessionError::Malformed(format!(
+            "ledger integration_record final_root must be 1..={MAX_INTEGRATION_ROOT_BYTES} bytes"
+        )));
+    }
+    // An EMPTY final hash is the record-first in-flight marker; a non-empty
+    // one is the binding digest.
+    if !record.final_snapshot_hash.is_empty() {
+        check_hex(&record.final_snapshot_hash, "final_snapshot_hash")?;
+    }
+    if record.integrated_files.len() > MAX_INTEGRATION_FILES {
+        return Err(SessionError::Oversized(format!(
+            "ledger integration_record stores {} integrated files (cap {MAX_INTEGRATION_FILES})",
+            record.integrated_files.len()
+        )));
+    }
+    for path in &record.integrated_files {
+        if path.is_empty() || path.len() > MAX_INTEGRATION_PATH_BYTES {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_record file path must be 1..={MAX_INTEGRATION_PATH_BYTES} bytes"
+            )));
+        }
+    }
+    if record.integrated_files.len() as u64 > record.integrated_file_count {
+        return Err(SessionError::Malformed(
+            "ledger integration_record stores more file rows than its file count".into(),
+        ));
+    }
+    if record.integrated_file_count == 0 {
+        if !record.integrated_files.is_empty() || !record.integrated_files_digest.is_empty() {
+            return Err(SessionError::Malformed(
+                "ledger integration_record with zero integrated files must carry no file rows or digest"
+                    .into(),
+            ));
+        }
+    } else {
+        check_hex(&record.integrated_files_digest, "integrated_files_digest")?;
+    }
+    if record.conflicts.len() > MAX_INTEGRATION_CONFLICTS {
+        return Err(SessionError::Oversized(format!(
+            "ledger integration_record stores {} conflict rows (cap {MAX_INTEGRATION_CONFLICTS})",
+            record.conflicts.len()
+        )));
+    }
+    for conflict in &record.conflicts {
+        if conflict.is_empty() || conflict.len() > MAX_INTEGRATION_CONFLICT_BYTES {
+            return Err(SessionError::Malformed(format!(
+                "ledger integration_record conflict row must be 1..={MAX_INTEGRATION_CONFLICT_BYTES} bytes"
+            )));
+        }
+    }
+    if record.conflicts.len() as u64 > record.conflict_count {
+        return Err(SessionError::Malformed(
+            "ledger integration_record stores more conflict rows than its conflict count".into(),
+        ));
+    }
+    // A clean finalized record must carry a final snapshot; an in-flight one
+    // may not pretend to have applied files. Conflicts are legal in both:
+    // they can be recorded before the remaining children apply.
+    if record.sources.len() > MAX_INTEGRATION_SOURCES {
+        return Err(SessionError::Oversized(format!(
+            "ledger integration_record stores {} sources (cap {MAX_INTEGRATION_SOURCES})",
+            record.sources.len()
+        )));
+    }
+    for source in &record.sources {
+        check_id(&source.child_id, "source child_id")?;
+        check_id(&source.change_set_id, "source change_set_id")?;
+        check_hex(&source.candidate_root_hash, "source candidate_root_hash")?;
+    }
+    if record.source_count < record.sources.len() as u64 {
+        return Err(SessionError::Malformed(
+            "ledger integration_record source count is smaller than its stored sources".into(),
+        ));
+    }
+    if record.source_count == 0 {
+        if !record.sources_digest.is_empty() {
+            return Err(SessionError::Malformed(
+                "ledger integration_record with zero sources must carry no sources digest".into(),
+            ));
+        }
+    } else if record.sources.len() as u64 != record.source_count {
+        // The bounded-full case: the digest covers every source.
+        check_hex(&record.sources_digest, "sources_digest")?;
+    }
+    if record.at_ms <= 0 {
+        return Err(SessionError::Malformed(
+            "ledger integration_record at_ms must be positive".into(),
         ));
     }
     Ok(())
@@ -1669,6 +1939,11 @@ fn fold(head: &mut LedgerHead, payload: &LedgerPayload) -> Result<(), SessionErr
         // history, never a lossy head projection.
         LedgerPayload::CompletionContractSet { .. }
         | LedgerPayload::CompletionStepStatus { .. } => {}
+        // Integration records are the durable binding of a root verification
+        // to the final integration snapshot: they fold nowhere in the head
+        // and are pinned across compaction (the completion gate re-reads
+        // them), exactly like tournament and completion-contract rows.
+        LedgerPayload::IntegrationRecorded { .. } => {}
     }
     Ok(())
 }
@@ -2705,7 +2980,8 @@ impl SessionHandle {
     /// Append one per-step outcome row. The row must name a revision that
     /// already carries a recorded contract (step statuses are evidence of an
     /// accepted run, never free-floating claims), checked and appended under
-    /// the session command lock.
+    /// the session command lock. Legacy callers record no integration
+    /// snapshot ([`Self::ledger_completion_step_status_with_snapshot`] does).
     pub fn ledger_completion_step_status(
         &self,
         task_id: u64,
@@ -2715,7 +2991,27 @@ impl SessionHandle {
         detail: &str,
         at_ms: i64,
     ) -> faktor_core::Result<Option<i64>> {
-        validate_completion_step_status(task_id, revision, detail, at_ms)?;
+        self.ledger_completion_step_status_with_snapshot(
+            task_id, revision, step, status, detail, None, at_ms,
+        )
+    }
+
+    /// [`Self::ledger_completion_step_status`] with the final integration
+    /// snapshot the outcome is recorded against. A non-empty snapshot must
+    /// be the 64-char hex BLAKE3 of the integration root; the completion
+    /// gate refuses the step once the root snapshot moved away from it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ledger_completion_step_status_with_snapshot(
+        &self,
+        task_id: u64,
+        revision: u64,
+        step: CompletionStep,
+        status: CompletionStepOutcome,
+        detail: &str,
+        snapshot: Option<&str>,
+        at_ms: i64,
+    ) -> faktor_core::Result<Option<i64>> {
+        validate_completion_step_status(task_id, revision, detail, at_ms, snapshot)?;
         let _guard = self.command_guard();
         if self
             .ledger_completion_contract_at(task_id, revision)?
@@ -2733,6 +3029,7 @@ impl SessionHandle {
             step,
             status,
             detail: detail.to_string(),
+            snapshot: snapshot.map(str::to_string),
             at_ms,
         })
     }
@@ -2752,6 +3049,7 @@ impl SessionHandle {
                 step,
                 status,
                 detail,
+                snapshot,
                 at_ms,
             } = entry.payload
             {
@@ -2763,8 +3061,64 @@ impl SessionHandle {
                         step,
                         status,
                         detail,
+                        snapshot,
                         at_ms,
                     });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Append one durable integration record (P0 orchestrated-completion
+    /// binding). Record-first: an in-flight record (empty
+    /// `final_snapshot_hash`) is legal and is superseded by the finalized
+    /// record of the same run. The FULL source/file lists are covered by the
+    /// record's exact counts and content digests; the stored samples are
+    /// bounded and validated before any byte is journaled.
+    pub fn ledger_integration_record_set(
+        &self,
+        record: &IntegrationRecordRow,
+    ) -> faktor_core::Result<i64> {
+        validate_integration_record(record)?;
+        let _guard = self.command_guard();
+        self.append_entry(LedgerPayload::IntegrationRecorded {
+            record: record.clone(),
+        })?
+        .ok_or_else(|| {
+            SessionError::Internal("ledger integration record append returned no seq".into()).into()
+        })
+    }
+
+    /// The NEWEST durable integration record of one task, or `None` when the
+    /// task never integrated isolated child changes. Entries ascend by seq,
+    /// so the last match wins — the exact record the completion binding must
+    /// evaluate.
+    pub fn ledger_integration_record_for_task(
+        &self,
+        task_id: u64,
+    ) -> faktor_core::Result<Option<IntegrationRecordRow>> {
+        let mut latest: Option<IntegrationRecordRow> = None;
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::IntegrationRecorded { record } = entry.payload {
+                if record.task_id == task_id {
+                    latest = Some(record);
+                }
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Every durable integration record of one task, ascending by seq.
+    pub fn ledger_integration_records_for_task(
+        &self,
+        task_id: u64,
+    ) -> faktor_core::Result<Vec<IntegrationRecordRow>> {
+        let mut out = Vec::new();
+        for entry in self.all_entries_decoded()? {
+            if let LedgerPayload::IntegrationRecorded { record } = entry.payload {
+                if record.task_id == task_id {
+                    out.push(record);
                 }
             }
         }
@@ -2868,6 +3222,10 @@ impl SessionHandle {
         // gate reads, so watermark compaction must never delete them (a
         // pruned status row would silently turn "not done" into "done").
         let mut completion_seqs: Vec<i64> = Vec::new();
+        // Integration records are pinned: the root verification binding and
+        // the completion gate re-read them, so a pruned record would
+        // silently unbind a passing verification from the root it certified.
+        let mut integration_seqs: Vec<i64> = Vec::new();
         for entry in &entries {
             match &entry.payload {
                 LedgerPayload::GoalSet { .. } => {
@@ -2895,6 +3253,7 @@ impl SessionHandle {
                 | LedgerPayload::BoardReset { .. } => board_seqs.push(entry.seq),
                 LedgerPayload::CompletionContractSet { .. }
                 | LedgerPayload::CompletionStepStatus { .. } => completion_seqs.push(entry.seq),
+                LedgerPayload::IntegrationRecorded { .. } => integration_seqs.push(entry.seq),
                 _ => {}
             }
         }
@@ -2933,6 +3292,7 @@ impl SessionHandle {
         pinned.extend(tournament_seqs);
         pinned.extend(board_seqs);
         pinned.extend(completion_seqs);
+        pinned.extend(integration_seqs);
         pinned.sort_unstable();
         pinned.dedup();
         let head_json = head_to_json(&head)?;

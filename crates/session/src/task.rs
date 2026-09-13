@@ -59,6 +59,7 @@
 //! [`faktor_core::Error`], so `?` interop with core-`Result` callers is
 //! unchanged.
 
+use faktor_core::attachment::{AttachmentId, MAX_ATTACHMENTS_PER_TASK};
 use faktor_core::completion::{CompletionContract, CompletionStep, CompletionStepOutcome};
 use faktor_core::id::{
     SessionId, TaskId, TaskRevision, VerificationRecordId, WorkspaceId, WorktreeId,
@@ -82,6 +83,19 @@ pub const MAX_TASK_CRITERION_BYTES: usize = 3000;
 pub const MAX_TASK_PLAN_STEPS: usize = 256;
 /// Hard bound on ONE plan step.
 pub const MAX_TASK_STEP_BYTES: usize = 3000;
+
+// -------------------------------------------------- root snapshot (P0 binding)
+
+/// Hard bound on one bounded root-snapshot walk (the completion binding):
+/// trees beyond it are typed Oversized refusals, never a partial digest.
+pub const MAX_ROOT_SNAPSHOT_ENTRIES: usize = 100_000;
+/// Hard depth bound of the root-snapshot walk (a hostile nested tree fails
+/// loudly instead of recursing without bound).
+pub const MAX_ROOT_SNAPSHOT_DEPTH: usize = 64;
+/// Directory names skipped at ANY depth by the root-snapshot digest: VCS
+/// bookkeeping the completion steps legitimately mutate (commits) and that
+/// is never working content. Everything else is hashed.
+pub const ROOT_SNAPSHOT_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 
 // ------------------------------------------------------ record bounds (P0-8)
 
@@ -709,6 +723,11 @@ pub struct Task {
     pub acceptance_criteria: Vec<String>,
     /// Ordered steps; append-only durable.
     pub plan: Vec<String>,
+    /// Durable typed binary/image attachments (schema v24), SEPARATE from
+    /// any workspace path: each entry names CAS bytes by digest plus its
+    /// declared mime/filename/size. Rows written before v24 and every
+    /// attachment-free task decode with an empty list.
+    pub attachments: Vec<AttachmentId>,
     pub budget: TaskBudget,
     pub state: TaskState,
     pub created_ms: i64,
@@ -723,6 +742,7 @@ impl Default for Task {
             goal: String::new(),
             acceptance_criteria: Vec::new(),
             plan: Vec::new(),
+            attachments: Vec::new(),
             budget: TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: 0,
@@ -739,6 +759,7 @@ impl From<faktor_store::TaskRow> for Task {
             goal: r.goal,
             acceptance_criteria: r.acceptance_criteria,
             plan: r.plan,
+            attachments: r.attachments,
             budget: TaskBudget {
                 max_tokens: r.max_tokens,
                 max_turns: r.max_turns,
@@ -762,6 +783,7 @@ fn task_row(task: Task, revision: TaskRevision) -> faktor_store::TaskRow {
         goal: task.goal,
         acceptance_criteria: task.acceptance_criteria,
         plan: task.plan,
+        attachments: task.attachments,
         max_tokens: task.budget.max_tokens,
         max_turns: task.budget.max_turns,
         spent_tokens: task.budget.spent_tokens,
@@ -912,6 +934,42 @@ pub enum TaskError {
         current: VerificationStatus,
     },
     #[error(
+        "verification record {record} certifies a final integration snapshot, but task {task_id} carries no integration record for it: only a real staged child integration may certify orchestrated completion"
+    )]
+    IntegrationRecordMissing {
+        task_id: TaskId,
+        record: VerificationRecordId,
+    },
+    #[error(
+        "verification record {record} certifies integration snapshot {recorded}, but the current root snapshot is {current} (the owner checkout moved after integration): completion is refused until the run is re-integrated and re-verified"
+    )]
+    IntegrationSnapshotMismatch {
+        task_id: TaskId,
+        record: VerificationRecordId,
+        recorded: String,
+        current: String,
+    },
+    #[error(
+        "verification record {record} cannot be bound for task {task_id}: {detail} (completion is refused until the root is resolvable and re-verified)"
+    )]
+    IntegrationSnapshotUnavailable {
+        task_id: TaskId,
+        record: VerificationRecordId,
+        detail: String,
+    },
+    #[error(
+        "completion contract step {step:?} of task {task_id} revision {revision} was recorded against integration snapshot {recorded}, but the current root snapshot is {current}: the step outcome is bound to the certified root and a moved root requires re-verification"
+    )]
+    CompletionStepSnapshotMismatch {
+        task_id: TaskId,
+        revision: TaskRevision,
+        step: CompletionStep,
+        recorded: String,
+        current: String,
+    },
+    #[error("root snapshot unavailable: {0}")]
+    RootSnapshotUnavailable(String),
+    #[error(
         "completion accounting incomplete for task {task_id}: {open_count} open reservation(s) \
          ({open_micro} micro held; {dispatched_count} already dispatched) and {uncertain_count} \
          UNCERTAIN ({uncertain_micro} micro held) still consume budget; VerifiedComplete requires \
@@ -967,6 +1025,8 @@ pub enum TaskError {
     Malformed(String),
     #[error("store failure: {0}")]
     Store(String),
+    #[error("internal task failure: {0}")]
+    Internal(String),
 }
 
 impl From<faktor_store::StoreError> for TaskError {
@@ -1034,8 +1094,138 @@ pub struct TaskPatch {
     pub goal: Option<String>,
     pub acceptance_criteria: Option<Vec<String>>,
     pub plan: Option<Vec<String>>,
+    /// Replace the task's attachment set (None = keep the durable set).
+    pub attachments: Option<Vec<AttachmentId>>,
     pub budget: Option<TaskBudget>,
     pub state: Option<TaskState>,
+}
+
+/// Deterministic, bounded content digest of a workspace root (the completion
+/// binding's root snapshot): every regular file under `root` (sorted by
+/// relative path, VCS bookkeeping directories skipped) is streamed through
+/// BLAKE3 and folded with its relative path into ONE 64-char hex digest.
+///
+/// Bounded everything: beyond `max_entries` files or
+/// [`MAX_ROOT_SNAPSHOT_DEPTH`] depth the walk refuses with a typed
+/// `Oversized` error — never a partial digest, never an unbounded walk.
+/// Symlinks are followed only while they resolve INSIDE the root; an
+/// escaping link is a typed `Malformed` refusal. The digest is stable across
+/// processes/platforms for the same tree, which is what lets an integration
+/// record, a verification record and a later completion pass compare the
+/// SAME root.
+pub fn root_snapshot_digest(
+    root: &std::path::Path,
+    max_entries: usize,
+) -> Result<String, TaskError> {
+    if max_entries == 0 {
+        return Err(TaskError::Malformed(
+            "root snapshot max_entries must be >= 1".into(),
+        ));
+    }
+    let canonical = root
+        .canonicalize()
+        .map_err(|e| TaskError::RootSnapshotUnavailable(format!("{}: {e}", root.display())))?;
+    if !canonical.is_dir() {
+        return Err(TaskError::RootSnapshotUnavailable(format!(
+            "{} is not a directory",
+            root.display()
+        )));
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut count = 0usize;
+    // Iterative DFS with an explicit stack: every frame is one directory
+    // whose entries are sorted, so the traversal order is deterministic.
+    let mut stack: Vec<(std::path::PathBuf, String, usize)> =
+        vec![(canonical.clone(), String::new(), 0)];
+    while let Some((dir, prefix, depth)) = stack.pop() {
+        if depth > MAX_ROOT_SNAPSHOT_DEPTH {
+            return Err(TaskError::Oversized(format!(
+                "root snapshot walk exceeded MAX_ROOT_SNAPSHOT_DEPTH ({MAX_ROOT_SNAPSHOT_DEPTH})"
+            )));
+        }
+        let mut entries: Vec<(std::ffi::OsString, std::path::PathBuf, std::fs::FileType)> =
+            Vec::new();
+        let read = std::fs::read_dir(&dir).map_err(|e| {
+            TaskError::Internal(format!("root snapshot read_dir {}: {e}", dir.display()))
+        })?;
+        for entry in read {
+            let entry = entry.map_err(|e| {
+                TaskError::Internal(format!("root snapshot entry {}: {e}", dir.display()))
+            })?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                TaskError::Internal(format!("root snapshot metadata {}: {e}", path.display()))
+            })?;
+            entries.push((entry.file_name(), path, meta.file_type()));
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, path, file_type) in entries {
+            let rel = if prefix.is_empty() {
+                name.to_string_lossy().into_owned()
+            } else {
+                format!("{prefix}/{}", name.to_string_lossy())
+            };
+            let resolved = if file_type.is_symlink() {
+                let target = std::fs::canonicalize(&path).map_err(|e| {
+                    TaskError::Malformed(format!(
+                        "root snapshot symlink {rel:?} cannot be resolved: {e}"
+                    ))
+                })?;
+                if !target.starts_with(&canonical) {
+                    return Err(TaskError::Malformed(format!(
+                        "root snapshot symlink {rel:?} escapes the root"
+                    )));
+                }
+                target
+            } else {
+                path.clone()
+            };
+            let meta = std::fs::metadata(&resolved)
+                .map_err(|e| TaskError::Internal(format!("root snapshot metadata {rel:?}: {e}")))?;
+            if meta.is_dir() {
+                if ROOT_SNAPSHOT_SKIP_DIRS.contains(&name.to_string_lossy().as_ref()) {
+                    continue;
+                }
+                stack.push((resolved, rel, depth + 1));
+                continue;
+            }
+            if !meta.is_file() {
+                // Sockets/FIFOs/devices are not working content: skipped (a
+                // FIFO would otherwise block the walk forever).
+                continue;
+            }
+            count += 1;
+            if count > max_entries {
+                return Err(TaskError::Oversized(format!(
+                    "root snapshot exceeds {max_entries} entries; refusing a partial digest"
+                )));
+            }
+            let mut hasher = blake3::Hasher::new();
+            let mut file = std::fs::File::open(&resolved)
+                .map_err(|e| TaskError::Internal(format!("root snapshot open {rel:?}: {e}")))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                use std::io::Read;
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| TaskError::Internal(format!("root snapshot read {rel:?}: {e}")))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            files.push((rel, hasher.finalize().to_hex().to_string()));
+        }
+    }
+    files.sort();
+    let mut fold = blake3::Hasher::new();
+    for (path, hash) in files {
+        fold.update(path.as_bytes());
+        fold.update(b"\0");
+        fold.update(hash.as_bytes());
+        fold.update(b"\n");
+    }
+    Ok(fold.finalize().to_hex().to_string())
 }
 
 impl SessionHandle {
@@ -1132,6 +1322,9 @@ impl SessionHandle {
         }
         if let Some(plan) = patch.plan {
             next.plan = plan;
+        }
+        if let Some(attachments) = patch.attachments {
+            next.attachments = attachments;
         }
         if let Some(budget) = patch.budget {
             // The durable budget cap: spent counters only ever move
@@ -1500,13 +1693,25 @@ impl SessionHandle {
                 "task {task_id} has no accepted completion contract; step outcomes need a contract revision"
             )));
         };
+        // P0 binding: when the task carries a finalized integration record,
+        // the step outcome references its final root snapshot. A step is
+        // then only admissible while the root still digests to that
+        // snapshot; the completion gate re-checks it.
+        let integration = self
+            .ledger_integration_record_for_task(task_id.raw())
+            .map_err(task_error_from_core)?;
+        let snapshot = integration
+            .as_ref()
+            .map(|r| r.final_snapshot_hash.clone())
+            .filter(|h| !h.is_empty());
         let seq = self
-            .ledger_completion_step_status(
+            .ledger_completion_step_status_with_snapshot(
                 task_id.raw(),
                 revision.raw(),
                 step,
                 status,
                 detail,
+                snapshot.as_deref(),
                 self.now_ms(),
             )
             .map_err(task_error_from_core)?
@@ -1564,7 +1769,41 @@ impl SessionHandle {
                 ));
             }
             match step_rows.last() {
-                Some(latest) if latest.status == CompletionStepOutcome::Succeeded => {}
+                Some(latest) if latest.status == CompletionStepOutcome::Succeeded => {
+                    // P0 binding: a step recorded against a final integration
+                    // snapshot only satisfies the gate while the root still
+                    // digests to it. The completed step is never silently
+                    // detached from the root it ran over.
+                    if let Some(recorded) = latest.snapshot.as_deref() {
+                        let current = match self.current_root_snapshot_digest() {
+                            Ok(Some(current)) => current,
+                            Ok(None) => {
+                                return Ok(CompletionContractGate::Refused(
+                                    TaskError::RootSnapshotUnavailable(
+                                        "the session workspace root is unresolvable; the step \
+                                         outcome cannot be bound to it"
+                                            .into(),
+                                    ),
+                                ))
+                            }
+                            Err(e @ TaskError::RootSnapshotUnavailable(_)) => {
+                                return Ok(CompletionContractGate::Refused(e))
+                            }
+                            Err(e) => return Err(e),
+                        };
+                        if current != recorded {
+                            return Ok(CompletionContractGate::Refused(
+                                TaskError::CompletionStepSnapshotMismatch {
+                                    task_id,
+                                    revision,
+                                    step,
+                                    recorded: recorded.to_string(),
+                                    current,
+                                },
+                            ));
+                        }
+                    }
+                }
                 Some(latest) => {
                     return Ok(CompletionContractGate::Refused(
                         TaskError::CompletionStepNotSucceeded {
@@ -1666,6 +1905,52 @@ impl SessionHandle {
                 task_worktree: base.worktree_id,
             });
         }
+        // P0 orchestrated-completion binding: a record that carries a
+        // final-integration snapshot is only valid while (a) the task holds
+        // the integration record that certified that snapshot and (b) the
+        // CURRENT root still digests to it. A later arbitrary owner-checkout
+        // edit changes the digest and refuses completion (typed); the run
+        // must re-integrate and re-verify. Records without a tree_hash keep
+        // the legacy single-session behavior byte-identically.
+        if let Some(recorded) = rec.tree_hash.as_deref() {
+            let Some(integration) = self
+                .ledger_integration_record_for_task(task_id.raw())
+                .map_err(task_error_from_core)?
+            else {
+                return Err(TaskError::IntegrationRecordMissing {
+                    task_id,
+                    record: proof,
+                });
+            };
+            if integration.final_snapshot_hash.is_empty()
+                || integration.final_snapshot_hash != recorded
+            {
+                return Err(TaskError::IntegrationSnapshotMismatch {
+                    task_id,
+                    record: proof,
+                    recorded: recorded.to_string(),
+                    current: integration.final_snapshot_hash,
+                });
+            }
+            match self.current_root_snapshot_digest()? {
+                Some(current) if current == recorded => {}
+                Some(current) => {
+                    return Err(TaskError::IntegrationSnapshotMismatch {
+                        task_id,
+                        record: proof,
+                        recorded: recorded.to_string(),
+                        current,
+                    })
+                }
+                None => {
+                    return Err(TaskError::IntegrationSnapshotUnavailable {
+                        task_id,
+                        record: proof,
+                        detail: "the session workspace root is unresolvable".into(),
+                    })
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1736,6 +2021,22 @@ impl SessionHandle {
             .get_task(self.id, task_id)?
             .ok_or(TaskError::NotFound(task_id))?;
         Ok(row.revision)
+    }
+
+    /// The CURRENT content digest of the session's effective root (the live
+    /// shadow root while one is live, else the durable workspace root): the
+    /// exact value the completion binding compares against a verification
+    /// record's integration snapshot. `Ok(None)` when the session or its
+    /// workspace row is unknown (no root — the caller fails closed).
+    pub fn current_root_snapshot_digest(&self) -> Result<Option<String>, TaskError> {
+        let Some(root) = self
+            .manager
+            .resolve_workspace_root(self.id)
+            .map_err(|e| TaskError::Store(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        root_snapshot_digest(&root, MAX_ROOT_SNAPSHOT_ENTRIES).map(Some)
     }
 
     /// The durable task row identified by `task_id` (session-scoped).
@@ -2137,6 +2438,18 @@ fn validate_task_fields(t: &Task) -> Result<(), TaskError> {
             )));
         }
     }
+    // Attachments are typed bytes references, SEPARATE from the plan/files
+    // vocabulary: bounded count, canonical mime, traversal-free filename and
+    // the payload ceiling — validated before ANY durable write.
+    if t.attachments.len() > MAX_ATTACHMENTS_PER_TASK {
+        return Err(TaskError::Oversized(format!(
+            "{} attachments exceed MAX_ATTACHMENTS_PER_TASK ({MAX_ATTACHMENTS_PER_TASK})",
+            t.attachments.len()
+        )));
+    }
+    for a in &t.attachments {
+        a.validate().map_err(task_error_from_core)?;
+    }
     Ok(())
 }
 
@@ -2478,6 +2791,7 @@ mod tests {
     use super::*;
     use crate::budget::BudgetAuthority;
     use crate::handle::tests::{session, test_manager};
+    use crate::SessionManager;
     use faktor_core::ErrorKind;
     use std::sync::Arc;
     use std::thread;
@@ -2489,6 +2803,7 @@ mod tests {
             goal: "implement durable tasks".into(),
             acceptance_criteria: vec!["goal: implement durable tasks".into()],
             plan: vec!["schema".into(), "repo".into()],
+            attachments: vec![],
             budget: TaskBudget {
                 max_tokens: Some(100_000),
                 max_turns: Some(10),
@@ -2508,6 +2823,7 @@ mod tests {
             goal: "gated goal".into(),
             acceptance_criteria: criteria,
             plan: vec![],
+            attachments: vec![],
             budget: TaskBudget::default(),
             state: TaskState::Pending,
             created_ms: 1,
@@ -2597,6 +2913,55 @@ mod tests {
         );
         assert_eq!(s.get_task(created.task_id).unwrap(), Some(patched.clone()));
         assert_eq!(s.list_tasks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_attachments_are_durable_typed_and_separate_from_paths() {
+        let (_d, m) = test_manager();
+        let s = session(&m);
+        let pdf = s
+            .put_attachment("application/pdf", Some("spec.pdf"), b"%PDF-1.4 spec")
+            .unwrap();
+        let mut t = task(&s);
+        t.attachments = vec![pdf.clone()];
+        let created = s.create_task(t.clone()).unwrap();
+        assert_eq!(created.attachments, vec![pdf.clone()]);
+        // The durable row resolves the byte-identical typed list.
+        assert_eq!(
+            s.get_task(created.task_id).unwrap().unwrap().attachments,
+            vec![pdf.clone()]
+        );
+        // A patch REPLACES the set (never merges silently).
+        let second = s
+            .put_attachment("text/plain", Some("notes.txt"), b"notes")
+            .unwrap();
+        let patched = s
+            .update_task(
+                created.task_id,
+                TaskPatch {
+                    attachments: Some(vec![second.clone()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(patched.attachments, vec![second.clone()]);
+        // Hostile attachment sets are typed refusals before any write.
+        let mut hostile = t.clone();
+        hostile.attachments = vec![AttachmentId {
+            filename: Some("../escape".into()),
+            ..second.clone()
+        }];
+        let err = s.create_task(Task {
+            task_id: TaskId::new(9),
+            ..hostile
+        });
+        assert!(matches!(err.unwrap_err().kind, ErrorKind::Malformed));
+        let mut many = t.clone();
+        many.attachments = vec![second; MAX_ATTACHMENTS_PER_TASK + 1];
+        assert!(matches!(
+            s.create_task(many).unwrap_err().kind,
+            ErrorKind::Oversized
+        ));
     }
 
     #[test]
@@ -5019,5 +5384,250 @@ mod tests {
                 1,
             )
             .is_err());
+    }
+
+    // ------------------------------------------- integration binding (P0)
+
+    /// A session over a REAL workspace root (the root-snapshot binding needs
+    /// a resolvable, digestible tree).
+    fn real_root_session(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<SessionManager>, SessionHandle, std::path::PathBuf) {
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        let m = crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+            .unwrap();
+        let ws = m.create_workspace(root.to_str().unwrap()).unwrap();
+        let s = m.create_session(ws, "t", "ollama", "qwen3.8").unwrap();
+        (m, s, root)
+    }
+
+    fn root_digest(root: &std::path::Path) -> String {
+        root_snapshot_digest(root, MAX_ROOT_SNAPSHOT_ENTRIES).unwrap()
+    }
+
+    fn passed_record_with_tree(
+        s: &SessionHandle,
+        task_id: TaskId,
+        criteria: &[String],
+        tree: &str,
+    ) -> VerificationRecordId {
+        let criteria: Vec<CriterionVerification> = criteria
+            .iter()
+            .map(|c| CriterionVerification {
+                criterion_key: c.clone(),
+                passed: true,
+                evidence: Some("exit 0".into()),
+            })
+            .collect();
+        s.create_verification_record(
+            task_id,
+            Some(tree.to_string()),
+            criteria,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            VerificationStatus::Passed,
+            1,
+        )
+        .unwrap()
+    }
+
+    /// One FINALIZED durable integration record (the binding authority).
+    fn finalized_integration(
+        s: &SessionHandle,
+        task_id: TaskId,
+        root: &std::path::Path,
+        final_hash: &str,
+        files: &[&str],
+    ) -> crate::ledger::IntegrationRecordRow {
+        let hex = "a".repeat(64);
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        s.ledger_integration_record_set(&crate::ledger::IntegrationRecordRow {
+            run_id: "run-integration-test".into(),
+            task_id: task_id.raw(),
+            base_revision: Some("child-0-base".into()),
+            base_snapshot: Some(hex.clone()),
+            final_root: root.to_string_lossy().into_owned(),
+            final_snapshot_hash: final_hash.to_string(),
+            integrated_files: files.clone(),
+            integrated_file_count: files.len() as u64,
+            integrated_files_digest: hex.clone(),
+            conflicts: vec![],
+            conflict_count: 0,
+            sources: vec![crate::ledger::IntegrationSourceRow {
+                child_id: "child-0".into(),
+                change_set_id: "child-0-base-cs".into(),
+                candidate_root_hash: hex.clone(),
+            }],
+            source_count: 1,
+            sources_digest: hex,
+            at_ms: 1,
+        })
+        .unwrap();
+        s.ledger_integration_record_for_task(task_id.raw())
+            .unwrap()
+            .unwrap()
+    }
+
+    /// A passing root record whose snapshot has NO durable integration record
+    /// can never complete: the refusal is typed and the task stays Verifying.
+    #[test]
+    fn completion_refuses_a_root_record_without_the_integration_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, s, root) = real_root_session(&dir);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        let digest = root_digest(&root);
+        let record = passed_record_with_tree(&s, tid, &["c1".into()], &digest);
+        let err = s.complete_verified_task(tid, rev, record).unwrap_err();
+        assert!(
+            matches!(err, TaskError::IntegrationRecordMissing { .. }),
+            "{err}"
+        );
+        assert_ne!(
+            s.get_task(tid).unwrap().unwrap().state,
+            TaskState::VerifiedComplete
+        );
+        // A finalized integration row unbinds the refusal.
+        finalized_integration(&s, tid, &root, &digest, &["base.txt"]);
+        let done = s.complete_verified_task(tid, rev, record).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+    }
+
+    /// An arbitrary owner-checkout edit AFTER the integration moves the root
+    /// snapshot: completion refuses with the typed mismatch, the durable
+    /// binding survives a real store restart, and restoring the certified
+    /// root lets the SAME record complete.
+    #[test]
+    fn owner_edit_after_integration_refuses_completion_typed_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (m, s, root) = real_root_session(&dir);
+        let sid = s.id;
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = drive_to_verifying(&s, tid);
+        let before = root_digest(&root);
+        let record = passed_record_with_tree(&s, tid, &["c1".into()], &before);
+        let integration = finalized_integration(&s, tid, &root, &before, &["base.txt"]);
+        // Re-appending the identical finalized row is an idempotent replay:
+        // the newest row resolves byte-identically.
+        assert_eq!(
+            finalized_integration(&s, tid, &root, &before, &["base.txt"]),
+            integration
+        );
+        // An unrelated owner edit (never part of the integration) moves the
+        // root snapshot.
+        std::fs::write(root.join("late.txt"), "owner drift\n").unwrap();
+        let after = root_digest(&root);
+        assert_ne!(after, before);
+        match s.complete_verified_task(tid, rev, record).unwrap_err() {
+            TaskError::IntegrationSnapshotMismatch {
+                recorded, current, ..
+            } => {
+                assert_eq!(recorded, before);
+                assert_eq!(current, after);
+            }
+            other => panic!("expected snapshot mismatch, got {other}"),
+        }
+        // The refusal wrote nothing: reopen the REAL store and read the same
+        // durable binding back.
+        drop(s);
+        drop(m);
+        let m2 =
+            crate::SessionManager::open(dir.path().join("store"), dir.path().join("cas"), true)
+                .unwrap();
+        let s2 = m2.get_session(sid).unwrap().unwrap();
+        assert_eq!(
+            s2.ledger_integration_record_for_task(tid.raw())
+                .unwrap()
+                .unwrap(),
+            integration
+        );
+        let durable_record = s2
+            .list_verification_records(tid)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.record_id == record)
+            .expect("record durable");
+        assert_eq!(durable_record.tree_hash.as_deref(), Some(before.as_str()));
+        // Restore the certified root: the same record now completes.
+        std::fs::remove_file(root.join("late.txt")).unwrap();
+        let done = s2.complete_verified_task(tid, rev, record).unwrap();
+        assert_eq!(done.state, TaskState::VerifiedComplete);
+    }
+
+    /// Completion-contract step outcomes reference the integration snapshot;
+    /// a later root edit turns their `Succeeded` into a typed gate refusal.
+    #[test]
+    fn completion_step_status_is_bound_to_the_integration_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_m, s, root) = real_root_session(&dir);
+        let tid = s.task_id().unwrap();
+        s.create_task(criteria_task(&s, tid, vec!["c1".into()]))
+            .unwrap();
+        let rev = s.task_revision(tid).unwrap();
+        s.set_completion_contract(tid, rev, push_contract())
+            .unwrap();
+        let digest = root_digest(&root);
+        finalized_integration(&s, tid, &root, &digest, &["base.txt"]);
+        s.set_completion_step_status(
+            tid,
+            CompletionStep::Push,
+            CompletionStepOutcome::Succeeded,
+            "pushed",
+        )
+        .unwrap();
+        let rows = s
+            .ledger_completion_step_statuses(tid.raw(), rev.raw())
+            .unwrap();
+        assert_eq!(rows[0].snapshot.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            s.completion_contract_gate(tid).unwrap(),
+            CompletionContractGate::Satisfied
+        );
+        std::fs::write(root.join("late.txt"), "drift\n").unwrap();
+        match s.completion_contract_gate(tid).unwrap() {
+            CompletionContractGate::Refused(TaskError::CompletionStepSnapshotMismatch {
+                recorded,
+                current,
+                ..
+            }) => {
+                assert_eq!(recorded, digest);
+                assert_ne!(current, digest);
+            }
+            other => panic!("expected step snapshot mismatch, got {other:?}"),
+        }
+    }
+
+    /// The root-snapshot digest is deterministic, skips VCS bookkeeping and
+    /// refuses oversized walks instead of returning a partial digest.
+    #[test]
+    fn root_snapshot_digest_is_deterministic_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/x.txt"), "x").unwrap();
+        std::fs::write(root.join("y.txt"), "y").unwrap();
+        let first = root_digest(&root);
+        std::fs::write(root.join("y.txt"), "z").unwrap();
+        let changed = root_digest(&root);
+        assert_ne!(changed, first);
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/objects/blob"), "commit state").unwrap();
+        assert_eq!(root_digest(&root), changed, "VCS bookkeeping is skipped");
+        let err = root_snapshot_digest(&root, 1).unwrap_err();
+        assert!(matches!(err, TaskError::Oversized(_)), "{err}");
+        let err = root_snapshot_digest(&dir.path().join("missing"), MAX_ROOT_SNAPSHOT_ENTRIES)
+            .unwrap_err();
+        assert!(
+            matches!(err, TaskError::RootSnapshotUnavailable(_)),
+            "{err}"
+        );
     }
 }

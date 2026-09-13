@@ -33,9 +33,11 @@ import {
   ingestWebviewMessage,
   locateVendoredBundle,
   readyMessage,
+  sendMessageFailedMessage,
   snapshotToWebviewMessages,
   vendoredFallbackNotice,
   VendoredBundle,
+  type RestorableSubmission,
 } from './kilo-bridge';
 import { FaktorSnapshot } from './state';
 
@@ -161,6 +163,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.post({ type: 'startResult', goal, ok });
+  }
+
+  /**
+   * Restore one failed pending submission in the vendored composer through
+   * the Kilo-compatible `sendMessageFailed` message: the ORIGINAL text,
+   * session/draft/message identity and attachment payload travel verbatim,
+   * so the frozen `restoreFailed` handler rebuilds the draft and images.
+   * The built-in fallback keeps its existing `startResult` contract.
+   */
+  postSendMessageFailed(pending: RestorableSubmission, error: string): void {
+    if (this.vendored !== null) {
+      this.post(sendMessageFailedMessage(pending, error));
+      return;
+    }
+    this.post({ type: 'startResult', goal: pending.text, ok: false });
   }
 
   /** One transient notice line (last error, control ack, ...). */

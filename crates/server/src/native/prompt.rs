@@ -40,6 +40,10 @@ pub struct PromptRequest {
     pub prompt: String,
     /// Attached file paths (the SDK prompt vocabulary).
     pub files: Vec<String>,
+    /// Durable typed binary/image attachments (`AttachmentId` rows),
+    /// SEPARATE from the workspace-relative `files`: CAS bytes addressed by
+    /// digest, uploaded and validated before this prompt is submitted.
+    pub attachments: Vec<faktor_core::attachment::AttachmentId>,
     /// Per-run model override.
     pub model: Option<String>,
     /// Acceptance criteria ridden onto the run's durable task row.
@@ -181,6 +185,7 @@ impl PromptExecutionService {
             model: request.model,
             criteria: request.criteria,
             files: request.files,
+            attachments: request.attachments,
             mutation_mode: request.mutation_mode,
             ..Default::default()
         };

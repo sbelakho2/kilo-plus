@@ -32,6 +32,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { bridgeTests } from './bridge-selftest.mjs';
+import {
+  bridgeCommandToHostMessage,
+  ingestWebviewMessage,
+  sendMessageFailedMessage,
+} from '../src/kilo-bridge.ts';
 import { stageBundle, verifyOverlay } from './prepare-vendored-webview.mjs';
 
 // `--packaged <extension-dir>` additionally asserts the extracted VSIX layout
@@ -536,6 +541,15 @@ async function validatorAccepts() {
     assertEqual(nc.validateTaskRuns([clone(taskRunJson)])[0].run_id, 'r1');
     assertEqual(nc.validateTaskRun(clone(taskRunJson)).task_id, 1);
     assertEqual(nc.validateTaskRunStarted(clone(taskRunStartedJson)).state, 'Pending');
+    assertEqual(
+      nc.validateAttachmentId({
+        digest: 'a'.repeat(64),
+        mime: 'application/pdf',
+        filename: null,
+        size: 8,
+      }).size,
+      8,
+    );
     assertEqual(nc.validateTaskRunCancelled(clone(taskRunCancelledJson)).cancelled, true);
     assertEqual(nc.validateAgents(clone(agentsJson)).length, 2);
     assertEqual(nc.validateAgents(clone(agentsJson))[1].presentation, 'foreground');
@@ -642,6 +656,14 @@ async function validatorRejects() {
     assertProtocol(() => nc.validateUsage(missingDurable), 'missing required field durable');
     assertProtocol(() => nc.validateSemanticStatus({ ...clone(semanticStatusJson), fallback: null }), 'expected an object');
     assertProtocol(() => nc.validateCheckpoints([{ ...clone(checkpointJson), beforeExists: 'nope' }]), 'expected a boolean');
+    assertProtocol(
+      () => nc.validateAttachmentId({ digest: 'ZZ', mime: 'application/pdf', filename: null, size: 8 }),
+      '64-char lowercase hex digest',
+    );
+    assertProtocol(
+      () => nc.validateAttachmentId({ digest: 'a'.repeat(64), mime: 'application/pdf', filename: null }),
+      'missing required field size',
+    );
     assertProtocol(() => nc.validateTaskViews([{ ...clone(taskViewJson), budget: { ...clone(budgetJson), spentCostMicro: '12' } }]), 'expected a finite number');
     // Board: absent fields, hostile types and phantom entries fail loudly.
     const missingBoardField = clone(boardPageJson);
@@ -689,6 +711,8 @@ async function clientAccepts() {
       'GET /native/session/7/task-runs': () => jsonResponse([taskRunJson]),
       'GET /native/session/7/task-runs/r1': () => jsonResponse(taskRunJson),
       'POST /native/session/7/task-runs': () => jsonResponse(taskRunStartedJson),
+      'POST /native/session/7/attachments': () =>
+        jsonResponse({ digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 8 }),
       'POST /native/session/7/task-runs/r1/cancel': () => jsonResponse(taskRunCancelledJson),
       'GET /native/agents': () => jsonResponse(agentsJson),
       'POST /native/agents/c1/pause': () => jsonResponse(controlAckJson),
@@ -733,8 +757,8 @@ async function clientAccepts() {
     assertEqual((await client.checkpoints('7'))[0].path, '/tmp/a.ts');
     assertEqual((await client.verification('7')).failedChecks.length, 1);
     assertEqual((await client.taskRuns('7'))[0].state, 'Running');
-    assertEqual((await client.taskRunState('7', 'r1')).run_id, 'r1');
-    assertEqual((await client.startTaskRun('7', { goal: 'ship it' })).run_id, 'r1');
+    assertEqual((await client.taskRunState('7', 'r1')).run_id, 'r1');    assertEqual((await client.startTaskRun('7', { goal: 'ship it' })).run_id, 'r1');
+    assertEqual((await client.uploadAttachment('7', { mime: 'application/pdf', filename: 'spec.pdf', data_base64: 'eA==' })).digest, 'a'.repeat(64));
     assertEqual((await client.cancelTaskRun('7', 'r1')).cancelled, true);
     assertEqual((await client.agents('7')).length, 2);
     assertEqual((await client.pauseAgent('c1')).queuedSeq, 3);
@@ -783,6 +807,11 @@ async function clientAccepts() {
       title: 'selftest',
     });
     assertDeepEqual(findCall(calls, 'POST', '/native/session/7/task-runs').body, { goal: 'ship it' });
+    assertDeepEqual(findCall(calls, 'POST', '/native/session/7/attachments').body, {
+      mime: 'application/pdf',
+      filename: 'spec.pdf',
+      data_base64: 'eA==',
+    });
     assertDeepEqual(findCall(calls, 'GET', '/native/messages').query, {
       session: '7',
       before: '9',
@@ -1579,6 +1608,334 @@ async function completionContractTests() {
   });
 }
 
+
+// ------------------- 7b-2. pending submission envelope + admission restore
+
+function pendingEnvelope(overrides = {}) {
+  return {
+    text: 'ship the screenshot',
+    sessionId: '7',
+    draftId: 'draft-1',
+    messageId: 'msg-1',
+    files: [{ url: 'data:image/png;base64,QUJD', mime: 'image/png', filename: 'shot.png' }],
+    attachments: [],
+    ...overrides,
+  };
+}
+
+function binaryAttachment(overrides = {}) {
+  return {
+    mime: 'application/pdf',
+    filename: 'spec.pdf',
+    bytes: 3,
+    dataBase64: Buffer.from('%PDF').toString('base64'),
+    isImage: false,
+    ...overrides,
+  };
+}
+
+async function pendingSubmissionTests() {
+  await test('typed attachments ride the task start beside workspace paths', () => {
+    const id = { digest: 'a'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 4 };
+    assertDeepEqual(
+      ts.startTaskRequest('goal', {
+        mutationMode: '',
+        maxTokens: 0,
+        maxCostMicro: 0,
+        files: ['src/a.ts'],
+        attachments: [id],
+      }),
+      { goal: 'goal', files: ['src/a.ts'], attachments: [id] },
+    );
+    assertDeepEqual(
+      ts.startTaskRequest('goal', { mutationMode: '', maxTokens: 0, maxCostMicro: 0 }),
+      { goal: 'goal' },
+      'the attachment-free path stays byte-identical',
+    );
+  });
+
+  await test('admission uploads bytes first and starts with the durable ids', async () => {
+    const calls = [];
+    const restores = [];
+    const started = [];
+    const client = {
+      uploadAttachment: async (sessionId, request) => {
+        calls.push({ kind: 'upload', sessionId, request });
+        return { digest: 'b'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 3 };
+      },
+      startTaskRun: async (sessionId, request) => {
+        calls.push({ kind: 'start', sessionId, request });
+        return taskRunStartedJson;
+      },
+    };
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({ attachments: [binaryAttachment()] }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: (run) => started.push(run),
+      onFailure: () => {},
+      restore: (failure) => restores.push(failure),
+    });
+    assertEqual(outcome.ok, true);
+    assertEqual(restores.length, 0, 'success never restores');
+    assertEqual(calls.length, 2, 'one upload then exactly one start');
+    assertEqual(calls[0].kind, 'upload');
+    assertDeepEqual(calls[0].request, {
+      mime: 'application/pdf',
+      filename: 'spec.pdf',
+      data_base64: Buffer.from('%PDF').toString('base64'),
+    });
+    assertEqual(calls[1].kind, 'start');
+    assertDeepEqual(calls[1].request.attachments, [
+      { digest: 'b'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 3 },
+    ]);
+    assertEqual(started.length, 1);
+  });
+
+  await test('every start failure restores the Kilo identity and never leaves a partial admission', async () => {
+    const failures = [
+      ['validation', new nc.NativeApiError(400, 'malformed', 'bad body', false)],
+      ['unavailable model', new nc.NativeApiError(400, 'unknown_model', 'model "x" is not available', false)],
+      ['existing run', new nc.NativeApiError(409, 'conflict', 'session already has a live run', false)],
+      ['daemon loss', new Error('socket closed')],
+    ];
+    for (const [label, error] of failures) {
+      const calls = [];
+      const restores = [];
+      const client = {
+        uploadAttachment: async () => {
+          calls.push('upload');
+          return { digest: 'c'.repeat(64), mime: 'application/pdf', filename: null, size: 3 };
+        },
+        startTaskRun: async (sessionId, request) => {
+          calls.push('start');
+          throw error;
+        },
+      };
+      const envelope = pendingEnvelope({ attachments: [binaryAttachment()] });
+      const snapshot = JSON.stringify(envelope);
+      const outcome = await ts.admitPendingSubmission({
+        client,
+        sessionId: '7',
+        pending: envelope,
+        settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+        onStarted: () => {
+          throw new Error(`${label}: must not start`);
+        },
+        onFailure: () => {},
+        restore: (failure) => restores.push(failure),
+      });
+      assertEqual(outcome.ok, false, label);
+      assertEqual(outcome.runId, null, `${label}: no durable run id may leak`);
+      assertDeepEqual(calls, ['upload', 'start'], `${label}: exactly one attempt each, no retry`);
+      assertEqual(restores.length, 1, `${label}: restore exactly once`);
+      // The ORIGINAL envelope identity/files survive verbatim; the Kilo
+      // restore message carries them back to the composer.
+      assertEqual(JSON.stringify(envelope), snapshot, `${label}: envelope untouched`);
+      const failed = sendMessageFailedMessage(envelope, restores[0].message);
+      assertEqual(failed.text, envelope.text);
+      assertEqual(failed.sessionID, '7');
+      assertEqual(failed.draftID, 'draft-1');
+      assertEqual(failed.messageID, 'msg-1');
+      assertEqual(failed.files[0].url, envelope.files[0].url, `${label}: images restored`);
+      assertEqual(failed.files[0].mime, 'image/png');
+    }
+  });
+
+  await test('an upload failure restores the draft and never issues a task start', async () => {
+    const calls = [];
+    const restores = [];
+    const client = {
+      uploadAttachment: async () => {
+        calls.push('upload');
+        throw new nc.NativeApiError(413, 'oversized', 'attachment exceeds the bound', false);
+      },
+      startTaskRun: async () => {
+        calls.push('start');
+        throw new Error('must not start');
+      },
+    };
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: pendingEnvelope({ attachments: [binaryAttachment()] }),
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure) => restores.push(failure),
+    });
+    assertEqual(outcome.ok, false);
+    assertDeepEqual(calls, ['upload'], 'no start after an upload failure');
+    assertEqual(restores.length, 1);
+    assertEqual(restores[0].kind, 'upload');
+    assert(restores[0].message.includes('413') || restores[0].message.includes('upload'), restores[0].message);
+  });
+
+  await test('image submission is refused loudly and the draft/images remain', async () => {
+    const calls = [];
+    const restores = [];
+    const client = {
+      uploadAttachment: async () => {
+        calls.push('upload');
+        throw new Error('must not upload an image');
+      },
+      startTaskRun: async () => {
+        calls.push('start');
+        throw new Error('must not start an image submission');
+      },
+    };
+    const image = binaryAttachment({
+      mime: 'image/png',
+      filename: 'shot.png',
+      isImage: true,
+      bytes: 4,
+      dataBase64: Buffer.from([137, 80, 78, 71]).toString('base64'),
+    });
+    const envelope = pendingEnvelope({ attachments: [image] });
+    const outcome = await ts.admitPendingSubmission({
+      client,
+      sessionId: '7',
+      pending: envelope,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure) => restores.push(failure),
+    });
+    assertEqual(outcome.ok, false);
+    assertDeepEqual(calls, [], 'images are refused before any upload/start request');
+    assertEqual(restores.length, 1);
+    assertEqual(restores[0].kind, 'image_unsupported');
+    assert(
+      restores[0].message.includes('provider media/content parts are not wired'),
+      restores[0].message,
+    );
+    const failed = sendMessageFailedMessage(envelope, restores[0].message);
+    assertEqual(failed.text, envelope.text);
+    assertEqual(failed.files[0].url, envelope.files[0].url, 'the image draft payload is restored');
+    assertEqual(outcome.attachmentIds.length, 0);
+  });
+
+  await test('pending envelopes are re-validated strictly at the host boundary', () => {
+    const valid = ts.parsePendingSubmission(pendingEnvelope());
+    assert(valid !== null && valid.draftId === 'draft-1' && valid.messageId === 'msg-1');
+    assertEqual(ts.parsePendingSubmission(pendingEnvelope()).files.length, 1);
+    for (const hostile of [
+      null,
+      'nope',
+      [],
+      { ...pendingEnvelope(), text: '   ' },
+      { ...pendingEnvelope(), messageId: 'x'.repeat(4097) },
+      { ...pendingEnvelope(), files: 'not-an-array' },
+      { ...pendingEnvelope(), attachments: 'not-an-array' },
+      { ...pendingEnvelope(), attachments: [{ mime: 'application/pdf' }] },
+      {
+        ...pendingEnvelope(),
+        attachments: [{ ...binaryAttachment(), dataBase64: 'x'.repeat(10 * 1024 * 1024) }],
+      },
+      { ...pendingEnvelope(), attachments: [{ ...binaryAttachment(), bytes: -1 }] },
+    ]) {
+      assertEqual(ts.parsePendingSubmission(hostile), null, JSON.stringify(hostile).slice(0, 120));
+    }
+  });
+
+  await test('the bridge output feeds the host admission flow end to end', async () => {
+    const image = `data:image/png;base64,${Buffer.from([137, 80, 78, 71]).toString('base64')}`;
+    const raw = {
+      type: 'sendMessage',
+      text: 'inspect these',
+      sessionID: '7',
+      messageID: 'msg-9',
+      draftID: 'draft-9',
+      files: [
+        { url: 'data:application/pdf;base64,JVBERi0xLjQ=', mime: 'application/pdf', filename: 'spec.pdf' },
+        { url: image, mime: 'image/png', filename: 'shot.png' },
+      ],
+    };
+    const command = ingestWebviewMessage(raw, { workspaceDirectory: '/w' });
+    assertEqual(command.kind, 'sendMessage');
+    const host = bridgeCommandToHostMessage(command);
+    const pending = ts.parsePendingSubmission(host.pending);
+    assert(pending !== null, 'the host must accept the bridge envelope');
+    assertEqual(pending.attachments.length, 2, 'binary refs ride the pending envelope');
+    assertEqual(pending.attachments[0].mime, 'application/pdf');
+    assertEqual(pending.attachments[0].dataBase64, 'JVBERi0xLjQ=');
+    assertEqual(pending.attachments[0].isImage, false);
+    assertEqual(pending.attachments[1].isImage, true);
+
+    // An image refuses the WHOLE submission loudly before any upload/start.
+    const calls = [];
+    const restores = [];
+    await ts.admitPendingSubmission({
+      client: {
+        uploadAttachment: async () => {
+          calls.push('upload');
+          throw new Error('images must never upload');
+        },
+        startTaskRun: async () => {
+          calls.push('start');
+          throw new Error('images must never start');
+        },
+      },
+      sessionId: '7',
+      pending,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: (failure) => restores.push(failure),
+    });
+    assertDeepEqual(calls, [], 'no daemon calls for an image submission');
+    assertEqual(restores.length, 1);
+    assertEqual(restores[0].kind, 'image_unsupported');
+    const failed = sendMessageFailedMessage(pending, restores[0].message);
+    assertEqual(failed.messageID, 'msg-9');
+    assertEqual(failed.files[1].url, image, 'the image bytes return to the composer');
+
+    // Without the image the same flow uploads the exact bytes and starts
+    // with the durable typed id.
+    const textOnly = ts.parsePendingSubmission(
+      bridgeCommandToHostMessage(
+        ingestWebviewMessage({
+          type: 'sendMessage',
+          text: 'attach spec',
+          files: [{ url: 'data:application/pdf;base64,JVBERi0xLjQ=', mime: 'application/pdf', filename: 'spec.pdf' }],
+        }),
+      ).pending,
+    );
+    const calls2 = [];
+    let startedRequest = null;
+    const outcome = await ts.admitPendingSubmission({
+      client: {
+        uploadAttachment: async (sessionId, request) => {
+          calls2.push({ kind: 'upload', request });
+          return { digest: 'd'.repeat(64), mime: request.mime, filename: request.filename ?? null, size: 8 };
+        },
+        startTaskRun: async (sessionId, request) => {
+          calls2.push({ kind: 'start' });
+          startedRequest = request;
+          return taskRunStartedJson;
+        },
+      },
+      sessionId: '7',
+      pending: textOnly,
+      settings: { mutationMode: '', maxTokens: 0, maxCostMicro: 0 },
+      onStarted: () => {},
+      onFailure: () => {},
+      restore: () => {
+        throw new Error('must not restore a successful admission');
+      },
+    });
+    assertEqual(outcome.ok, true);
+    assertDeepEqual(calls2[0].request, {
+      mime: 'application/pdf',
+      filename: 'spec.pdf',
+      data_base64: 'JVBERi0xLjQ=',
+    });
+    assertDeepEqual(startedRequest.attachments, [
+      { digest: 'd'.repeat(64), mime: 'application/pdf', filename: 'spec.pdf', size: 8 },
+    ]);
+  });
+}
 
 // -------------- 7c. board state projection + webview forwarding hardening
 
@@ -3186,6 +3543,7 @@ async function main() {
   await daemonTests();
   await shadowDefaultTests();
   await completionContractTests();
+  await pendingSubmissionTests();
   await boardAndForwardingTests();
   await draftPreservationTests();
   await runStateTests();
