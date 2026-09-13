@@ -685,7 +685,7 @@ pub fn is_egress_destination(url: &str) -> bool {
 }
 
 /// Render one strict PR template. The template was validated at config time
-/// (known placeholders, no shell metacharacters/control bytes, `{branch}`
+/// (known placeholders, no control bytes, `{branch}`
 /// present); the rendered command is split on whitespace into program+args
 /// and is NEVER passed through a shell.
 pub fn render_pr_command(
@@ -741,7 +741,6 @@ pub fn validate_pr_command(template: &str) -> Result<(), String> {
                 | '?'
                 | '!'
                 | '#'
-                | '~'
                 | '('
                 | ')'
         ) {
